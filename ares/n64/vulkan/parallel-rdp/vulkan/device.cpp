@@ -34,6 +34,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -860,6 +864,22 @@ void Device::init_workarounds()
 	workarounds.broken_push_descriptors = true;
 	LOGW("Emulating events as pipeline barriers on Metal emulation.\n");
 	LOGW("Disabling push descriptors on Metal emulation.\n");
+	// LUMIVERSE: MoltenVK advertises pipelineCreationCacheControl without
+	// honouring VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT —
+	// instead of returning VK_PIPELINE_COMPILE_REQUIRED it builds the Metal
+	// pipeline synchronously and reports VK_SUCCESS. Device logs showed
+	// "Stalled compile (compute, ...) 65000-310000 us (mode:
+	// fail-on-compile-required, success: yes)" landing on the emulation thread
+	// mid-gameplay: each one a ~100 ms hole in a 16.7 ms budget. Declaring it
+	// broken makes parallel-RDP's non-blocking probe bail out for real, which
+	// is what routes the specialised pipeline to the async worker while the
+	// generic variant covers the frame.
+	// NOTE: this MUST live inside the __APPLE__ branch. The upstream
+	// NVIDIA/Qualcomm broken_pipeline_cache_control cases below are in the
+	// #else and never compile on Apple — putting it there is dead code.
+	workarounds.broken_pipeline_cache_control = true;
+	LOGW("Lumiverse: disabling pipeline cache control (MoltenVK ignores "
+	     "FAIL_ON_PIPELINE_COMPILE_REQUIRED).\n");
 #else
 	bool sync2_workarounds = false;
 	const bool mesa_driver = ext.driver_id == VK_DRIVER_ID_MESA_RADV ||
@@ -895,7 +915,6 @@ void Device::init_workarounds()
 		LOGW("Disabling pipeline cache control.\n");
 		workarounds.broken_pipeline_cache_control = true;
 	}
-
 	if (sync2_workarounds)
 	{
 		LOGW("Enabling workaround for sync2 access mask bugs.\n");
@@ -1268,6 +1287,14 @@ void Device::submit_discard(CommandBufferHandle &cmd)
 
 QueueIndices Device::get_physical_queue_type(CommandBuffer::Type queue_type) const
 {
+#if defined(LUMIVERSE_ARES_SINGLE_VULKAN_QUEUE) || (defined(TARGET_OS_VISION) && TARGET_OS_VISION)
+	if (queue_type == CommandBuffer::Type::AsyncCompute ||
+	    queue_type == CommandBuffer::Type::AsyncTransfer)
+	{
+		return QUEUE_INDEX_GRAPHICS;
+	}
+#endif
+
 	// Enums match.
 	return QueueIndices(queue_type);
 }
@@ -2960,6 +2987,24 @@ uint32_t Device::find_memory_type(BufferDomain domain, uint32_t mask) const
 	return UINT32_MAX;
 }
 
+uint32_t Device::find_private_device_memory_type(uint32_t mask) const
+{
+	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++)
+	{
+		if (((1u << i) & mask) == 0)
+			continue;
+
+		uint32_t flags = mem_props.memoryTypes[i].propertyFlags;
+		if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+		    (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)
+		{
+			return i;
+		}
+	}
+
+	return UINT32_MAX;
+}
+
 uint32_t Device::find_memory_type(ImageDomain domain, uint32_t mask) const
 {
 	uint32_t desired = 0, fallback = 0;
@@ -4490,7 +4535,19 @@ BufferHandle Device::create_buffer(const BufferCreateInfo &create_info, const vo
 				std::max<VkDeviceSize>(reqs.memoryRequirements.alignment, create_info.allocation_requirements.alignment);
 	}
 
-	uint32_t memory_type = find_memory_type(create_info.domain, reqs.memoryRequirements.memoryTypeBits);
+	bool force_private_texel_buffer =
+			(getenv("PARALLEL_RDP_FORCE_PRIVATE_TEXEL_BUFFERS") != nullptr) &&
+			create_info.domain != BufferDomain::Host &&
+			create_info.domain != BufferDomain::CachedHost &&
+			create_info.domain != BufferDomain::CachedCoherentHostPreferCached &&
+			create_info.domain != BufferDomain::CachedCoherentHostPreferCoherent &&
+			((create_info.usage & (VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+			                       VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)) != 0);
+	uint32_t memory_type = force_private_texel_buffer ?
+			find_private_device_memory_type(reqs.memoryRequirements.memoryTypeBits) :
+			UINT32_MAX;
+	if (memory_type == UINT32_MAX)
+		memory_type = find_memory_type(create_info.domain, reqs.memoryRequirements.memoryTypeBits);
 	if (memory_type == UINT32_MAX)
 	{
 		LOGE("Failed to find memory type.\n");
@@ -4501,6 +4558,8 @@ BufferHandle Device::create_buffer(const BufferCreateInfo &create_info, const vo
 	AllocationMode mode;
 	if ((create_info.misc & BUFFER_MISC_EXTERNAL_MEMORY_BIT) != 0)
 		mode = AllocationMode::External;
+	else if (force_private_texel_buffer)
+		mode = AllocationMode::LinearDevice;
 	else if (create_info.domain == BufferDomain::Device &&
 	    (create_info.usage & (VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) != 0)
 		mode = AllocationMode::LinearDeviceHighPriority;

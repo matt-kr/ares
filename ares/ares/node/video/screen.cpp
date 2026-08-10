@@ -1,4 +1,6 @@
 #include <memory>
+#include <chrono>
+#include <cstdio>
 Screen::Screen(string name, u32 width, u32 height) : Video(name) {
   _canvasWidth  = width;
   _canvasHeight = height;
@@ -201,7 +203,24 @@ auto Screen::colors(u32 colors, std::function<n64 (n32)> color) -> void {
 
 auto Screen::frame() -> void {
   if(runAhead()) return;
-  while(_frame) spinloop();
+  { //LUMIVERSE: account the emulation thread's presentation spin per second
+    static thread_local u64 spinNs = 0;
+    static thread_local u64 windowStartNs = 0;
+    auto nowNs = [] -> u64 {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const u64 spinStart = nowNs();
+    while(_frame) spinloop();
+    const u64 now = nowNs();
+    spinNs += now - spinStart;
+    if(!windowStartNs) windowStartNs = now;
+    if(now - windowStartNs >= 1000000000ull) {
+      fprintf(stderr, "[ares-perf] present spin %.1f ms/s\n", spinNs / 1e6);
+      spinNs = 0;
+      windowStartNs = now;
+    }
+  }
 
   lock_guard<recursive_mutex> lock(_mutex);
   _inputA.swap(_inputB);

@@ -721,6 +721,7 @@ private:
 	uint32_t find_memory_type(BufferDomain domain, uint32_t mask) const;
 	uint32_t find_memory_type(ImageDomain domain, uint32_t mask) const;
 	uint32_t find_memory_type(uint32_t required, uint32_t mask) const;
+	uint32_t find_private_device_memory_type(uint32_t mask) const;
 	bool memory_type_is_device_optimal(uint32_t type) const;
 	bool memory_type_is_host_visible(uint32_t type) const;
 

@@ -40,6 +40,33 @@ auto AI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
       if(io.dmaCount == 0) mi.raise(MI::IRQ::AI);
       io.dmaLength[io.dmaCount] = length;
       io.dmaOriginPc[io.dmaCount] = cpu.ipu.pc;
+      //Lumiverse addition: LUMIVERSE_ARES_N64_AI_DUMP=<path> appends every
+      //submitted AI DMA buffer ([addr u32][len u32][payload], big-endian)
+      //at enqueue time. Used to validate serial-vs-async audio execution
+      //byte-exactly, independent of playback timing. Default off.
+      static FILE* lumiverseAIDump = []() -> FILE* {
+        const char* path = ::getenv("LUMIVERSE_ARES_N64_AI_DUMP");
+        return path && path[0] ? ::fopen(path, "wb") : nullptr;
+      }();
+      if(lumiverseAIDump) {
+        const u32 dmaAddress = io.dmaAddress[io.dmaCount];
+        const u32 dmaLength = length;
+        auto put32 = [&](u32 value) {
+          u8 bytes[4] = {u8(value >> 24), u8(value >> 16), u8(value >> 8), u8(value)};
+          ::fwrite(bytes, 1, 4, lumiverseAIDump);
+        };
+        put32(dmaAddress);
+        put32(dmaLength);
+        for(u32 offset = 0; offset < dmaLength; offset += 8) {
+          const u64 value = rdram.ram.read<Dual>(dmaAddress + offset, RBusDevice::AI_DMA);
+          u8 bytes[8] = {
+            u8(value >> 56), u8(value >> 48), u8(value >> 40), u8(value >> 32),
+            u8(value >> 24), u8(value >> 16), u8(value >>  8), u8(value >>  0),
+          };
+          ::fwrite(bytes, 1, 8, lumiverseAIDump);
+        }
+        ::fflush(lumiverseAIDump);
+      }
       io.dmaCount++;
     }
   }

@@ -2359,12 +2359,36 @@ void Renderer::maintain_queues()
 	// If we get 2 full render passes of ~256 primitives, that's also a good indication we should flush since we're getting spammed.
 	// If we have no pending submissions, the GPU is idle and there is no reason not to submit.
 	// If we haven't submitted anything in a while (1.0 ms), it's probably fine to submit again.
-	if (pending_render_passes >= ImplementationConstants::MaxPendingRenderPassesBeforeFlush ||
-	    (caps.super_sample_readback && pending_render_passes_upscaled >= ImplementationConstants::MaxPendingRenderPassesBeforeFlush) ||
+	//LUMIVERSE: the submit-batching window and render-pass flush cap are
+	//tunable. MoltenVK pays a high per-submission cost and the timeline
+	//worker fence-waits each submission serially, so heavy scenes with many
+	//small batches drown in sync overhead. Read once per process (the envs
+	//are set before the core loads).
+	static const int64_t lumiverse_submit_interval_ns = [] {
+		if (const char *env = getenv("PARALLEL_RDP_SUBMIT_INTERVAL_US"))
+		{
+			long value = strtol(env, nullptr, 0);
+			if (value > 0)
+				return int64_t(value) * 1000;
+		}
+		return int64_t(1000000);
+	}();
+	static const unsigned lumiverse_max_pending_render_passes = [] {
+		if (const char *env = getenv("PARALLEL_RDP_MAX_PENDING_RENDER_PASSES"))
+		{
+			long value = strtol(env, nullptr, 0);
+			if (value > 0)
+				return unsigned(value);
+		}
+		return unsigned(ImplementationConstants::MaxPendingRenderPassesBeforeFlush);
+	}();
+
+	if (pending_render_passes >= lumiverse_max_pending_render_passes ||
+	    (caps.super_sample_readback && pending_render_passes_upscaled >= lumiverse_max_pending_render_passes) ||
 	    pending_primitives >= Limits::MaxPrimitives ||
 	    pending_primitives_upscaled >= Limits::MaxPrimitives ||
 	    active_submissions.load(std::memory_order_relaxed) == 0 ||
-	    int64_t(Util::get_current_time_nsecs() - last_submit_ns) > 1000000)
+	    int64_t(Util::get_current_time_nsecs() - last_submit_ns) > lumiverse_submit_interval_ns)
 	{
 		submit_to_queue();
 	}

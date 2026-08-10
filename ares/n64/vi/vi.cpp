@@ -1,11 +1,43 @@
 #include <n64/n64.hpp>
 
+#include <cstdlib>
+
 namespace ares::Nintendo64 {
 
 VI vi;
 #include "io.cpp"
 #include "debugger.cpp"
 #include "serialization.cpp"
+
+namespace {
+
+auto lumiverseScanoutInterval() -> u32 {
+  //LUMIVERSE: read fresh (not cached) so the app's Smooth Mode toggle takes
+  //effect on the next ROM launch within the same process.
+  const char* value = std::getenv("LUMIVERSE_ARES_N64_SCANOUT_INTERVAL");
+  if(!value) return 1u;
+
+  char* end = nullptr;
+  unsigned long parsed = std::strtoul(value, &end, 10);
+  if(end == value) return 1u;
+  if(parsed < 1) return 1u;
+  if(parsed > 6) return 6u;
+  return static_cast<u32>(parsed);
+}
+
+auto lumiverseShouldScanoutThisFrame() -> bool {
+  static u32 frameCounter = 0;
+  const u32 interval = lumiverseScanoutInterval();
+  if(interval <= 1) return true;
+
+  const bool shouldScanout = (frameCounter % interval) == 0;
+  frameCounter++;
+  return shouldScanout;
+}
+
+bool lumiverseFreshScanoutThisFrame = true;
+
+}
 
 auto VI::step(u32 clocks) -> void {
   auto scaled = (u64)clocks * system.frequency() + clockFraction;
@@ -87,13 +119,32 @@ auto VI::main() -> void {
 
       if(io.vcounter == io.vstart >> 1) {
         #if defined(VULKAN)
+        bool shouldPresentFrame = true;
         if (vulkan.enable) {
-          gpuOutputValid = vulkan.scanoutAsync(io.field);
+          lumiverseFreshScanoutThisFrame = lumiverseShouldScanoutThisFrame();
+          if(lumiverseFreshScanoutThisFrame) {
+            if(vulkan.scanoutAsync(io.field)) {
+              gpuOutputValid = true;
+            } else {
+              //LUMIVERSE: reader thread still busy with the previous scanout:
+              //skip presenting this field and keep emulating.
+              lumiverseFreshScanoutThisFrame = false;
+            }
+          }
+          shouldPresentFrame = lumiverseFreshScanoutThisFrame;
           vulkan.frame();
+        } else {
+          lumiverseFreshScanoutThisFrame = true;
         }
         #endif
         refreshed = true;
+        #if defined(VULKAN)
+        if(shouldPresentFrame) {
+          screen->frame();
+        }
+        #else
         screen->frame();
+        #endif
       }
 
       if(io.halfLinesPerField.bit(0)) { // progressive

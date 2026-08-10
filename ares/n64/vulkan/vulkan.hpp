@@ -8,6 +8,11 @@ struct Vulkan {
 
   auto render() -> bool;
   auto frame() -> void;
+  //Lumiverse addition: feed complete HLE-generated RDP commands (pairs of
+  //big-endian words, host byte order) straight into the processor queue.
+  auto queueHLECommands(const u32* data, u32 wordCount) -> bool;
+  //Lumiverse addition: shared dispatch loop; false = partial command remains.
+  auto processQueuedCommands() -> bool;
   auto writeWord(u32 address, u32 data) -> void;
   auto scanoutAsync(bool field) -> bool;
   auto mapScanoutRead(const u8*& rgba, u32& width, u32& height) -> void;

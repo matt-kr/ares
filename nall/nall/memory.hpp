@@ -196,7 +196,7 @@ template<u32 size, typename T> auto writem(void* target, T data) -> void {
 }
 
 inline auto jitprotect(bool executable) -> void {
-  #if defined(PLATFORM_MACOS)
+  #if defined(PLATFORM_MACOS) && (!defined(TARGET_OS_VISION) || !TARGET_OS_VISION)
   if(__builtin_available(macOS 11.0, *)) {
     static thread_local s32 depth = 0;
     if(!executable &&   depth++ == 0

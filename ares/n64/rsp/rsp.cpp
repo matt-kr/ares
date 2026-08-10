@@ -1,10 +1,24 @@
 #include <n64/n64.hpp>
 
+//Lumiverse addition: threading primitives for lumiverse-async-audio.cpp
+//(included below inside the namespace, where #includes are not possible)
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#if defined(__APPLE__)
+  #include <pthread/qos.h>
+#endif
+
 namespace ares::Nintendo64 {
 
 RSP rsp;
 #include "decoder.cpp"
 #include "dma.cpp"
+#include "lumiverse-async-audio.cpp"
+#include "lumiverse-hle.cpp"
+#include "lumiverse-hle-gfx.cpp"
 #include "io.cpp"
 #include "interpreter.cpp"
 #include "interpreter-ipu.cpp"
@@ -119,6 +133,9 @@ auto RSP::instructionEpilogue(u32 clocks) -> s32 {
 }
 
 auto RSP::power(bool reset) -> void {
+  //Lumiverse addition: never reset the core out from under an in-flight
+  //async audio task
+  lumiverseAsyncDrain();
   Thread::reset();
   dmem.fill();
   imem.fill();

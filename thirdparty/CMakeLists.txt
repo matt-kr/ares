@@ -85,9 +85,12 @@ add_library(
 
 target_include_directories(tzxfile PUBLIC ../thirdparty/TZXFile)
 
+# Lumiverse patch: build ymfm as an OBJECT library so its objects are archived
+# directly into libares.a (the fc core links it PRIVATE). The app links a
+# single self-contained libares.a and must not need a separate ymfm.a.
 add_library(
   ymfm
-  STATIC
+  OBJECT
   ymfm/src/ymfm_adpcm.cpp
   ymfm/src/ymfm_misc.cpp
   ymfm/src/ymfm_opl.cpp

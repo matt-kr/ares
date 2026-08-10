@@ -1,23 +1,39 @@
+//Lumiverse addition: LUMIVERSE_ARES_N64_RELAX_IO_SYNC=1 skips the
+//cpu.forceSynchronize() on DPC register READS (mirrors the SP status-read
+//relaxation in rsp/io.cpp; see rsp/lumiverse-hle.cpp for rationale).
+//Default off = stock behavior.
+namespace {
+auto lumiverseRelaxDPCReadSync() -> int {
+  static int relax = [] {
+    const char* value = ::getenv("LUMIVERSE_ARES_N64_RELAX_IO_SYNC");
+    return value ? ::atoi(value) : 0;
+  }();
+  return relax;
+}
+}
+
 auto RDP::readWord(u32 address, Thread& thread) -> u32 {
   address = (address & 0x1f) >> 2;
   n32 data;
 
+  const bool syncOnRead = &thread == &cpu && !lumiverseRelaxDPCReadSync();
+
   if(address == 0) {
     //DPC_START
     data.bit(0,23) = command.start;
-    if(&thread == &cpu) cpu.forceSynchronize();
+    if(syncOnRead) cpu.forceSynchronize();
   }
 
   if(address == 1) {
     //DPC_END
     data.bit(0,23) = command.end;
-    if(&thread == &cpu) cpu.forceSynchronize();
+    if(syncOnRead) cpu.forceSynchronize();
   }
 
   if(address == 2) {
     //DPC_CURRENT
     data.bit(0,23) = command.current;
-    if(&thread == &cpu) cpu.forceSynchronize();
+    if(syncOnRead) cpu.forceSynchronize();
   }
 
   if(address == 3) {
@@ -33,32 +49,32 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
     data.bit( 8) = 0;  //DMA busy
     data.bit( 9) = command.endValid;
     data.bit(10) = command.startValid;
-    if(&thread == &cpu) cpu.forceSynchronize();
+    if(syncOnRead) cpu.forceSynchronize();
   }
 
   if(address == 4) {
     //DPC_CLOCK
     data.bit(0,23) = command.clock - (Thread::clock - thread.clock) / 3;
-    cpu.forceSynchronize();
-    if(&thread == &cpu) cpu.forceSynchronize();
+    if(!lumiverseRelaxDPCReadSync()) cpu.forceSynchronize();
+    if(syncOnRead) cpu.forceSynchronize();
   }
 
   if(address == 5) {
     //DPC_BUSY
     data.bit(0,23) = command.bufferBusy;
-    if(&thread == &cpu) cpu.forceSynchronize();
+    if(syncOnRead) cpu.forceSynchronize();
   }
 
   if(address == 6) {
     //DPC_PIPE_BUSY
     data.bit(0,23) = command.pipeBusy;
-    if(&thread == &cpu) cpu.forceSynchronize();
+    if(syncOnRead) cpu.forceSynchronize();
   }
 
   if(data == 7) {
     //DPC_TMEM_BUSY
     data.bit(0,23) = command.tmemBusy;
-    if(&thread == &cpu) cpu.forceSynchronize();
+    if(syncOnRead) cpu.forceSynchronize();
   }
 
   debugger.ioDPC(Read, address, data);
@@ -77,6 +93,20 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
 
   if(address == 1) {
     //DPC_END
+    //Lumiverse diagnostic: log the first DP kicks and their origin (CPU vs
+    //RSP) to understand per-game RDP submission (enable with
+    //LUMIVERSE_ARES_N64_RSP_HLE_DPC_LOG=1).
+    static int dpcLog = [] {
+      const char* value = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_DPC_LOG");
+      return value ? ::atoi(value) : 0;
+    }();
+    if(dpcLog >= 1) {
+      static u32 logged = 0;
+      if(logged++ < 64) {
+        fprintf(stderr, "[rdp-dpc] end=%06x start=%06x startValid=%u origin=%s\n",
+          (u32)data.bit(0,23), command.start, (u32)command.startValid, &thread == &cpu ? "cpu" : "rsp");
+      }
+    }
     command.end = data.bit(0,23) & ~7;
     if(command.startValid) {
       command.current = command.start;

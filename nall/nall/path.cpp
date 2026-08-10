@@ -70,8 +70,15 @@ NALL_HEADER_INLINE auto user() -> string {
   string result = (const char*)utf8_t(path);
   result.transform("\\", "/");
   #else
-  struct passwd* userinfo = getpwuid(getuid());
-  string result = userinfo->pw_dir;
+  //Lumiverse: prefer $HOME over getpwuid(). On iOS-family devices (visionOS)
+  //pw_dir is /var/mobile — outside the app sandbox — while $HOME is the app
+  //container; on macOS/Linux both agree, so behavior there is unchanged.
+  string result;
+  if(const char* home = ::getenv("HOME")) result = home;
+  if(!result) {
+    struct passwd* userinfo = getpwuid(getuid());
+    result = userinfo->pw_dir;
+  }
   #endif
   if(!result) result = ".";
   if(!result.endsWith("/")) result.append("/");

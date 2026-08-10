@@ -4,7 +4,11 @@
 
 namespace mia {
 
+#if defined(MIA_LIBRARY)
+std::function<string ()> homeLocation = [] { return string{}; };
+#else
 std::function<string ()> homeLocation = [] { return string{Path::user(), "Emulation/Systems/"}; };
+#endif
 std::function<string ()> saveLocation = [] { return string{}; };
 std::vector<string> media;
 

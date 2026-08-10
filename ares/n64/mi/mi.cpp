@@ -19,6 +19,19 @@ auto MI::unload() -> void {
 }
 
 auto MI::raise(IRQ source) -> void {
+  //Lumiverse diagnostic: LUMIVERSE_ARES_N64_SP_IRQ_LOG=1 logs each SP
+  //interrupt with the CPU timer, for serial-vs-async completion timing diffs
+  if(source == IRQ::SP) {
+    static int spIrqLog = [] {
+      const char* value = ::getenv("LUMIVERSE_ARES_N64_SP_IRQ_LOG");
+      return value ? ::atoi(value) : 0;
+    }();
+    if(spIrqLog) {
+      static unsigned long long raises = 0;
+      fprintf(stderr, "[sp-irq] %llu count=%llu\n",
+        ++raises, (unsigned long long)(u64)cpu.scc.count);
+    }
+  }
   debugger.interrupt((u32)source);
   switch(source) {
   case IRQ::SP: irq.sp.line = 1; break;

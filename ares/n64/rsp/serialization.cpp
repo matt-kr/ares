@@ -1,4 +1,7 @@
 auto RSP::serialize(serializer& s) -> void {
+  //Lumiverse addition: a save state must capture a quiescent RSP; wait for
+  //any in-flight async audio task before touching core state
+  lumiverseAsyncDrain();
   Thread::serialize(s);
   s(dmem);
   s(imem);

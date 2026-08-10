@@ -272,6 +272,24 @@ struct RSP : Thread, Memory::RCP<RSP> {
   auto ioRead(u32 address, Thread& thread) -> u32;
   auto ioWrite(u32 address, u32 data, Thread& thread) -> void;
 
+  //lumiverse-hle.cpp
+  //Lumiverse addition: OSTask dispatch census/HLE hook; returns true when the
+  //task was executed natively and the RSP should stay halted.
+  auto lumiverseTaskDispatchHook() -> bool;
+
+  //lumiverse-async-audio.cpp
+  //Lumiverse addition: opt-in worker-thread execution of audio (type-2)
+  //tasks (LUMIVERSE_ARES_N64_ASYNC_AUDIO=1). While lumiverseAsyncInFlight is
+  //set the worker owns ALL RSP state; the emulation thread must go through
+  //Poll (non-blocking completion check from CPU::synchronize) or Drain
+  //(block until done) instead of touching the core. The flag itself is only
+  //ever read/written on the emulation thread.
+  bool lumiverseAsyncInFlight = false;
+  auto lumiverseAsyncBegin() -> void;
+  auto lumiverseAsyncComplete() -> void;
+  auto lumiverseAsyncPoll(s64 clocks) -> void;
+  auto lumiverseAsyncDrain() -> void;
+
   //serialization.cpp
   auto serialize(serializer&) -> void;
 

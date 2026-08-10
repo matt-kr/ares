@@ -11,7 +11,7 @@ NALL_HEADER_INLINE auto map(u32 size, bool executable) -> void* {
   int flags = MAP_ANON | MAP_PRIVATE;
   if(executable) {
     prot |= PROT_EXEC;
-    #if defined(PLATFORM_MACOS)
+    #if defined(PLATFORM_MACOS) && (!defined(TARGET_OS_VISION) || !TARGET_OS_VISION)
     flags |= MAP_JIT;
     #endif
   }

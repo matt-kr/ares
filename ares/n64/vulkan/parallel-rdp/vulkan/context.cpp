@@ -30,6 +30,10 @@
 #include <algorithm>
 #include <string.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #ifndef _WIN32
 #include <dlfcn.h>
 #elif defined(_WIN32)
@@ -1533,6 +1537,9 @@ bool Context::create_device(VkPhysicalDevice gpu_, VkSurfaceKHR surface,
 	ext.vk12_features.bufferDeviceAddressCaptureReplay = VK_FALSE;
 	ext.vk12_features.bufferDeviceAddressMultiDevice = VK_FALSE;
 	ext.vk12_features.imagelessFramebuffer = VK_FALSE;
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+	ext.vk12_features.timelineSemaphore = VK_FALSE;
+#endif
 
 	ext.vk13_features.descriptorBindingInlineUniformBlockUpdateAfterBind = VK_FALSE;
 	ext.vk13_features.inlineUniformBlock = VK_FALSE;

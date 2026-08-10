@@ -1,5 +1,8 @@
 auto RSP::readWord(u32 address, Thread& thread) -> u32 {
   if(address <= 0x0403'ffff) {
+    //Lumiverse addition: DMEM/IMEM belongs to the async-audio worker while a
+    //task is in flight; block until it completes (emulation thread only)
+    if(unlikely(lumiverseAsyncInFlight) && !lumiverseOnRSPWorker()) lumiverseAsyncDrain();
     if(address & 0x1000) return imem.read<Word>(address);
     else                 return dmem.read<Word>(address);
   }
@@ -9,6 +12,19 @@ auto RSP::readWord(u32 address, Thread& thread) -> u32 {
 auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
   address = (address & 0x1f) >> 2;
   n32 data;
+
+  //Lumiverse addition: while an async audio task is in flight, CPU reads see
+  //a stable "task running" snapshot (halted=0, DMA idle, dispatch-time
+  //signals) instead of racing the worker's live state. SP_SEMAPHORE has a
+  //read side effect, so it drains instead.
+  if(unlikely(lumiverseAsyncInFlight) && !lumiverseOnRSPWorker()) {
+    u32 shadow = 0;
+    if(lumiverseAsyncIOReadShadow(address, shadow)) {
+      debugger.ioSCC(Read, address, shadow);
+      return shadow;
+    }
+    lumiverseAsyncDrain();
+  }
 
   if(address == 0) {
     //SP_PBUS_ADDRESS
@@ -45,7 +61,9 @@ auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
     data.bit(12) = status.signal[5];
     data.bit(13) = status.signal[6];
     data.bit(14) = status.signal[7];
-    cpu.forceSynchronize();
+    //Lumiverse addition: optional relaxed status-read sync (see
+    //lumiverse-hle.cpp); never force-sync the CPU from the async worker
+    if(!lumiverseRelaxIOSync() && !lumiverseOnRSPWorker()) cpu.forceSynchronize();
   }
 
   if(address == 5) {
@@ -62,7 +80,9 @@ auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
     //SP_SEMAPHORE
     data.bit(0) = status.semaphore;
     status.semaphore = 1;
-    cpu.forceSynchronize();
+    //Lumiverse addition: optional relaxed status-read sync (see
+    //lumiverse-hle.cpp); never force-sync the CPU from the async worker
+    if(!lumiverseRelaxIOSync() && !lumiverseOnRSPWorker()) cpu.forceSynchronize();
   }
 
   debugger.ioSCC(Read, address, data);
@@ -71,6 +91,9 @@ auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
 
 auto RSP::writeWord(u32 address, u32 data, Thread& thread) -> void {
   if(address <= 0x0403'ffff) {
+    //Lumiverse addition: DMEM/IMEM belongs to the async-audio worker while a
+    //task is in flight; block until it completes (emulation thread only)
+    if(unlikely(lumiverseAsyncInFlight) && !lumiverseOnRSPWorker()) lumiverseAsyncDrain();
     if(address & 0x1000) return recompiler.invalidate(address & 0xfff), imem.write<Word>(address, data);
     else                 return dmem.write<Word>(address, data);
   }
@@ -80,6 +103,13 @@ auto RSP::writeWord(u32 address, u32 data, Thread& thread) -> void {
 auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
   address = (address & 0x1f) >> 2;
   n32 data = data_;
+
+  //Lumiverse addition: serialize emulation-thread SP register writes against
+  //an in-flight async audio task (the worker owns the RSP until completion;
+  //this also serializes back-to-back task dispatches, which arrive as
+  //SP_STATUS writes). Worker-context writes (the microcode's own MTC0s)
+  //pass through untouched.
+  if(unlikely(lumiverseAsyncInFlight) && !lumiverseOnRSPWorker()) lumiverseAsyncDrain();
 
   if(address == 0) {
     //SP_PBUS_ADDRESS
@@ -119,11 +149,23 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
 
   if(address == 4) {
     //SP_STATUS
-    if(data.bit( 0) && !data.bit( 1)) status.halted = 0;
+    //Lumiverse addition: task census/HLE hook on the halted -> running edge;
+    //a true return means the task ran natively and the RSP stays halted.
+    //Completion status (BREAK + task-done signal) is applied after the rest
+    //of the write is processed: the start write's own set/clear bits (which
+    //typically clear SIG1/SIG2) logically precede the microcode finishing.
+    bool lumiverseHLEComplete = false;
+    if(data.bit( 0) && !data.bit( 1)) {
+      if(!status.halted || !lumiverseTaskDispatchHook()) status.halted = 0;
+      else lumiverseHLEComplete = true;
+    }
     if(data.bit( 1) && !data.bit( 0)) status.halted = 1;
     if(data.bit( 2)) status.broken = 0;
-    if(data.bit( 3) && !data.bit( 4)) mi.lower(MI::IRQ::SP);
-    if(data.bit( 4) && !data.bit( 3)) mi.raise(MI::IRQ::SP);
+    //Lumiverse addition: MI must never be touched from the async worker;
+    //the microcode's own SP-interrupt set/clear writes are recorded and
+    //replayed on the emulation thread at task completion.
+    if(data.bit( 3) && !data.bit( 4)) { if(lumiverseOnRSPWorker()) lumiverseAsyncNoteSPLower(); else mi.lower(MI::IRQ::SP); }
+    if(data.bit( 4) && !data.bit( 3)) { if(lumiverseOnRSPWorker()) lumiverseAsyncNoteSPRaise(); else mi.raise(MI::IRQ::SP); }
     if(data.bit( 5) && !data.bit( 6)) status.singleStep = 0;
     if(data.bit( 6) && !data.bit( 5)) status.singleStep = 1;
     if(data.bit( 7) && !data.bit( 8)) status.interruptOnBreak = 0;
@@ -144,7 +186,17 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
     if(data.bit(22) && !data.bit(21)) status.signal[6] = 1;
     if(data.bit(23) && !data.bit(24)) status.signal[7] = 0;
     if(data.bit(24) && !data.bit(23)) status.signal[7] = 1;
-    cpu.forceSynchronize();
+    if(lumiverseHLEComplete) {
+      //mirror BREAK semantics + the microcode's task-done signal (SIG2)
+      status.broken = 1;
+      status.signal[2] = 1;
+      if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+    }
+    //Lumiverse addition: hand a requested audio task to the worker thread
+    //only now, after the start write's own set/clear bits (which typically
+    //clear SIG1/SIG2) have been fully processed.
+    if(lumiverseAsyncConsumeStartRequest()) lumiverseAsyncBegin();
+    if(!lumiverseOnRSPWorker()) cpu.forceSynchronize();
   }
 
   if(address == 5) {
@@ -158,7 +210,7 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
   if(address == 7) {
     //SP_SEMAPHORE
     status.semaphore = 0;
-    cpu.forceSynchronize();
+    if(!lumiverseOnRSPWorker()) cpu.forceSynchronize();
   }
 
   debugger.ioSCC(Write, address, data);
@@ -170,7 +222,12 @@ auto RSP::Status::readWord(u32 address, Thread& thread) -> u32 {
 
   if(address == 0) {
     //SP_PC_REG
-    if(halted) {
+    //Lumiverse addition: while the async-audio worker owns the RSP, a PC
+    //read behaves like reading a running RSP (unstable value) — do not
+    //touch the live halted/pc fields.
+    if(unlikely(self.lumiverseAsyncInFlight) && !lumiverseOnRSPWorker()) {
+      data.bit(0,11) = random();
+    } else if(halted) {
       data.bit(0,11) = self.ipu.pc;
     } else {
       data.bit(0,11) = random();
@@ -188,6 +245,9 @@ auto RSP::Status::readWord(u32 address, Thread& thread) -> u32 {
 auto RSP::Status::writeWord(u32 address, u32 data_, Thread& thread) -> void {
   address = (address & 0x1f) >> 2;
   n32 data = data_;
+
+  //Lumiverse addition: SP_PC writes must not race the async-audio worker
+  if(unlikely(self.lumiverseAsyncInFlight) && !lumiverseOnRSPWorker()) self.lumiverseAsyncDrain();
 
   if(address == 0) {
     //SP_PC_REG

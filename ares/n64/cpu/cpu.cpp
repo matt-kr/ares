@@ -72,12 +72,17 @@ auto CPU::synchronize() -> void {
 
    vi.clock -= clocks;
    ai.clock -= clocks;
-  rsp.clock -= clocks;
+  //Lumiverse addition: while an async audio task is in flight the worker
+  //thread owns the RSP (including Thread::clock); the emulation thread only
+  //polls for completion here — the safe scheduler point where the deferred
+  //BREAK/SIG2 SP interrupt is delivered. See rsp/lumiverse-async-audio.cpp.
+  if(!rsp.lumiverseAsyncInFlight) rsp.clock -= clocks;
   rdp.clock -= clocks;
   pif.clock -= clocks;
   vi.main();
   ai.main();
-  rsp.main();
+  if(rsp.lumiverseAsyncInFlight) rsp.lumiverseAsyncPoll(clocks);
+  else rsp.main();
   rdp.main();
   pif.main();
 
@@ -150,11 +155,19 @@ auto CPU::instruction() -> bool {
     auto block = recompiler.block(ipu.pc, access.paddr);
     if(block) {
       if(Thread::clock >= jitClockTarget) {
+        //Lumiverse addition: LUMIVERSE_ARES_N64_JIT_INTERLEAVE overrides the
+        //compile-time interleave cap (cycles the CPU may run unsynchronized).
+        //Unset/0 keeps the stock Accuracy::CPU::JitInterleaving value.
+        static const s64 jitInterleaving = [] {
+          const char* value = ::getenv("LUMIVERSE_ARES_N64_JIT_INTERLEAVE");
+          const s64 override = value ? ::atoll(value) : 0;
+          return override > 0 ? override : Accuracy::CPU::JitInterleaving;
+        }();
         s64 timerDelta = (s64)scc.compare - (s64)scc.count;
         if(timerDelta < 0) timerDelta = 0;
         s64 queueDelta = queue.timeToNextEvent();
         if(queueDelta < 0) queueDelta = 0;
-        s64 capBudget = min<s64>(Accuracy::CPU::JitInterleaving, min(timerDelta, queueDelta));
+        s64 capBudget = min<s64>(jitInterleaving, min(timerDelta, queueDelta));
         jitClockTarget = Thread::clock + capBudget;
       }
       block->execute(*this);
