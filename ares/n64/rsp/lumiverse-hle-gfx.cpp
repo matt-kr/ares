@@ -32,8 +32,26 @@ constexpr u64 LumiverseUcodeF3DZEXNoN208J = 0x25b57dd6a30111d1ull;
 constexpr u64 LumiverseUcodeF3DZEXNoN206H = 0x53b27814790b1a3bull;
 //Majora's Mask (U): F3DZEX.NoN fifo 2.08I
 constexpr u64 LumiverseUcodeF3DZEXNoN208I = 0xf7ec201e8049d5cfull;
-//Banjo-Tooie (U): "RSP Gfx ucode F3DEX.NoN fifo 2.08  Yoshitaka Yasumoto 1999 Nintendo."
+//Banjo-Tooie (U) + Tony Hawk's Pro Skater 2 (U): "RSP Gfx ucode F3DEX.NoN fifo 2.08  Yoshitaka Yasumoto 1999 Nintendo."
 constexpr u64 LumiverseUcodeF3DEX2NoN208 = 0x64df8bf96faf6149ull;
+//2026-08-29 census additions — all "fifo 2.xx" = F3DEX2/GBI2 command set.
+//Super Smash Bros. (U) + Kirby 64 (U): "RSP Gfx ucode F3DEX fifo 2.04H"
+constexpr u64 LumiverseUcodeF3DEX2204H = 0xef47e4ae07558fa7ull;
+//Pokemon Stadium (U): "RSP Gfx ucode F3DEX fifo 2.06"
+constexpr u64 LumiverseUcodeF3DEX2206 = 0x9a69128077e0353bull;
+//Donkey Kong 64 (U): "RSP Gfx ucode F3DEX fifo 2.07" — hash kept for the
+//census, but NOT whitelisted: under HLE the game hangs (CPU stuck at the
+//exception vector, gfx dispatch stops) right as the DK Rap starts, while
+//rendering up to that point is correct and the opcode census is ordinary.
+//Rare-engine pattern (BK type-2 gfx, BT slower with HLE): their engines
+//appear to depend on RSP task timing/DPC behavior HLE doesn't reproduce.
+constexpr u64 LumiverseUcodeF3DEX2207 = 0xfcf475ff1d56eb94ull;
+//Pokemon Snap (U): "RSP Gfx ucode F3DEX.NoN fifo 2.08H"
+constexpr u64 LumiverseUcodeF3DEX2NoN208H = 0xe444097f7a0d4d6eull;
+//Pokemon Stadium 2 (U) + Paper Mario (U): "RSP Gfx ucode F3DEX fifo 2.08 Yoshitaka Yasumoto/Kawasedo 1999."
+constexpr u64 LumiverseUcodeF3DEX2208K = 0x622da83a65470bbbull;
+//Ogre Battle 64 (U): "RSP Gfx ucode F3DEX fifo 2.08 Yoshitaka Yasumoto 1999 Nintendo."
+constexpr u64 LumiverseUcodeF3DEX2208 = 0x2f87f5f429f21a49ull;
 
 //Fast3D / GBI0 (launch generation, banner "RSP SW Version: 2.0D, 04-01-96";
 //n64js gbi0.js + microcodes.js). Standard vertex encoding:
@@ -1949,6 +1967,12 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   case LumiverseUcodeF3DZEXNoN206H: dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DZEXNoN208I: dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DEX2NoN208:  dialect = LumiverseDialectGBI2; break;
+  case LumiverseUcodeF3DEX2204H:    dialect = LumiverseDialectGBI2; break;
+  case LumiverseUcodeF3DEX2206:     dialect = LumiverseDialectGBI2; break;
+  //LumiverseUcodeF3DEX2207 (DK64) deliberately absent — see its declaration
+  case LumiverseUcodeF3DEX2NoN208H: dialect = LumiverseDialectGBI2; break;
+  case LumiverseUcodeF3DEX2208K:    dialect = LumiverseDialectGBI2; break;
+  case LumiverseUcodeF3DEX2208:     dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeFast3DSM64:    dialect = LumiverseDialectGBI0; break;
   case LumiverseUcodeFast3DPW64:    dialect = LumiverseDialectGBI0; break;
   case LumiverseUcodeFast3DCUSA:    dialect = LumiverseDialectGBI0; break;

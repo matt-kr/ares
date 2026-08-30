@@ -14,6 +14,12 @@ struct Vulkan {
   //Lumiverse addition: shared dispatch loop; false = partial command remains.
   auto processQueuedCommands() -> bool;
   auto writeWord(u32 address, u32 data) -> void;
+  //Lumiverse addition: compile every VI scanout pipeline variant up front by
+  //sweeping synthetic VI register configs through the real scanout path.
+  //MoltenVK compiles graphics pipelines synchronously (no async fallback in
+  //the VI stages), so any variant not compiled here becomes a ~100ms hitch on
+  //the emulation thread mid-game. Runs once per process, on first scanout.
+  auto warmupVIPipelines() -> void;
   auto scanoutAsync(bool field) -> bool;
   auto mapScanoutRead(const u8*& rgba, u32& width, u32& height) -> void;
   auto unmapScanoutRead() -> void;

@@ -87,6 +87,16 @@ struct LumiverseStallStats {
 };
 LumiverseStallStats lumiverseStallStats;
 
+//LUMIVERSE: pre-compile every VI scanout pipeline variant during the load
+//phase. The VI stages are graphics pipelines with no async-compile fallback,
+//so on MoltenVK each new variant otherwise costs a ~100ms synchronous Metal
+//pipeline build on the emulation thread the first time a game exercises it
+//(interlace, gamma, AA-mode changes mid-game).
+auto lumiverseVIWarmupEnabled() -> bool {
+  const char* value = std::getenv("LUMIVERSE_ARES_VI_WARMUP");
+  return !value || value[0] != '0';
+}
+
 //LUMIVERSE: how many SyncFulls of GPU latency the emulation thread tolerates
 //before blocking. 1 = wait for the previous sync; 2-4 absorb the GPU
 //scheduling latency of sharing the device with the RealityKit compositor.
@@ -125,6 +135,11 @@ struct Vulkan::Implementation {
   u32 queueOffset = 0;
 
   ::RDP::VIScanoutBuffer scanout;
+  //LUMIVERSE: last VI register values the game wrote, so the pipeline
+  //warm-up sweep can restore the real config after its synthetic one.
+  u32 viShadow[unsigned(::RDP::VIRegister::Count)] = {};
+  bool viShadowSet[unsigned(::RDP::VIRegister::Count)] = {};
+  bool viWarmupDone = false;
   std::mutex lock;
   std::condition_variable condition;
   u64 pendingSyncFullTimelines[4] = {};
@@ -308,11 +323,128 @@ auto Vulkan::frame() -> void {
 
 auto Vulkan::writeWord(u32 address, u32 data) -> void {
   if(!implementation || !implementation->processor) return;
+  if(address < unsigned(::RDP::VIRegister::Count)) {
+    implementation->viShadow[address] = data;
+    implementation->viShadowSet[address] = true;
+  }
   implementation->processor->set_vi_register(::RDP::VIRegister(address), data);
+}
+
+auto Vulkan::warmupVIPipelines() -> void {
+  if(!implementation || !implementation->processor) return;
+  if(implementation->viWarmupDone) return;
+  implementation->viWarmupDone = true;
+  if(!lumiverseVIWarmupEnabled()) return;
+
+  using Reg = ::RDP::VIRegister;
+  auto* processor = implementation->processor;
+  const u64 startNs = LumiverseStallStats::nowNs();
+
+  //identical option derivation to scanoutAsync, so pipeline keys match
+  ::RDP::ScanoutOptions options;
+  options.downscale_steps = supersampleScanout ? 16 : 0;
+  options.persist_frame_on_invalid_input = true;
+  if(disableVideoInterfaceProcessing) {
+    options.vi = {false, false, true, false, false, false};
+  }
+  if(!supersampleScanout) {
+    options.blend_previous_frame = weaveDeinterlacing;
+    options.upscale_deinterlacing = !weaveDeinterlacing;
+  } else {
+    options.blend_previous_frame = false;
+    options.upscale_deinterlacing = true;
+  }
+
+  const auto set = [&](Reg reg, u32 value) {
+    processor->set_vi_register(reg, value);
+  };
+
+  //synthetic NTSC 320x240 config; Control/XScale/YScale/VCurrentLine vary
+  set(Reg::Origin, 0x00100000);
+  set(Reg::Width, 320);
+  set(Reg::Intr, 2);
+  set(Reg::Timing, 0x03e52239);
+  set(Reg::VSync, 525);
+  set(Reg::HSync, 0x00000c15);
+  set(Reg::Leap, 0x0c150c15);
+  set(Reg::HStart, ::RDP::make_vi_start_register(108, 108 + 640));
+  set(Reg::VStart, ::RDP::make_vi_start_register(37, 37 + 474));
+  set(Reg::VBurst, 0x000e0204);
+
+  //the sweep axes cover every specialization-constant and shader-variant
+  //combination the VI stages key on:
+  //  type x aaMode      -> extract_vram spec (TYPE_MASK | META_AA)
+  //  aaMode x dither    -> vi_fetch spec (META_AA | DITHER_FILTER)
+  //  gammaSel x aaMode  -> vi_scale spec (GAMMA | GAMMA_DITHER | META_SCALE | META_AA)
+  //  yBug               -> fetch-bug program variants + vi_scale spec 2
+  //  serrate (2 fields) -> vi_blend_fields / vi_deinterlace paths
+  //divot filter stays on throughout: it never enters a spec constant, and
+  //having the stage run compiles both divot program variants via the yBug axis.
+  constexpr u32 aaModes[] = {0u << 8, 2u << 8, 3u << 8};  //META_AA+SCALE, SCALE, neither
+  constexpr u32 gammaSels[] = {
+    0,
+    ::RDP::VI_CONTROL_GAMMA_ENABLE_BIT,
+    ::RDP::VI_CONTROL_GAMMA_ENABLE_BIT | ::RDP::VI_CONTROL_GAMMA_DITHER_ENABLE_BIT,
+  };
+
+  constexpr u32 bufferCount = 8;
+  ::RDP::VIScanoutBuffer buffers[bufferCount];
+  u32 submitted = 0;
+
+  const auto sweepScanout = [&](bool field) {
+    set(Reg::VCurrentLine, field);
+    auto& target = buffers[submitted % bufferCount];
+    if(target.fence) target.fence->wait();
+    processor->scanout_async_buffer(target, options);
+    submitted++;
+    if((submitted % 16) == 0) processor->begin_frame_context();
+  };
+
+  for(u32 type = 0; type < 2; type++)
+  for(u32 aa = 0; aa < 3; aa++)
+  for(u32 dither = 0; dither < 2; dither++)
+  for(u32 gamma = 0; gamma < 3; gamma++)
+  for(u32 yBug = 0; yBug < 2; yBug++)
+  for(u32 serrate = 0; serrate < 2; serrate++) {
+    const u32 control =
+        (type ? ::RDP::VI_CONTROL_TYPE_RGBA8888_BIT : ::RDP::VI_CONTROL_TYPE_RGBA5551_BIT)
+      | aaModes[aa]
+      | (dither ? ::RDP::VI_CONTROL_DITHER_FILTER_ENABLE_BIT : 0u)
+      | gammaSels[gamma]
+      | ::RDP::VI_CONTROL_DIVOT_ENABLE_BIT
+      | (serrate ? ::RDP::VI_CONTROL_SERRATE_BIT : 0u);
+    set(Reg::Control, control);
+    set(Reg::XScale, ::RDP::make_vi_scale_register(0x200, 0));
+    set(Reg::YScale, ::RDP::make_vi_scale_register(yBug ? 0x200 : 0x400, 0));
+    sweepScanout(false);
+    if(serrate) sweepScanout(true);  //second field: blend/deinterlace paths
+  }
+
+  //two blank scanouts drop the sweep's garbage prev-frame image so the real
+  //first frame never blends against it
+  set(Reg::Control, 0);
+  sweepScanout(false);
+  sweepScanout(false);
+
+  for(auto& buffer : buffers) {
+    if(buffer.fence) buffer.fence->wait();
+  }
+  processor->begin_frame_context();
+
+  //restore every register the game has written so far
+  for(u32 index = 0; index < unsigned(Reg::Count); index++) {
+    if(implementation->viShadowSet[index]) {
+      processor->set_vi_register(Reg(index), implementation->viShadow[index]);
+    }
+  }
+
+  fprintf(stderr, "[ares] VI pipeline warm-up: %u scanouts in %.0f ms\n",
+    submitted, (LumiverseStallStats::nowNs() - startNs) / 1e6);
 }
 
 auto Vulkan::scanoutAsync(bool field) -> bool {
   if(!implementation || !implementation->processor) return false;
+  warmupVIPipelines();
   struct ScanoutTimer {
     u64 start = LumiverseStallStats::nowNs();
     ~ScanoutTimer() { lumiverseStallStats.recordScanout(LumiverseStallStats::nowNs() - start); }
