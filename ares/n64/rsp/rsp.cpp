@@ -19,6 +19,7 @@ RSP rsp;
 #include "lumiverse-async-audio.cpp"
 #include "lumiverse-hle.cpp"
 #include "lumiverse-hle-gfx.cpp"
+#include "lumiverse-hle-audio.cpp"
 #include "io.cpp"
 #include "interpreter.cpp"
 #include "interpreter-ipu.cpp"
@@ -49,6 +50,13 @@ auto RSP::main() -> void {
     auto clock = Thread::clock;
 
     if(status.halted) {
+      //Lumiverse addition: settle a truncated-task audio-HLE shadow compare
+      //(debug tool; the game typically crashes after the experiment, so the
+      //normal settle-on-next-dispatch never runs)
+      if(lumiverseAudioTruncateArmed && lumiverseAudioShadowState.pending) {
+        lumiverseAudioTruncateArmed = false;
+        lumiverseAudioShadowSettle();
+      }
       step(128);
       profile.cycles += 128;
       profile.haltedCycles += 128;

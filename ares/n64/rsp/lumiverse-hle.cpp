@@ -124,6 +124,13 @@ auto lumiverseFindBanner(u32 dataAddress, u32 scanLength, char* out, u32 outSize
 //executed natively (RDP commands already queued via vulkan.queueHLECommands)
 auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool;
 
+//implemented in lumiverse-hle-audio.cpp; returns true when the audio task
+//was executed natively (output samples already written to RDRAM). Gated by
+//LUMIVERSE_ARES_N64_AUDIO_HLE=1 (default off) and a per-ucode hash whitelist.
+auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool;
+//shadow-mode (AUDIO_HLE=2) comparison settle point; no-op otherwise
+auto lumiverseAudioShadowSettle() -> void;
+
 }  //namespace
 
 auto RSP::lumiverseTaskDispatchHook() -> bool {
@@ -253,6 +260,40 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
     }
   }
 
+  //raw alist dump (LUMIVERSE_ARES_N64_RSP_HLE_ALIST_DUMP=<path>): append the
+  //full 8-byte command words of every type-2 task's command list as text, for
+  //offline empirical analysis of the audio ABI encodings (clean-room: this
+  //observes only our own emulator's RDRAM contents).
+  static FILE* alistDump = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_ALIST_DUMP");
+    return path && path[0] ? fopen(path, "w") : nullptr;
+  }();
+  if(alistDump && taskType == 2 && dataPtr && dataSize >= 8 && dataSize <= 0x10000) {
+    static u64 dumpTask = 0;
+    fprintf(alistDump, "task %llu hash=%016llx data=%06x size=%u\n",
+      (unsigned long long)dumpTask++, (unsigned long long)ucodeHash, dataPtr, dataSize);
+    for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
+      u32 w0 = 0, w1 = 0;
+      for(u32 b = 0; b < 4; b++) w0 = w0 << 8 | lumiverseRDRAMByte(dataPtr + offset + b);
+      for(u32 b = 0; b < 4; b++) w1 = w1 << 8 | lumiverseRDRAMByte(dataPtr + offset + 4 + b);
+      fprintf(alistDump, "  %08x %08x", w0, w1);
+      //annotate game-provided data blocks (ADPCM books, loop states, filter
+      //coefficient tables) with their raw RDRAM contents
+      const u8 op = w0 >> 24;
+      if(op == 0x0b || op == 0x0f || (op == 0x07 && ((w0 >> 16) & 0xff) == 2)) {
+        fprintf(alistDump, "  |");
+        for(u32 b = 0; b < 64; b++) fprintf(alistDump, " %02x", lumiverseRDRAMByte((w1 & 0x00ffffff) + b));
+      }
+      fprintf(alistDump, "\n");
+    }
+    fflush(alistDump);
+  }
+
+  //audio HLE shadow mode: settle an outstanding comparison on ANY dispatch
+  //(audio tasks normally settle it themselves; this covers the case where
+  //the game stops issuing audio tasks, e.g. truncated-task experiments)
+  if(level >= 2 && taskType == 1) lumiverseAudioShadowSettle();
+
   //level 2: execute recognized graphics tasks natively; anything else (and
   //any failure) falls back to LLE by returning false.
   if(level >= 2 && taskType == 1) {
@@ -264,6 +305,24 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
       return true;
     }
   }
+
+  //audio HLE (LUMIVERSE_ARES_N64_AUDIO_HLE=1, default off): execute
+  //recognized type-2 audio tasks natively. Falls through to the existing
+  //behavior (mute probe / async / serial LLE) for unrecognized ucodes, tasks
+  //that fail validation, and shadow-compare mode (=2).
+  if(level >= 2 && taskType == 2) {
+    if(lumiverseExecuteAudioTask(task, ucodeHash)) return true;
+  }
+
+  //diagnostic (LUMIVERSE_ARES_N64_MUTE_AUDIO_TASKS=1): complete type-2
+  //(audio) tasks instantly without executing them. Output buffers keep
+  //stale contents (garbage sound), so this is a MEASUREMENT probe only:
+  //the wall-time delta vs a normal run is exactly what LLE audio costs.
+  static int muteAudioTasks = [] {
+    const char* value = ::getenv("LUMIVERSE_ARES_N64_MUTE_AUDIO_TASKS");
+    return value ? ::atoi(value) : 0;
+  }();
+  if(muteAudioTasks && taskType == 2) return true;
 
   //async audio (LUMIVERSE_ARES_N64_ASYNC_AUDIO=1): request worker-thread
   //execution of type-2 (audio) tasks. The task still dispatches through the
