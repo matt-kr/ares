@@ -83,6 +83,27 @@
 //                 flags(cmd0.b2) consecutive copies at dst(cmd1.hi16) —
 //                 extends short looped waveforms for the resampler
 //
+//DIALECTS: the ABI2 command set above covers the SF64/Zelda family. The
+//older ABI1 family (SM64 / Wave Race 64 / Pokemon Snap, SETBUFF-driven with
+//a segment table) is implemented as a second dialect: LOADBUFF(04)/
+//SAVEBUFF(06) move via SETBUFF in/out/count, SEGMENT(07) fills the address
+//table, SETVOL(09) uses the A_VOL(4)|A_LEFT(2)/A_AUX(8) flag map, ENVMIXER
+//(03) mixes into SETBUFF.out + the three A_AUX buffers with Q16-fractional
+//per-sample exponential volume ramps (rate = Q16 multiplier per 8-sample
+//group, applied per sample at rate^(1/8), clamped at target) whose
+//parameters persist in the per-voice state (CONTINUE chunks carry no
+//SETVOLs), and POLEF(0e) is a one-pole IIR whose pole comes from the
+//LOADADPCM table (row1[0], Q14) with a Q14 input gain. All fitted against
+//isolated LLE runs via the truncated-task oracle.
+//
+//A third family ("naudio": Super Smash Bros. / Kirby) is only partially
+//decoded (fixed 0x170-byte chunks, state addresses in cmd0.lo24, an
+//80+ byte per-voice RDRAM parameter block holding per-lane vol int/frac
+//vectors, targets, 16.16 rates and wet/dry gains, envmix output at fixed
+//dmem 0x9d0/0xb40/0xcb0/0xe20). It stays OFF the whitelist; the
+//LUMIVERSE_ARES_N64_AUDIO_HLE_NAUDIO=1 gate enables the experimental
+//skeleton for further oracle work only.
+//
 //This file is included from rsp.cpp inside namespace ares::Nintendo64 (same
 //translation unit as lumiverse-hle.cpp); no #includes allowed here.
 
