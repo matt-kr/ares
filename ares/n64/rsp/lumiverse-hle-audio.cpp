@@ -112,6 +112,12 @@ auto lumiverseAudioHLEDebug() -> int {
   return debug;
 }
 
+//command-set dialects (analogous to the gfx interpreter's GBI0/1/2)
+enum : u32 {
+  LumiverseAudioDialectABI2 = 0,  //SF64 / Zelda family (validated first)
+  LumiverseAudioDialectABI1 = 1,  //SM64 / Wave Race / Pokemon Snap family
+};
+
 //whitelisted audio microcode hashes (FNV-1a over the ucode text, captured by
 //the census in lumiverse-hle.cpp)
 constexpr u64 LumiverseAudioUcodeStarFox64 = 0xc1a98f5d15c322c7ull;  //Star Fox 64 (U)
@@ -119,11 +125,18 @@ constexpr u64 LumiverseAudioUcodeZeldaMQ   = 0x9d3b431ff4357876ull;  //Zelda OoT
 constexpr u64 LumiverseAudioUcodeZeldaOoTU = 0xca93aeebeae5d62full;  //Zelda OoT (U)
 constexpr u64 LumiverseAudioUcodeMajoraU   = 0xa8df9aeb4a7cb685ull;  //Majora's Mask (U)
 
-auto lumiverseAudioHashWhitelisted(u64 hash) -> bool {
-  return hash == LumiverseAudioUcodeStarFox64
-      || hash == LumiverseAudioUcodeZeldaMQ
-      || hash == LumiverseAudioUcodeZeldaOoTU
-      || hash == LumiverseAudioUcodeMajoraU;
+constexpr u64 LumiverseAudioUcodeSM64WR    = 0x394bf43d72dfa31dull;  //Super Mario 64 (U) + Wave Race 64 (U), shared
+constexpr u64 LumiverseAudioUcodeSnapU     = 0x7123e4d5f82ae6a5ull;  //Pokemon Snap (U)
+
+//returns the command-set dialect for a whitelisted audio ucode, -1 otherwise
+auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
+  if(hash == LumiverseAudioUcodeStarFox64) return LumiverseAudioDialectABI2;
+  if(hash == LumiverseAudioUcodeZeldaMQ)   return LumiverseAudioDialectABI2;
+  if(hash == LumiverseAudioUcodeZeldaOoTU) return LumiverseAudioDialectABI2;
+  if(hash == LumiverseAudioUcodeMajoraU)   return LumiverseAudioDialectABI2;
+  if(hash == LumiverseAudioUcodeSM64WR)    return LumiverseAudioDialectABI1;
+  if(hash == LumiverseAudioUcodeSnapU)     return LumiverseAudioDialectABI1;
+  return -1;
 }
 
 //----------------------------------------------------------------------------
@@ -232,18 +245,34 @@ struct LumiverseAudioMachine {
   u32 loopAddr = 0;
   //SETBUFF
   u32 inBuf = 0, outBuf = 0, bufCount = 0;
-  //envelope
+  //envelope (ABI2 style)
   u32 volL = 0, volR = 0;
   s32 rateL = 0, rateR = 0;
   u32 wetGain = 0;
-  //filter
+  //filter (ABI2 Zeldas)
   u32 filterLength = 0;
   u32 filterCoefAddr = 0;
+  //ABI1 state
+  u32 segments[16] = {};
+  u32 aux1 = 0, aux2 = 0, aux3 = 0;         //A_AUX SETBUFF: dryR, wetL, wetR
+  s32 setVolL = 0, setVolR = 0;             //aSetVolume A_VOL left/right
+  s32 setTargetL = 0, setTargetR = 0;       //aSetVolume A_RATE targets
+  u32 setRateL = 0x10000, setRateR = 0x10000;  //Q16 per-8-sample multipliers
+  s32 setDryVol = 0, setWetVol = 0;         //aSetVolume A_AUX
   //statistics
   u64 tasksExecuted = 0;
   u64 tasksFallback = 0;
   u64 unknownEnvmixFlags = 0;
 };
+
+//ABI1 RDRAM addresses go through a segment table (aSegment); ABI2 uses
+//physical addresses directly
+auto lumiverseAudioResolve(const LumiverseAudioMachine& m, u32 dialect, u32 raw) -> u32 {
+  if(dialect == LumiverseAudioDialectABI1) {
+    return (m.segments[raw >> 24 & 0xf] + (raw & 0x00ffffff)) & 0x00ffffff;
+  }
+  return raw & 0x00ffffff;
+}
 
 auto lumiverseAudioClamp16(s32 value) -> s16 {
   if(value > 32767) return 32767;
@@ -272,9 +301,10 @@ struct LumiverseAudioValidator {
   u32 inBuf, outBuf, bufCount;
   u32 filterLength;
   u32 filterCoefAddr;
+  u32 aux1, aux2, aux3;
 };
 
-auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u32 dataSize, u64 ucodeHash) -> bool {
+auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u32 dataSize, u32 dialect) -> bool {
   LumiverseAudioValidator v;
   v.bookEntries = machine.bookEntries;
   v.loopAddr = machine.loopAddr;
@@ -283,7 +313,10 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
   v.bufCount = machine.bufCount;
   v.filterLength = machine.filterLength;
   v.filterCoefAddr = machine.filterCoefAddr;
-  (void)ucodeHash;
+  v.aux1 = machine.aux1;
+  v.aux2 = machine.aux2;
+  v.aux3 = machine.aux3;
+  const bool abi1 = dialect == LumiverseAudioDialectABI1;
 
   static u64 rejectLogs = 0;
   auto reject = [&](u32 offset, u32 w0, u32 w1, const char* reason) -> bool {
@@ -320,12 +353,49 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
       if(dmemAddr + count > 0x1000) return reject(offset, w0, w1, "clearbuff range");
       break;
     }
-    case 0x04:
-    case 0x0c: {  //MIXER
+    case 0x04: {  //ABI2: MIXER; ABI1: LOADBUFF (uses SETBUFF in/count)
+      if(abi1) {
+        if(v.inBuf + v.bufCount > 0x1000) return reject(offset, w0, w1, "loadbuff range");
+        break;
+      }
       const u32 count = (w0 >> 16 & 0xff) << 4;
       const u32 in = w1 >> 16, out = w1 & 0xffff;
       if(!count) return reject(offset, w0, w1, "mixer count");
       if(in + count > 0x1000 || out + count > 0x1000) return reject(offset, w0, w1, "mixer range");
+      break;
+    }
+    case 0x0c: {  //MIXER (ABI1: count from SETBUFF; ABI2: count embedded)
+      const u32 count = abi1 ? v.bufCount : (w0 >> 16 & 0xff) << 4;
+      const u32 in = w1 >> 16, out = w1 & 0xffff;
+      if(!count) return reject(offset, w0, w1, "mixer count");
+      if(in + count > 0x1000 || out + count > 0x1000) return reject(offset, w0, w1, "mixer range");
+      break;
+    }
+    case 0x03: {  //ENVMIXER (ABI1)
+      if(!abi1) return reject(offset, w0, w1, "envmixer in abi2");
+      if(flags & ~9u) return reject(offset, w0, w1, "envmixer flags");
+      const u32 count = v.bufCount;
+      if(!count || (count & 1)) return reject(offset, w0, w1, "envmixer count");
+      if(v.inBuf + count > 0x1000 || v.outBuf + count > 0x1000) return reject(offset, w0, w1, "envmixer dry range");
+      if(v.aux1 + count > 0x1000) return reject(offset, w0, w1, "envmixer aux1 range");
+      if((flags & 8) && (v.aux2 + count > 0x1000 || v.aux3 + count > 0x1000)) return reject(offset, w0, w1, "envmixer wet range");
+      break;
+    }
+    case 0x06: {  //SAVEBUFF (ABI1; uses SETBUFF out/count)
+      if(!abi1) return reject(offset, w0, w1, "savebuff in abi2");
+      if(v.outBuf + v.bufCount > 0x1000) return reject(offset, w0, w1, "savebuff range");
+      break;
+    }
+    case 0x09: {  //SETVOL (ABI1)
+      if(!abi1) return reject(offset, w0, w1, "setvol in abi2");
+      if(flags != 0 && flags != 2 && flags != 4 && flags != 6 && flags != 8) return reject(offset, w0, w1, "setvol flags");
+      break;
+    }
+    case 0x0e: {  //POLEF (ABI1, Pokemon Snap)
+      if(!abi1) return reject(offset, w0, w1, "polef in abi2");
+      if(flags & ~1u) return reject(offset, w0, w1, "polef flags");
+      if(!v.bookEntries) return reject(offset, w0, w1, "polef without table");
+      if(v.inBuf + v.bufCount > 0x1000 || v.outBuf + v.bufCount > 0x1000) return reject(offset, w0, w1, "polef range");
       break;
     }
     case 0x05: {  //RESAMPLE
@@ -339,7 +409,8 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
       if(!(w1 & 0x00ffffff)) return reject(offset, w0, w1, "resample state addr");
       break;
     }
-    case 0x07: {  //FILTER
+    case 0x07: {  //ABI1: SEGMENT; ABI2 Zeldas: FILTER
+      if(abi1) break;
       if(flags == 2) {
         const u32 count = w0 & 0xffff;
         if(!count || (count & 1) || count > 0x1000) return reject(offset, w0, w1, "filter set count");
@@ -357,6 +428,14 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
       break;
     }
     case 0x08: {  //SETBUFF
+      if(abi1 && flags == 8) {
+        //A_AUX: three auxiliary buffers (dry R, wet L, wet R)
+        v.aux1 = w0 & 0xffff;
+        v.aux2 = w1 >> 16;
+        v.aux3 = w1 & 0xffff;
+        if(v.aux1 >= 0x1000 || v.aux2 >= 0x1000 || v.aux3 >= 0x1000) return reject(offset, w0, w1, "setbuff aux range");
+        break;
+      }
       if(flags) return reject(offset, w0, w1, "setbuff flags");
       v.inBuf = w0 & 0xffff;
       v.outBuf = w1 >> 16;
@@ -398,6 +477,7 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
     }
     case 0x12:  //ENVSETUP1
     case 0x16:  //ENVSETUP2
+      if(abi1) return reject(offset, w0, w1, "envsetup in abi1");
       break;
     case 0x1a: {  //DUPLICATE
       const u32 copies = flags ? flags : 1;
@@ -435,7 +515,7 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
 //execution pass
 //----------------------------------------------------------------------------
 
-auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shadow, u32 dataPtr, u32 dataSize) -> void {
+auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shadow, u32 dataPtr, u32 dataSize, u32 dialect) -> void {
   u8* dmem = m.dmem;
 
   for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
@@ -445,7 +525,8 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
     for(u32 b = 0; b < 4; b++) w1 = w1 << 8 | lumiverseAudioRDRAMReadByte(dataPtr + offset + 4 + b);
     const u8 op = w0 >> 24;
     const u32 flags = w0 >> 16 & 0xff;
-    const u32 address = w1 & 0x00ffffff;
+    const u32 address = lumiverseAudioResolve(m, dialect, w1);
+    const bool abi1 = dialect == LumiverseAudioDialectABI1;
 
     switch(op) {
     case 0x00:
@@ -545,9 +626,144 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
       break;
     }
 
-    case 0x04:
-    case 0x0c: {  //MIXER: out += in * gain (Q15, saturated)
+    case 0x04: {  //ABI1: LOADBUFF via SETBUFF (in, count); ABI2: MIXER
+      if(abi1) {
+        if(!m.bufCount) break;
+        u8 scratch[0x1000];
+        lumiverseAudioReadRDRAM(shadow, address, scratch, m.bufCount);
+        for(u32 index = 0; index < m.bufCount; index++) dmem[(m.inBuf + index) & 0xfff] = scratch[index];
+        break;
+      }
       const u32 count = (w0 >> 16 & 0xff) << 4;
+      const s32 gain = (s16)(w0 & 0xffff);
+      const u32 in = w1 >> 16, out = w1 & 0xffff;
+      for(u32 index = 0; index < count; index += 2) {
+        const s32 x = lumiverseAudioDmemReadS16(dmem, in + index);
+        const s32 y = lumiverseAudioDmemReadS16(dmem, out + index);
+        lumiverseAudioDmemWriteS16(dmem, out + index, lumiverseAudioClamp16(y + (x * gain + 0x4000 >> 15)));
+      }
+      break;
+    }
+
+    case 0x06: {  //SAVEBUFF (ABI1): SETBUFF out/count -> RDRAM
+      if(!m.bufCount) break;
+      u8 scratch[0x1000];
+      for(u32 index = 0; index < m.bufCount; index++) scratch[index] = dmem[(m.outBuf + index) & 0xfff];
+      lumiverseAudioWriteRDRAM(shadow, address, scratch, m.bufCount);
+      break;
+    }
+
+    case 0x09:  //SETVOL (ABI1): flags = A_VOL(4)|A_LEFT(2) / A_AUX(8)
+      switch(flags) {
+      case 0x06: m.setVolL = (s16)(w0 & 0xffff); break;
+      case 0x04: m.setVolR = (s16)(w0 & 0xffff); break;
+      case 0x02: m.setTargetL = (s16)(w0 & 0xffff); m.setRateL = w1; break;
+      case 0x00: m.setTargetR = (s16)(w0 & 0xffff); m.setRateR = w1; break;
+      case 0x08: m.setDryVol = (s16)(w0 & 0xffff); m.setWetVol = (s16)(w1 & 0xffff); break;
+      }
+      break;
+
+    case 0x0e: {  //POLEF (ABI1): one-pole IIR lowpass, in-place per SETBUFF.
+      //The table loaded via LOADADPCM holds [8 zeros][a^(j+1) in Q14]; the
+      //command's low 16 bits are the input gain in Q14 (observed g = 1 - a
+      //for unity DC gain). y[n] = (x[n]*g + y[n-1]*a) >> 14.
+      auto& state = lumiverseAudioState(address);
+      const s32 pole = m.bookEntries > 8 ? m.book[8] : 0;
+      const s32 gain = (s16)(w0 & 0xffff);
+      s32 previous = (flags & 1) ? 0 : state.samples[0];
+      const u32 samples = m.bufCount / 2;
+      for(u32 n = 0; n < samples; n++) {
+        const s32 x = lumiverseAudioDmemReadS16(dmem, m.inBuf + n * 2);
+        const s32 y = lumiverseAudioClamp16((s32)(((s64)x * gain + (s64)previous * pole) >> 14));
+        lumiverseAudioDmemWriteS16(dmem, m.outBuf + n * 2, (s16)y);
+        previous = y;
+      }
+      state.samples[0] = (s16)previous;
+      break;
+    }
+
+    case 0x03: {  //ENVMIXER (ABI1): in/dryL from SETBUFF, dryR/wetL/wetR aux.
+      //Volumes are tracked at Q16 fractional precision: the multiplicative
+      //ramp starts voices at vol=1 (exponential attack), which an integer
+      //vol register would freeze at 1 forever (verified against LLE's
+      //per-sample gain curve on SM64's title voice: rate 0x1717e/group grows
+      //1 -> 1.44 -> 2.07 ... only with the fraction kept).
+      //the envelope parameters live in the per-voice state: CONTINUE
+      //chunks are issued WITHOUT fresh aSetVolume commands (observed in
+      //SM64's alists), so target/rate/dry/wet must persist per voice, not
+      //in machine-global registers
+      auto& state = lumiverseAudioState(address);
+      s64 vl32, vr32;
+      s32 targetL, targetR, dry, wet;
+      u32 rateL, rateR;
+      if(flags & 1) {
+        vl32 = (s64)m.setVolL << 16;
+        vr32 = (s64)m.setVolR << 16;
+        targetL = m.setTargetL; targetR = m.setTargetR;
+        rateL = m.setRateL; rateR = m.setRateR;
+        dry = m.setDryVol; wet = m.setWetVol;
+      } else {
+        vl32 = (s64)(u16)state.samples[0] << 16 | (u16)state.samples[1];
+        vr32 = (s64)(u16)state.samples[2] << 16 | (u16)state.samples[3];
+        targetL = state.samples[4]; targetR = state.samples[5];
+        rateL = (u32)(u16)state.samples[6] << 16 | (u16)state.samples[7];
+        rateR = (u32)(u16)state.samples[8] << 16 | (u16)state.samples[9];
+        dry = state.samples[10]; wet = state.samples[11];
+      }
+      const u32 samples = m.bufCount / 2;
+      auto accumulate = [&](u32 bus, u32 n, s32 value) {
+        const s32 current = lumiverseAudioDmemReadS16(dmem, bus + n * 2);
+        lumiverseAudioDmemWriteS16(dmem, bus + n * 2, lumiverseAudioClamp16(current + value));
+      };
+      //the microcode ramps per SAMPLE at rate^(1/8) (the documented rate is
+      //per 8-sample group; LLE's per-lane gain curve on attacks fits the
+      //interpolated form)
+      auto eighthRoot = [](u32 rate) -> u32 {
+        const double value = (double)rate / 65536.0;
+        return (u32)(__builtin_sqrt(__builtin_sqrt(__builtin_sqrt(value))) * 65536.0 + 0.5);
+      };
+      const u32 r8L = eighthRoot(rateL);
+      const u32 r8R = eighthRoot(rateR);
+      auto ramp = [](s64 vol32, s32 target, u32 rate, u32 rate8) -> s64 {
+        s64 next = vol32 * rate8 >> 16;
+        const s64 target32 = (s64)target << 16;
+        if(rate >= 0x10000) { if(next > target32) next = target32; }
+        else { if(next < target32) next = target32; }
+        if(next > 0x7fff0000ll) next = 0x7fff0000ll;
+        if(next < 0) next = 0;
+        return next;
+      };
+      for(u32 n = 0; n < samples; n++) {
+        const s32 x = lumiverseAudioDmemReadS16(dmem, m.inBuf + n * 2);
+        const s32 vl = (s32)(vl32 >> 16), vr = (s32)(vr32 >> 16);
+        const s32 l = x * vl + 0x4000 >> 15;
+        const s32 r = x * vr + 0x4000 >> 15;
+        accumulate(m.outBuf, n, l * dry + 0x4000 >> 15);
+        accumulate(m.aux1, n, r * dry + 0x4000 >> 15);
+        if(flags & 8) {
+          accumulate(m.aux2, n, l * wet + 0x4000 >> 15);
+          accumulate(m.aux3, n, r * wet + 0x4000 >> 15);
+        }
+        vl32 = ramp(vl32, targetL, rateL, r8L);
+        vr32 = ramp(vr32, targetR, rateR, r8R);
+      }
+      state.samples[0] = (s16)(u16)(vl32 >> 16);
+      state.samples[1] = (s16)(u16)(vl32 & 0xffff);
+      state.samples[2] = (s16)(u16)(vr32 >> 16);
+      state.samples[3] = (s16)(u16)(vr32 & 0xffff);
+      state.samples[4] = (s16)targetL;
+      state.samples[5] = (s16)targetR;
+      state.samples[6] = (s16)(u16)(rateL >> 16);
+      state.samples[7] = (s16)(u16)(rateL & 0xffff);
+      state.samples[8] = (s16)(u16)(rateR >> 16);
+      state.samples[9] = (s16)(u16)(rateR & 0xffff);
+      state.samples[10] = (s16)dry;
+      state.samples[11] = (s16)wet;
+      break;
+    }
+
+    case 0x0c: {  //MIXER: out += in * gain (Q15, saturated)
+      const u32 count = abi1 ? m.bufCount : (w0 >> 16 & 0xff) << 4;
       const s32 gain = (s16)(w0 & 0xffff);
       const u32 in = w1 >> 16, out = w1 & 0xffff;
       for(u32 index = 0; index < count; index += 2) {
@@ -632,7 +848,11 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
       break;
     }
 
-    case 0x07: {  //FILTER (8-tap FIR, Q15 taps; identity kernel = tap 3)
+    case 0x07: {  //ABI1: SEGMENT; ABI2 Zeldas: FILTER
+      if(abi1) {
+        m.segments[w1 >> 24 & 0xf] = w1 & 0x00ffffff;
+        break;
+      }
       if(flags == 2) {
         m.filterLength = w0 & 0xffff;
         m.filterCoefAddr = address;
@@ -683,7 +903,13 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
       break;
     }
 
-    case 0x08:  //SETBUFF
+    case 0x08:  //SETBUFF (flags 8 = A_AUX aux buffers, ABI1)
+      if(abi1 && flags == 8) {
+        m.aux1 = w0 & 0xffff;
+        m.aux2 = w1 >> 16;
+        m.aux3 = w1 & 0xffff;
+        break;
+      }
       m.inBuf = w0 & 0xffff;
       m.outBuf = w1 >> 16;
       m.bufCount = w1 & 0xffff;
@@ -894,7 +1120,7 @@ auto lumiverseAudioDebugDump(const LumiverseAudioDebugCapture& capture, u64 task
     fprintf(fp, "  %08x %08x\n", capture.alist[index], capture.alist[index + 1]);
   }
   fprintf(fp, "dmem (mine | theirs):\n");
-  for(u32 offset = 0x400; offset < 0xfc0; offset += 16) {
+  for(u32 offset = 0x000; offset < 0xfc0; offset += 16) {
     fprintf(fp, "%03x:", offset);
     for(u32 b = 0; b < 16; b += 2) fprintf(fp, " %04x", (u16)((u16)capture.dmem[offset + b] << 8 | capture.dmem[offset + b + 1]));
     fprintf(fp, " |");
@@ -990,7 +1216,8 @@ auto lumiverseAudioShadowSettle() -> void {
 auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   const int level = lumiverseAudioHLELevel();
   if(level < 1) return false;
-  if(!lumiverseAudioHashWhitelisted(ucodeHash)) return false;
+  const s32 dialect = lumiverseAudioDialectForHash(ucodeHash);
+  if(dialect < 0) return false;
 
   const u32 dataPtr = task[12] & 0x00ffffff;
   u32 dataSize = task[13];
@@ -1052,7 +1279,7 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   //completed it by now — audio tasks are serialized)
   if(level >= 2) lumiverseAudioShadowSettle();
 
-  if(!lumiverseAudioValidate(machine, dataPtr, dataSize, ucodeHash)) {
+  if(!lumiverseAudioValidate(machine, dataPtr, dataSize, (u32)dialect)) {
     machine.tasksFallback++;
     return false;
   }
@@ -1063,7 +1290,7 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   shadow.overflow = false;
   shadow.task = taskIndex;
 
-  lumiverseAudioExecute(machine, shadow, dataPtr, dataSize);
+  lumiverseAudioExecute(machine, shadow, dataPtr, dataSize, (u32)dialect);
 
   if(capture && level >= 2) {
     //stash the alist and our workspace now: the game reuses the alist buffer

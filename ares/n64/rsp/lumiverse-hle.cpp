@@ -280,7 +280,7 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
       //annotate game-provided data blocks (ADPCM books, loop states, filter
       //coefficient tables) with their raw RDRAM contents
       const u8 op = w0 >> 24;
-      if(op == 0x0b || op == 0x0f || (op == 0x07 && ((w0 >> 16) & 0xff) == 2)) {
+      if(op == 0x0b || op == 0x0f || op == 0x03 || (op == 0x07 && ((w0 >> 16) & 0xff) == 2)) {
         fprintf(alistDump, "  |");
         for(u32 b = 0; b < 64; b++) fprintf(alistDump, " %02x", lumiverseRDRAMByte((w1 & 0x00ffffff) + b));
       }
