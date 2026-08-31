@@ -114,8 +114,9 @@ auto lumiverseAudioHLEDebug() -> int {
 
 //command-set dialects (analogous to the gfx interpreter's GBI0/1/2)
 enum : u32 {
-  LumiverseAudioDialectABI2 = 0,  //SF64 / Zelda family (validated first)
-  LumiverseAudioDialectABI1 = 1,  //SM64 / Wave Race / Pokemon Snap family
+  LumiverseAudioDialectABI2 = 0,   //SF64 / Zelda family (validated first)
+  LumiverseAudioDialectABI1 = 1,   //SM64 / Wave Race / Pokemon Snap family
+  LumiverseAudioDialectNaudio = 2, //Smash Bros / Kirby family (fixed layout)
 };
 
 //whitelisted audio microcode hashes (FNV-1a over the ucode text, captured by
@@ -127,6 +128,17 @@ constexpr u64 LumiverseAudioUcodeMajoraU   = 0xa8df9aeb4a7cb685ull;  //Majora's 
 
 constexpr u64 LumiverseAudioUcodeSM64WR    = 0x394bf43d72dfa31dull;  //Super Mario 64 (U) + Wave Race 64 (U), shared
 constexpr u64 LumiverseAudioUcodeSnapU     = 0x7123e4d5f82ae6a5ull;  //Pokemon Snap (U)
+constexpr u64 LumiverseAudioUcodeSmashU    = 0xbbca23e37b0bc136ull;  //Super Smash Bros. (U) (+ Kirby 64 family)
+
+//LUMIVERSE_ARES_N64_AUDIO_HLE_NAUDIO=1 enables the still-experimental naudio
+//dialect (default off until validated)
+auto lumiverseAudioNaudioEnabled() -> bool {
+  static bool enabled = [] {
+    const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NAUDIO");
+    return value && value[0] == '1';
+  }();
+  return enabled;
+}
 
 //returns the command-set dialect for a whitelisted audio ucode, -1 otherwise
 auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
@@ -136,6 +148,7 @@ auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
   if(hash == LumiverseAudioUcodeMajoraU)   return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeSM64WR)    return LumiverseAudioDialectABI1;
   if(hash == LumiverseAudioUcodeSnapU)     return LumiverseAudioDialectABI1;
+  if(hash == LumiverseAudioUcodeSmashU && lumiverseAudioNaudioEnabled()) return LumiverseAudioDialectNaudio;
   return -1;
 }
 
@@ -317,6 +330,7 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
   v.aux2 = machine.aux2;
   v.aux3 = machine.aux3;
   const bool abi1 = dialect == LumiverseAudioDialectABI1;
+  if(dialect == LumiverseAudioDialectNaudio) return true;  //EXPERIMENT: permissive while decoding
 
   static u64 rejectLogs = 0;
   auto reject = [&](u32 offset, u32 w0, u32 w1, const char* reason) -> bool {
@@ -515,6 +529,49 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
 //execution pass
 //----------------------------------------------------------------------------
 
+//naudio dialect (Smash Bros family): fixed 0x170-byte chunk layout, commands
+//carry state addresses in cmd0.lo24 and dmem/count in cmd1. EXPERIMENTAL.
+auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow& shadow, u32 w0, u32 w1) -> void {
+  u8* dmem = m.dmem;
+  const u8 op = w0 >> 24;
+  switch(op) {
+  case 0x02: {  //CLEARBUFF
+    const u32 dmemAddr = w0 & 0xffff, count = w1 & 0xffff;
+    for(u32 index = 0; index < count && dmemAddr + index < 0x1000; index++) dmem[dmemAddr + index] = 0;
+    break;
+  }
+  case 0x04: {  //LOADBUFF count=cmd0 bits12-23, dmem=cmd0 lo12, addr=cmd1
+    const u32 count = w0 >> 12 & 0xfff, dmemAddr = w0 & 0xfff;
+    if(!count) break;
+    u8 scratch[0x1000];
+    lumiverseAudioReadRDRAM(shadow, w1 & 0x00ffffff, scratch, count);
+    for(u32 index = 0; index < count; index++) dmem[(dmemAddr + index) & 0xfff] = scratch[index];
+    break;
+  }
+  case 0x06: {  //SAVEBUFF
+    const u32 count = w0 >> 12 & 0xfff, dmemAddr = w0 & 0xfff;
+    if(!count) break;
+    u8 scratch[0x1000];
+    for(u32 index = 0; index < count; index++) scratch[index] = dmem[(dmemAddr + index) & 0xfff];
+    lumiverseAudioWriteRDRAM(shadow, w1 & 0x00ffffff, scratch, count);
+    break;
+  }
+  case 0x0b: {  //LOADADPCM count=cmd0.lo16 bytes, addr=cmd1
+    const u32 count = w0 & 0xffff;
+    if(!count || count > sizeof(LumiverseAudioMachine::book)) break;
+    u8 raw[sizeof(LumiverseAudioMachine::book)];
+    lumiverseAudioReadRDRAM(shadow, w1 & 0x00ffffff, raw, count);
+    for(u32 index = 0; index < count / 2; index++) {
+      m.book[index] = (s16)((u16)raw[index * 2] << 8 | raw[index * 2 + 1]);
+    }
+    m.bookEntries = count / 2;
+    break;
+  }
+  default:
+    break;  //remaining ops decoded via oracle
+  }
+}
+
 auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shadow, u32 dataPtr, u32 dataSize, u32 dialect) -> void {
   u8* dmem = m.dmem;
 
@@ -527,6 +584,10 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
     const u32 flags = w0 >> 16 & 0xff;
     const u32 address = lumiverseAudioResolve(m, dialect, w1);
     const bool abi1 = dialect == LumiverseAudioDialectABI1;
+    if(dialect == LumiverseAudioDialectNaudio) {
+      lumiverseAudioExecuteNaudio(m, shadow, w0, w1);
+      continue;
+    }
 
     switch(op) {
     case 0x00:
