@@ -293,6 +293,13 @@ struct LumiverseAudioMachine {
   s32 setTargetL = 0, setTargetR = 0;       //aSetVolume A_RATE targets
   u32 setRateL = 0x10000, setRateR = 0x10000;  //Q16 per-8-sample multipliers
   s32 setDryVol = 0, setWetVol = 0;         //aSetVolume A_AUX
+  //naudio (Smash/Kirby) state
+  u32 naLoadCount = 0;          //bytes staged by the last 04 load
+  u32 naDecodeSamples = 0;      //samples produced by the last decode/clear
+  s32 naPendVolL = 0, naPendVolR = 0;
+  s32 naPendTargetL = 0, naPendTargetR = 0;
+  u32 naPendRateL = 0x10000, naPendRateR = 0x10000;
+  s32 naPendWet = 0x7fff, naPendDry = 0x7fff;
   //statistics
   u64 tasksExecuted = 0;
   u64 tasksFallback = 0;
@@ -550,23 +557,51 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
 //execution pass
 //----------------------------------------------------------------------------
 
-//naudio dialect (Smash Bros family): fixed 0x170-byte chunk layout, commands
-//carry state addresses in cmd0.lo24 and dmem/count in cmd1. EXPERIMENTAL.
+//naudio dialect (Super Smash Bros. / Kirby 64 family). Fixed alist-space
+//layout derived empirically (per-command DMEM oracles; every alist dmem
+//field maps to physical DMEM at +0x4f0, so this interpreter uses the alist
+//values literally in its own workspace):
+//  0x000 staging (compressed input, then the resampler output = envmix in)
+//  0x170 decode buffer (16-sample state prefix, data at 0x190)
+//  0x4e0/0x650 wet L/R buses, 0x7c0/0x930 dry L/R buses (0x170 each)
+//Commands (fields verified against isolated LLE runs):
+//  0x02 CLEARBUFF dmem=cmd0.lo16, count=cmd1
+//  0x04 LOADBUFF  count=cmd0 bits12-23, dmem=cmd0.lo12, RDRAM addr=cmd1
+//  0x06 SAVEBUFF  same fields, direction reversed
+//  0x0b LOADADPCM count bytes=cmd0.lo16, addr=cmd1 (book)
+//  0x01 ADPCM     state addr=cmd0.lo24; cmd1 = [flags:4][outBytes:12]
+//                 [flags:4][chunk 0x170]; decodes staged bytes to the decode
+//                 buffer (state prefix + outBytes, 9-byte/16-sample frames)
+//  0x05 RESAMPLE  state addr=cmd0.lo24; pitch=cmd1>>16 (Q13, 0x2000=1.0);
+//                 reads the decode stream, writes 184 samples to staging
+//  0x03 ENVMIX    cmd0 = [flags byte][init vol u16], cmd1 = RDRAM param
+//                 block (per-lane vol int/frac vectors, targets, 16.16
+//                 rates, wet/dry Q15); wet buses += (x*vol>>15)*wet>>15,
+//                 dry buses += (x*vol>>15)*dry>>15
+//  0x09 pending init-params for the next ENVMIX (flags 0x00/0x04/0x06)
+//  0x0c MIXER     gain=s16 cmd0.lo16, in=cmd1.hi16, out=cmd1.lo16, 0x170 bytes
+//  0x0d INTERLEAVE / 0x0e POLEF: see handlers
 auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow& shadow, u32 w0, u32 w1) -> void {
   u8* dmem = m.dmem;
   const u8 op = w0 >> 24;
+  constexpr u32 NaChunk = 0x170;
+  constexpr u32 NaStaging = 0x000;
+  constexpr u32 NaDecode = 0x170;
+
   switch(op) {
   case 0x02: {  //CLEARBUFF
     const u32 dmemAddr = w0 & 0xffff, count = w1 & 0xffff;
-    for(u32 index = 0; index < count && dmemAddr + index < 0x1000; index++) dmem[dmemAddr + index] = 0;
+    for(u32 index = 0; index < count; index++) dmem[(dmemAddr + index) & 0xfff] = 0;
+    if(dmemAddr == NaDecode && count > 32) m.naDecodeSamples = (count - 32) / 2;
     break;
   }
-  case 0x04: {  //LOADBUFF count=cmd0 bits12-23, dmem=cmd0 lo12, addr=cmd1
+  case 0x04: {  //LOADBUFF
     const u32 count = w0 >> 12 & 0xfff, dmemAddr = w0 & 0xfff;
     if(!count) break;
     u8 scratch[0x1000];
     lumiverseAudioReadRDRAM(shadow, w1 & 0x00ffffff, scratch, count);
     for(u32 index = 0; index < count; index++) dmem[(dmemAddr + index) & 0xfff] = scratch[index];
+    if(dmemAddr == NaStaging) m.naLoadCount = count;
     break;
   }
   case 0x06: {  //SAVEBUFF
@@ -577,7 +612,7 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     lumiverseAudioWriteRDRAM(shadow, w1 & 0x00ffffff, scratch, count);
     break;
   }
-  case 0x0b: {  //LOADADPCM count=cmd0.lo16 bytes, addr=cmd1
+  case 0x0b: {  //LOADADPCM
     const u32 count = w0 & 0xffff;
     if(!count || count > sizeof(LumiverseAudioMachine::book)) break;
     u8 raw[sizeof(LumiverseAudioMachine::book)];
@@ -588,8 +623,226 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     m.bookEntries = count / 2;
     break;
   }
+  case 0x01: {  //ADPCM decode staged bytes -> decode buffer
+    auto& state = lumiverseAudioState(w0 & 0x00ffffff);
+    const u32 outBytes = w1 >> 16 & 0xfff;
+    const bool init = (w1 >> 28) & 1;   //bit 28 = voice start
+    s16 last[16];
+    if(init) for(auto& sample : last) sample = 0;
+    else for(u32 index = 0; index < 16; index++) last[index] = state.samples[index];
+    //state prefix at the decode buffer base
+    for(u32 index = 0; index < 16; index++) lumiverseAudioDmemWriteS16(dmem, NaDecode + index * 2, last[index]);
+    s32 prev2 = last[14], prev1 = last[15];
+    //cmd1 bits 12-15 = byte offset of the first frame inside the staged
+    //block (the loader DMAs 8-byte-aligned; verified bit-exact against LLE
+    //decodes at offsets 0 and 2)
+    u32 in = NaStaging + (w1 >> 12 & 0xf);
+    u32 out = NaDecode + 32;
+    const u32 frames = outBytes / 32;
+    for(u32 frame = 0; frame < frames; frame++) {
+      const u8 header = dmem[in++ & 0xfff];
+      const u32 scale = header >> 4;
+      u32 predictor = header & 0xf;
+      if(predictor * 16 + 16 > m.bookEntries) predictor = 0;
+      const s16* row0 = &m.book[predictor * 16];
+      const s16* row1 = &m.book[predictor * 16 + 8];
+      s32 residual[16];
+      for(u32 byteIndex = 0; byteIndex < 8; byteIndex++) {
+        const u8 byte = dmem[in++ & 0xfff];
+        s32 hi = byte >> 4, lo = byte & 0xf;
+        if(hi >= 8) hi -= 16;
+        if(lo >= 8) lo -= 16;
+        residual[byteIndex * 2 + 0] = hi << scale;
+        residual[byteIndex * 2 + 1] = lo << scale;
+      }
+      for(u32 half = 0; half < 2; half++) {
+        const s32* r = &residual[half * 8];
+        s16 decoded[8];
+        for(u32 j = 0; j < 8; j++) {
+          s64 acc = (s64)row0[j] * prev2 + (s64)row1[j] * prev1 + ((s64)r[j] << 11);
+          for(u32 k = 0; k < j; k++) acc += (s64)row1[j - 1 - k] * r[k];
+          decoded[j] = lumiverseAudioClamp16((s32)(acc >> 11));
+        }
+        for(u32 j = 0; j < 8; j++) lumiverseAudioDmemWriteS16(dmem, out + j * 2, decoded[j]);
+        out += 16;
+        prev2 = decoded[6];
+        prev1 = decoded[7];
+      }
+    }
+    for(u32 index = 0; index < 16; index++) {
+      state.samples[index] = lumiverseAudioDmemReadS16(dmem, out - 32 + index * 2);
+    }
+    m.naDecodeSamples = outBytes / 2;
+    break;
+  }
+  case 0x05: {  //RESAMPLE decode stream -> 184 samples at staging.
+    //The decoder writes a 16-sample history prefix before its data; the
+    //stream position persists across chunks (pos_next = pos + 184*pitch -
+    //avail), going negative into the prefix for unconsumed leftovers.
+    auto& state = lumiverseAudioState(w0 & 0x00ffffff);
+    const u32 pitch = w1 >> 16 & 0x3fff;   //Q13; bit 14 of the field = init
+    const bool init = (w1 >> 16 & 0x4000) != 0;
+    s32 pos32 = init ? 0 : (s32)state.frac;
+    if(pos32 < -0x200000 || pos32 > 0x200000) pos32 = 0;  //sanity re-anchor
+    const u32 dataStart = NaDecode + 32;
+    const u32 step = pitch << 3;           //Q13 -> Q16 per output sample
+    auto sampleAt = [&](s32 index) -> s32 {
+      if(index < -16) index = -16;
+      return lumiverseAudioDmemReadS16(dmem, dataStart + index * 2);
+    };
+    s64 position = pos32;
+    for(u32 n = 0; n < NaChunk / 2; n++) {
+      s32 index = (s32)(position >> 16);
+      if((position & 0xffff) == 0 && (position < 0)) index = (s32)(position / 65536);
+      const s64 f = position - ((s64)index << 16);
+      const s64 x0 = sampleAt(index - 2);
+      const s64 x1 = sampleAt(index - 1);
+      const s64 x2 = sampleAt(index);
+      const s64 x3 = sampleAt(index + 1);
+      const s64 f2 = f * f >> 16, f3 = f2 * f >> 16;
+      const s64 catmull = x1
+        + ((f  * (x2 - x0)) >> 17)
+        + ((f2 * (2 * x0 - 5 * x1 + 4 * x2 - x3)) >> 17)
+        + ((f3 * (3 * (x1 - x2) + x3 - x0)) >> 17);
+      const s64 oneMinusF = 0x10000 - f;
+      const s64 omf2 = oneMinusF * oneMinusF >> 16, omf3 = omf2 * oneMinusF >> 16;
+      const s64 bspline = (omf3 * x0
+        + (0x40000 - 6 * f2 + 3 * f3) * x1
+        + (0x10000 + 3 * f + 3 * f2 - 3 * f3) * x2
+        + f3 * x3) / 6 >> 16;
+      s64 y = (2 * catmull + bspline) / 3;
+      const s64 lower = x1 < x2 ? x1 : x2;
+      const s64 upper = x1 < x2 ? x2 : x1;
+      if(y < lower) y = lower;
+      if(y > upper) y = upper;
+      lumiverseAudioDmemWriteS16(dmem, NaStaging + n * 2, lumiverseAudioClamp16((s32)y));
+      position += step;
+    }
+    const s32 avail = (s32)(m.naDecodeSamples ? m.naDecodeSamples : NaChunk / 2);
+    state.frac = (u32)(s32)(position - ((s64)avail << 16));
+    break;
+  }
+  case 0x09: {  //pending envmix init-params
+    const u32 flags = w0 >> 16 & 0xff;
+    const s32 value = (s16)(w0 & 0xffff);
+    //mapping verified against an observed init (voice block 0x8d130):
+    //f=00 carries targetL+rateL, f=04 targetR+rateR, f=06 the starting
+    //volL plus wet/dry gains; the ENVMIX command embeds the starting volR
+    switch(flags) {
+    case 0x00: m.naPendTargetL = value; m.naPendRateL = w1; break;
+    case 0x04: m.naPendTargetR = value; m.naPendRateR = w1; break;
+    case 0x06: m.naPendVolL = value;
+               m.naPendWet = (s16)(w1 >> 16); m.naPendDry = (s16)(w1 & 0xffff); break;
+    }
+    break;
+  }
+  case 0x03: {  //ENVMIX using the RDRAM parameter block
+    const u32 flags = w0 >> 16 & 0xff;
+    const u32 address = w1 & 0x00ffffff;
+    u8 raw[0x50];
+    lumiverseAudioReadRDRAM(shadow, address, raw, 0x50);
+    auto rd16 = [&](u32 offset) -> s32 { return (s16)((u16)raw[offset] << 8 | raw[offset + 1]); };
+    auto rdu16 = [&](u32 offset) -> u32 { return (u16)((u16)raw[offset] << 8 | raw[offset + 1]); };
+    s64 vl32, vr32;
+    s32 targetL, targetR, dry, wet;
+    u32 rateL, rateR;
+    if(flags & 1) {
+      //init: volumes from the 0x09 pending params and the value embedded in
+      //this command; targets/rates/wet/dry from pending
+      const s32 initVol = (s16)(w0 & 0xffff);
+      vl32 = (s64)m.naPendVolL << 16;
+      vr32 = (s64)initVol << 16;
+      targetL = m.naPendTargetL; targetR = (s32)initVol;
+      rateL = m.naPendRateL; rateR = m.naPendRateR;
+      wet = m.naPendWet; dry = m.naPendDry;
+    } else {
+      vl32 = (s64)rdu16(0x00) << 16 | rdu16(0x10);
+      vr32 = (s64)rdu16(0x20) << 16 | rdu16(0x30);
+      targetL = rd16(0x40); rateL = rdu16(0x42) << 16 | rdu16(0x44);
+      targetR = rd16(0x46); rateR = rdu16(0x48) << 16 | rdu16(0x4a);
+      wet = rd16(0x4c); dry = rd16(0x4e);
+    }
+    const u32 samples = NaChunk / 2;
+    auto accumulate = [&](u32 bus, u32 n, s32 value) {
+      const s32 current = lumiverseAudioDmemReadS16(dmem, bus + n * 2);
+      lumiverseAudioDmemWriteS16(dmem, bus + n * 2, lumiverseAudioClamp16(current + value));
+    };
+    auto ramp = [](s64 vol32, s32 target, u32 rate) -> s64 {
+      s64 next = vol32 * rate >> 16;
+      const s64 target32 = (s64)target << 16;
+      if(rate >= 0x10000) { if(next > target32) next = target32; }
+      else { if(next < target32) next = target32; }
+      if(next > 0x7fff0000ll) next = 0x7fff0000ll;
+      if(next < 0) next = 0;
+      return next;
+    };
+    for(u32 n = 0; n < samples; n++) {
+      const s32 x = lumiverseAudioDmemReadS16(dmem, NaStaging + n * 2);
+      const s32 vl = (s32)(vl32 >> 16), vr = (s32)(vr32 >> 16);
+      const s32 l = x * vl + 0x4000 >> 15;
+      const s32 r = x * vr + 0x4000 >> 15;
+      accumulate(0x4e0, n, l * wet + 0x4000 >> 15);
+      accumulate(0x650, n, r * wet + 0x4000 >> 15);
+      accumulate(0x7c0, n, l * dry + 0x4000 >> 15);
+      accumulate(0x930, n, r * dry + 0x4000 >> 15);
+      //the 16.16 rate applies FOUR times per output sample (fitted from an
+      //observed init chunk: vol 0x804 -> 0x7e7 = rate^(4*184))
+      for(u32 rep = 0; rep < 4; rep++) {
+        vl32 = ramp(vl32, targetL, rateL);
+        vr32 = ramp(vr32, targetR, rateR);
+      }
+    }
+    //write the updated block back (lane vectors flattened to the scalar)
+    u8 outBlock[0x50];
+    auto wr16 = [&](u32 offset, u32 value) { outBlock[offset] = value >> 8; outBlock[offset + 1] = (u8)value; };
+    for(u32 lane = 0; lane < 8; lane++) {
+      wr16(0x00 + lane * 2, (u32)(vl32 >> 16));
+      wr16(0x10 + lane * 2, (u32)(vl32 & 0xffff));
+      wr16(0x20 + lane * 2, (u32)(vr32 >> 16));
+      wr16(0x30 + lane * 2, (u32)(vr32 & 0xffff));
+    }
+    wr16(0x40, (u32)targetL); wr16(0x42, rateL >> 16); wr16(0x44, rateL & 0xffff);
+    wr16(0x46, (u32)targetR); wr16(0x48, rateR >> 16); wr16(0x4a, rateR & 0xffff);
+    wr16(0x4c, (u32)wet); wr16(0x4e, (u32)dry);
+    lumiverseAudioWriteRDRAM(shadow, address, outBlock, 0x50);
+    break;
+  }
+  case 0x0c: {  //MIXER (0x170 bytes)
+    const s32 gain = (s16)(w0 & 0xffff);
+    const u32 in = w1 >> 16 & 0xffff, out = w1 & 0xffff;
+    for(u32 index = 0; index < NaChunk; index += 2) {
+      const s32 x = lumiverseAudioDmemReadS16(dmem, in + index);
+      const s32 y = lumiverseAudioDmemReadS16(dmem, out + index);
+      lumiverseAudioDmemWriteS16(dmem, out + index, lumiverseAudioClamp16(y + (x * gain + 0x4000 >> 15)));
+    }
+    break;
+  }
+  case 0x0a: {  //DMEMMOVE (in=cmd0.lo16, out=cmd1.hi16; the reversed
+                //direction A/B-tested 2.6x worse against LLE output)
+    const u32 in = w0 & 0xffff, out = w1 >> 16 & 0xffff, count = w1 & 0xffff;
+    u8 scratch[0x1000];
+    for(u32 index = 0; index < count; index++) scratch[index] = dmem[(in + index) & 0xfff];
+    for(u32 index = 0; index < count; index++) dmem[(out + index) & 0xfff] = scratch[index];
+    break;
+  }
+  case 0x0d: {  //INTERLEAVE: fixed buffers (fields carry unrelated values in
+                //the observed streams): L=0x4e0, R=0x650 -> stereo at 0x000
+    s16 scratch[NaChunk];
+    for(u32 n = 0; n < NaChunk / 2; n++) {
+      scratch[n * 2 + 0] = lumiverseAudioDmemReadS16(dmem, 0x4e0 + n * 2);
+      scratch[n * 2 + 1] = lumiverseAudioDmemReadS16(dmem, 0x650 + n * 2);
+    }
+    for(u32 n = 0; n < NaChunk; n++) lumiverseAudioDmemWriteS16(dmem, NaStaging + n * 2, scratch[n]);
+    break;
+  }
+  case 0x0e: {  //POLEF: an isolated LLE run showed NO dmem buffer writes
+                //from this op in the observed stream (internal state only),
+                //so it is treated as a no-op pending better evidence — the
+                //in-place-filter guess measurably roughened the output.
+    break;
+  }
   default:
-    break;  //remaining ops decoded via oracle
+    break;
   }
 }
 
@@ -1164,7 +1417,7 @@ auto lumiverseAudioShadowCompare(LumiverseAudioShadow& shadow) -> void {
     else if(maxDiff <= 64) close++;
     else {
       bad++;
-      if(maxDiff > 200 && detailLines < 400) {
+      if(maxDiff > 5000 && detailLines < 1200) {
         detailLines++;
         fprintf(stderr, "[rsp-hle-audio-shadow]   write cmd=%u addr=%06x len=%u maxdiff=%d firstbad=+%u ratio=%.3f\n",
           write.command, write.addr, write.length, maxDiff, firstBad,
