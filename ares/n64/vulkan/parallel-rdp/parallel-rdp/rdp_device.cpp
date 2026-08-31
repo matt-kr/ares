@@ -219,6 +219,11 @@ void CommandProcessor::init_renderer()
 	}));
 	renderer.set_shader_bank(shader_bank.get());
 	vi.set_shader_bank(shader_bank.get());
+
+	// LUMIVERSE: kick async compiles for every reachable compute pipeline
+	// variant now, so first-use mid-gameplay never stalls a thread on a
+	// synchronous Metal pipeline build.
+	renderer.lumiverse_prewarm_compute_pipelines();
 #endif
 }
 

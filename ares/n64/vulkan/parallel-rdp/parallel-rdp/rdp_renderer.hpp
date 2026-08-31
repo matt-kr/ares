@@ -110,6 +110,13 @@ public:
 	void set_tmem(Vulkan::Buffer *buffer);
 	void set_shader_bank(const ShaderBank *bank);
 
+	// LUMIVERSE: queue async compiles for every reachable compute-pipeline
+	// variant so first use during gameplay never compiles synchronously on
+	// the emulation thread (MoltenVK builds Metal pipelines synchronously;
+	// see broken_pipeline_cache_control in device.cpp). Called once after
+	// the shader bank is installed. Gated by LUMIVERSE_ARES_N64_COMPUTE_PREWARM.
+	void lumiverse_prewarm_compute_pipelines();
+
 	bool init_renderer(const RendererOptions &options);
 
 	// setup may be mutated to apply various fixups to triangle setup.
@@ -366,6 +373,7 @@ private:
 
 	bool can_support_minimum_subgroup_size(unsigned size) const;
 	bool supports_subgroup_size_control(uint32_t minimum_size, uint32_t maximum_size) const;
+
 
 	std::unordered_set<Util::Hash> pending_async_pipelines;
 

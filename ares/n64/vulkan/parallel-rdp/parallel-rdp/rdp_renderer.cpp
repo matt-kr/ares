@@ -3593,6 +3593,176 @@ bool Renderer::supports_subgroup_size_control(uint32_t minimum_size, uint32_t ma
 	return true;
 }
 
+// LUMIVERSE: pre-warm all enumerable compute pipeline variants through the
+// async pipeline worker. On MoltenVK, pipelineCreationCacheControl is a lie
+// (compiles happen synchronously and report VK_SUCCESS), so any pipeline not
+// already in the cache stalls whichever thread first dispatches with it —
+// device logs showed 10-190 ms "Stalled compile (compute, mode: sync)" holes
+// mid-gameplay. The variant space below mirrors each dispatch site's
+// set_program/spec-constant/subgroup-state setup exactly; a hash mismatch is
+// harmless (one wasted compile) but leaves that variant stalling, so keep
+// this in sync with the dispatch sites above.
+void Renderer::lumiverse_prewarm_compute_pipelines()
+{
+	if (!shader_bank || !pipeline_worker)
+		return;
+	if (const char *env = getenv("LUMIVERSE_ARES_N64_COMPUTE_PREWARM"); env && env[0] == '0')
+		return;
+
+	auto cmd = device->request_command_buffer(Vulkan::CommandBuffer::Type::AsyncCompute);
+	unsigned queued = 0;
+
+	const auto push_current = [&]() {
+		Vulkan::DeferredPipelineCompile compile;
+		cmd->extract_pipeline_state(compile);
+		if (pending_async_pipelines.count(compile.hash) == 0)
+		{
+			pending_async_pipelines.insert(compile.hash);
+			pipeline_worker->push(std::move(compile));
+			queued++;
+		}
+	};
+
+	// submit_tmem_update
+	cmd->set_program(shader_bank->tmem_update);
+	cmd->set_specialization_constant_mask(1);
+	cmd->set_specialization_constant(0, ImplementationConstants::DefaultWorkgroupSize);
+	push_current();
+
+	// clear_indirect_buffer
+	cmd->set_program(shader_bank->clear_indirect_buffer);
+	cmd->set_specialization_constant_mask(1);
+	cmd->set_specialization_constant(0, ImplementationConstants::DefaultWorkgroupSize);
+	push_current();
+
+	// submit_span_setup_jobs (upscale false/true)
+	for (unsigned upscale = 0; upscale < (caps.upscaling > 1 ? 2u : 1u); upscale++)
+	{
+		cmd->set_program(shader_bank->span_setup);
+		cmd->set_specialization_constant_mask(3);
+		cmd->set_specialization_constant(0, (upscale ? caps.upscaling : 1) * ImplementationConstants::DefaultWorkgroupSize);
+		cmd->set_specialization_constant(1, upscale ? Util::trailing_zeroes(caps.upscaling) : 0u);
+		push_current();
+	}
+
+	// submit_tile_binning_combined
+	{
+		uint32_t subgroup_size = device->get_device_features().vk11_props.subgroupSize;
+		cmd->set_program(shader_bank->tile_binning_combined);
+		if (caps.subgroup_tile_binning)
+		{
+			if (supports_subgroup_size_control(32, subgroup_size))
+			{
+				cmd->enable_subgroup_size_control(true);
+				cmd->set_subgroup_size_log2(true, 5, Util::trailing_zeroes(subgroup_size));
+			}
+		}
+		else
+			subgroup_size = 32;
+		cmd->set_specialization_constant_mask(1);
+		cmd->set_specialization_constant(0, subgroup_size);
+		push_current();
+		cmd->enable_subgroup_size_control(false);
+	}
+
+	// submit_rasterization generic fallback variants (used while specialised
+	// pipelines compile asynchronously); only reached without the ubershader
+	if (!caps.ubershader)
+	{
+		for (unsigned upscaling = 0; upscaling < (caps.upscaling > 1 ? 2u : 1u); upscaling++)
+		{
+			uint32_t scale_log2_bit = (upscaling ? Util::trailing_zeroes(caps.upscaling) : 0u) << RASTERIZATION_UPSCALING_LOG2_BIT_OFFSET;
+			cmd->set_program(shader_bank->rasterizer);
+			cmd->set_specialization_constant_mask(7);
+			cmd->set_specialization_constant(0, ImplementationConstants::TileWidth);
+			cmd->set_specialization_constant(1, ImplementationConstants::TileHeight);
+			cmd->set_specialization_constant(2, scale_log2_bit);
+			push_current();
+		}
+	}
+
+	// submit_depth_blend / ubershader: fmt x depth-aliasing x upscaled x
+	// write-mask variants (the ~100+ ms compiles that stall mid-game when a
+	// title switches framebuffer format or depth address aliasing)
+	for (unsigned upscaled = 0; upscaled < (caps.upscaling > 1 ? 2u : 1u); upscaled++)
+	{
+		for (uint32_t fmt = uint32_t(FBFormat::I4); fmt <= uint32_t(FBFormat::RGBA8888); fmt++)
+		{
+			for (unsigned depth_alias = 0; depth_alias < 2; depth_alias++)
+			{
+				for (unsigned write_mask = 0; write_mask < 2; write_mask++)
+				{
+					if (caps.ubershader)
+						cmd->set_program(shader_bank->ubershader);
+					else
+						cmd->set_program(shader_bank->depth_blend);
+					cmd->set_specialization_constant_mask(0xff);
+					cmd->set_specialization_constant(0, uint32_t(rdram_size));
+					cmd->set_specialization_constant(1, fmt);
+					cmd->set_specialization_constant(2, depth_alias);
+					cmd->set_specialization_constant(3, ImplementationConstants::TileWidth);
+					cmd->set_specialization_constant(4, ImplementationConstants::TileHeight);
+					cmd->set_specialization_constant(5, Limits::MaxPrimitives);
+					cmd->set_specialization_constant(6, upscaled ? caps.max_width : Limits::MaxWidth);
+					cmd->set_specialization_constant(7, write_mask |
+					                                    ((upscaled ? Util::trailing_zeroes(caps.upscaling) : 0u) << 1u));
+					push_current();
+				}
+			}
+		}
+	}
+
+	// submit_update_upscaled_domain (upscaled rendering only)
+	if (caps.upscaling > 1)
+	{
+		Vulkan::Program *stages[] = {
+			shader_bank->update_upscaled_domain_pre,
+			shader_bank->update_upscaled_domain_post,
+			shader_bank->update_upscaled_domain_resolve,
+		};
+		for (auto *program : stages)
+		{
+			for (uint32_t pixel_size_log2 = 0; pixel_size_log2 < 3; pixel_size_log2++)
+			{
+				for (unsigned depth_alias = 0; depth_alias < 2; depth_alias++)
+				{
+					cmd->set_program(program);
+					cmd->set_specialization_constant_mask(0x7f);
+					cmd->set_specialization_constant(0, uint32_t(rdram_size));
+					cmd->set_specialization_constant(1, pixel_size_log2);
+					cmd->set_specialization_constant(2, depth_alias);
+					cmd->set_specialization_constant(3, ImplementationConstants::DefaultWorkgroupSize);
+					cmd->set_specialization_constant(4, caps.upscaling * caps.upscaling);
+					cmd->set_specialization_constant(5, uint32_t(caps.super_sample_readback_dither));
+					cmd->set_specialization_constant(6, uint32_t(!is_host_coherent));
+					push_current();
+				}
+			}
+		}
+
+		cmd->set_program(shader_bank->clear_super_sampled_write_mask);
+		cmd->set_specialization_constant_mask(1);
+		cmd->set_specialization_constant(0, ImplementationConstants::DefaultWorkgroupSize);
+		push_current();
+	}
+
+	// resolve_coherency_gpu_to_host (incoherent RDRAM only)
+	if (!is_host_coherent)
+	{
+		for (auto *program : { shader_bank->masked_rdram_resolve, shader_bank->clear_write_mask })
+		{
+			cmd->set_program(program);
+			cmd->set_specialization_constant_mask(3);
+			cmd->set_specialization_constant(0, ImplementationConstants::IncoherentPageSize / 4);
+			cmd->set_specialization_constant(1, ImplementationConstants::IncoherentPageSize / 4);
+			push_current();
+		}
+	}
+
+	device->submit_discard(cmd);
+	LOGI("Lumiverse: queued %u compute pipeline pre-warm compiles.\n", queued);
+}
+
 void Renderer::PipelineExecutor::perform_work(const Vulkan::DeferredPipelineCompile &compile) const
 {
 	auto start_ts = device->write_calibrated_timestamp();
