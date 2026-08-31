@@ -227,6 +227,23 @@ auto RDP::flushCommands() -> void {
   command.bufferBusy = 1;
   command.pipeBusy = 1;
   command.startGclk = 1;
+  //Lumiverse diagnostic: LUMIVERSE_ARES_N64_RDP_STREAM_DUMP=<path> appends
+  //every consumed RDP command range as text words (source-aware) before the
+  //renderer eats it. Empirical analysis only; default off.
+  static FILE* lumiverseStreamDump = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_RDP_STREAM_DUMP");
+    return path && path[0] ? fopen(path, "w") : nullptr;
+  }();
+  if(lumiverseStreamDump && command.end > command.current) {
+    auto& memory = !command.source ? (Memory::Writable&)rdram.ram : (Memory::Writable&)rsp.dmem;
+    fprintf(lumiverseStreamDump, "kick src=%s cur=%06x end=%06x\n",
+      command.source ? "xbus" : "rdram", (u32)command.current, (u32)command.end);
+    for(u32 address = command.current; address + 8 <= command.end && address < command.current + 0x4000; address += 8) {
+      fprintf(lumiverseStreamDump, "  %08x %08x\n",
+        memory.readUnaligned<Word>(address), memory.readUnaligned<Word>(address + 4));
+    }
+    fflush(lumiverseStreamDump);
+  }
   if(command.end > command.current) render();
   command.ready = 1;
 }

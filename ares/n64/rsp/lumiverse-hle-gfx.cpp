@@ -1741,7 +1741,7 @@ auto lumiverseGfxOpcodeSupported(u8 opcode) -> bool {
 
 //dry-run walker shared by GBI1 and GBI0 (Fast3D): flow control + segment
 //table only; any unsupported opcode fails the whole task over to LLE
-auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = LumiverseDialectGBI1) -> bool {
+auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = LumiverseDialectGBI1, bool rejectBakedRDP = false) -> bool {
   u32 segments[16] = {};
   u32 stack[32];
   u32 stackDepth = 0;
@@ -1753,12 +1753,21 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
     return (segments[(address >> 24) & 0xf] + (address & 0x00ffffff)) & 0x00ffffff;
   };
 
+  //LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP=<path>: append every walked DL
+  //command (empirical analysis of undecoded dialects, e.g. GoldenEye 2.0G)
+  static FILE* dlDump = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP");
+    return path && path[0] ? fopen(path, "w") : nullptr;
+  }();
+  if(dlDump) fprintf(dlDump, "task dl=%06x dialect=%u\n", pc, dialect);
+
   u32 steps = 0;
   while(pc && steps++ < 1000000) {
     const u32 cmd0 = lumiverseGfxWord(pc + 0);
     const u32 cmd1 = lumiverseGfxWord(pc + 4);
     pc += 8;
     const u8 opcode = cmd0 >> 24;
+    if(dlDump && steps < 20000) fprintf(dlDump, "  %06x: %08x %08x\n", pc - 8, cmd0, cmd1);
 
     census.counts[opcode]++;
     if(!census.seen[opcode]) { census.seen[opcode] = true; newOpcode = true; }
@@ -1771,6 +1780,18 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
       }
       supported = false;
       continue;  //keep walking to complete the census
+    }
+
+    //GoldenEye 2.0G bakes raw RDP command streams into the DL via
+    //0xb4/0xb2/0xb3; that format is not implemented, so any task containing
+    //them falls back to LLE (never observed in menus; expected in gameplay)
+    if(rejectBakedRDP && (opcode == 0xb4 || opcode == 0xb2 || opcode == 0xb3)) {
+      static bool geLogged = false;
+      if(!geLogged) {
+        geLogged = true;
+        fprintf(stderr, "[rsp-hle-gfx] GE baked-RDP op %02x -> LLE fallback\n", opcode);
+      }
+      supported = false;
     }
 
     switch(opcode) {
@@ -1958,6 +1979,7 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
 #if defined(VULKAN)
   u32 dialect;
   u32 gbi0Vertex = LumiverseGBI0VertexStandard;
+  bool geBaked = false;
   switch(ucodeHash) {
   case LumiverseUcodeF3DEXNoN122:   dialect = LumiverseDialectGBI1; break;
   case LumiverseUcodeF3DEX121:      dialect = LumiverseDialectGBI1; break;
@@ -1978,8 +2000,11 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   case LumiverseUcodeFast3DCUSA:    dialect = LumiverseDialectGBI0; break;
   case LumiverseUcodeFast3DWR64:    dialect = LumiverseDialectGBI0; gbi0Vertex = LumiverseGBI0VertexWaveRace; break;
   case LumiverseUcodeFast3DSOTE:    dialect = LumiverseDialectGBI0; gbi0Vertex = LumiverseGBI0VertexSOTE; break;
-  //GoldenEye 2.0G (c8f38644ac25bbab) intentionally absent: baked RDP
-  //command streams (0xb4/0xb2/0xb3) need real support, not the rect hack
+  //GoldenEye (U) "RSP SW Version: 2.0G": standard Fast3D command set in the
+  //menus (5M-command census over 3600 steps showed zero 0xb4/0xb2/0xb3);
+  //the baked raw-RDP stream feature those opcodes select is NOT implemented
+  //and the dry-run rejects any task using them (per-task LLE fallback).
+  case 0xc8f38644ac25bbabull: dialect = LumiverseDialectGBI0; geBaked = true; break;
   default: return false;
   }
   if(!vulkan.enable) return false;
@@ -1994,7 +2019,7 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
 
   const bool walkable = dialect == LumiverseDialectGBI2
     ? lumiverseGfxDryRunGBI2(dataPtr, census)
-    : lumiverseGfxDryRun(dataPtr, census, dialect);
+    : lumiverseGfxDryRun(dataPtr, census, dialect, geBaked);
   if(!walkable) {
     tasksFallback++;
     return false;
