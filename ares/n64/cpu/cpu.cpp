@@ -175,13 +175,97 @@ auto CPU::instruction() -> bool {
     }
   }
 
+  //Lumiverse addition: LUMIVERSE_ARES_N64_CPU_FAST=1 (default off) enables
+  //interpreter-path speedups. Device builds cannot obtain JIT memory (the
+  //recompiler is force-disabled outside debugger launches — see
+  //RetroGamingService.isJITAvailable), so the interpreter is what actually
+  //runs on hardware. Sub-knobs, only honored while CPU_FAST=1:
+  //  LUMIVERSE_ARES_N64_CPU_FAST_BATCH  clock-tick budget between scheduler
+  //    synchronizations (default 32768, 0 = stock per-instruction sync).
+  //    Mirrors the recompiler's jitClockTarget budget: min(batch, timer
+  //    delta, queue delta); queueInsert() lowers the live target and
+  //    forceSynchronize() zeroes it, so interrupts/events still end a batch
+  //    immediately.
+  //  LUMIVERSE_ARES_N64_CPU_FAST_NOTRACE  (default 1, 0 = off) skip the
+  //    per-instruction tracer-enabled virtual call unless the instruction
+  //    tracer is armed; recompiler.callInstructionPrologue already tracks
+  //    the tracer toggle, and recompiled code compiles the same short-
+  //    circuit in, so tracer-off behavior is identical.
+  static const bool lumiverseCpuFast = [] {
+    const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST");
+    return v && *v == '1';
+  }();
+  static const s64 lumiverseCpuFastBatch = [] {
+    if(!lumiverseCpuFast) return (s64)0;
+    const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_BATCH");
+    const s64 value = v ? ::atoll(v) : 32768;
+    return value > 0 ? value : (s64)0;
+  }();
+  static const bool lumiverseCpuFastNoTrace = [] {
+    if(!lumiverseCpuFast) return false;
+    const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_NOTRACE");
+    return !v || *v != '0';
+  }();
+
+  if(lumiverseCpuFastBatch && Thread::clock >= jitClockTarget) {
+    //Timer distance is modular: count/compare are n33 and the timer next
+    //fires when count crosses compare from below, so once compare has been
+    //passed (or is unused, e.g. compare=0) the true distance is the wrap
+    //distance, not zero. The recompiler path's non-modular clamp degrades
+    //its budget to zero in that state; computing it modularly here keeps
+    //batches alive for games that never program the Compare timer.
+    s64 timerDelta = (s64)(u64)n33(scc.compare - scc.count);
+    s64 queueDelta = queue.timeToNextEvent();
+    if(queueDelta < 0) queueDelta = 0;
+    jitClockTarget = Thread::clock + min<s64>(lumiverseCpuFastBatch, min(timerDelta, queueDelta));
+  }
   auto data = fetch(access);
   if (!data) return true;
   pipeline.begin();
-  instructionPrologue(ipu.pc, *data);
+  if(!lumiverseCpuFastNoTrace || unlikely(recompiler.callInstructionPrologue)) {
+    instructionPrologue(ipu.pc, *data);
+  }
   decoderEXECUTE(*data);
   instructionEpilogue<0>();
   pipeline.end();
+  if(lumiverseCpuFastBatch) {
+    //Lumiverse diagnostic (temporary): batch-length telemetry under
+    //LUMIVERSE_ARES_N64_CPU_DIAG=1.
+    static const bool diag = [] {
+      const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_DIAG");
+      return v && *v == '1';
+    }();
+    const bool batchEnd = Thread::clock >= jitClockTarget;
+    if(unlikely(diag)) {
+      static u64 instrs = 0, syncs = 0, timerCap = 0, queueCap = 0, forceCap = 0;
+      instrs++;
+      if(batchEnd) {
+        syncs++;
+        if(jitClockTarget == 0) {
+          forceCap++;
+          static struct { u64 pc; u32 op; u64 count; } fhist[32] = {};
+          u64 pc = ipu.pc; u32 slot = (u32)((pc >> 2) ^ (pc >> 11)) & 31;
+          if(fhist[slot].pc == pc) fhist[slot].count++;
+          else if(fhist[slot].count < 8) { fhist[slot].pc = pc; fhist[slot].op = *data; fhist[slot].count = 1; }
+          if((forceCap & 0xffffff) == 0) for(auto& h : fhist) if(h.count > 65536)
+            fprintf(stderr, "[cpu-diag]   forcePC=%016llx op=%08x count=%llu\n",
+              (unsigned long long)h.pc, h.op, (unsigned long long)h.count);
+        }
+        else {
+          s64 timerDelta = (s64)scc.compare - (s64)scc.count;
+          s64 queueDelta = queue.timeToNextEvent();
+          if(timerDelta <= queueDelta && timerDelta < lumiverseCpuFastBatch) timerCap++;
+          else if(queueDelta < lumiverseCpuFastBatch) queueCap++;
+        }
+        if((syncs & 0x3ffff) == 0)
+          fprintf(stderr, "[cpu-diag] instrs=%llu syncs=%llu avgBatch=%.1f force=%llu timerCap=%llu queueCap=%llu\n",
+            (unsigned long long)instrs, (unsigned long long)syncs,
+            (double)instrs / (double)syncs, (unsigned long long)forceCap,
+            (unsigned long long)timerCap, (unsigned long long)queueCap);
+      }
+    }
+    return batchEnd;
+  }
   return true;
 }
 
