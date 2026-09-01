@@ -43,6 +43,7 @@ struct CPU : Thread {
   auto queueInsert(u32 event, u32 clocks) -> void;
 
   auto instruction() -> bool;
+  auto lumiverseLoadFastConfig() -> void;
   auto instructionPrologue(u64 address, u32 instruction) -> void;
   template<bool Recompiled> auto instructionEpilogue() -> void;
   auto raiseCoprocessor1Exception() -> void;
@@ -353,10 +354,47 @@ struct CPU : Thread {
   template<u32 Size> auto busReadBurst(u32 address, u32 *data) -> bool;
   template<u32 Size> auto read(PhysAccess access) -> maybe<u64>;
   template<u32 Size> auto write(PhysAccess access, u64 data) -> bool;
+  //Lumiverse addition: LUMIVERSE_ARES_N64_CPU_FAST configuration, read once
+  //in power() (see cpu.cpp) so the interpreter hot path carries no
+  //function-local-static guards. All fields are false/0 unless CPU_FAST=1.
+  struct LumiverseFast {
+    bool enabled = false;
+    s64  batch = 0;       //CPU_FAST_BATCH: scheduler sync budget in clock ticks
+    bool noTrace = false; //CPU_FAST_NOTRACE: skip tracer virtual unless armed
+    bool fetch = false;   //CPU_FAST_FETCH: inline KSEG0-RDRAM instruction fetch
+    bool memory = false;  //CPU_FAST_MEM: inline KSEG0-RDRAM aligned loads/stores
+    bool memoryLive = false;  //memory && no GDB breakpoints/watchpoints (refreshed per synchronize)
+    int  diag = 0;        //CPU_DIAG: 1 = batch telemetry, 2 = + PC histogram
+  } lumiverseFast;
+
+  //Lumiverse addition: inline fast path for the dominant case — an aligned
+  //access into KSEG0 RDRAM (0xffffffff80000000..83efffff, the range the
+  //general devirtualize() already special-cases) — that skips the
+  //non-inlined devirtualize/vaddrAlignedError/read(PhysAccess) call chain
+  //and the GDB watchpoint report. Only taken while no GDB breakpoints or
+  //watchpoints exist (memoryLive), so debugger behavior is unchanged.
+  //Unaligned or non-RDRAM addresses fall through to the general path, whose
+  //results are identical for the addresses the fast path accepts.
+  template<u32 Size> auto lumiverseFastPaddr(u64 vaddr, u32& paddr) const -> bool {
+    if(!lumiverseFast.memoryLive) return false;
+    if((vaddr - 0xffff'ffff'8000'0000ull) > 0x03ef'ffffull) return false;
+    if(vaddr & (Size - 1)) return false;
+    paddr = (u32)vaddr & 0x3eff'ffff;
+    if(context.littleEndian()) {
+      if constexpr(Size == Byte) paddr ^= 7;
+      if constexpr(Size == Half) paddr ^= 6;
+      if constexpr(Size == Word) paddr ^= 4;
+    }
+    return true;
+  }
   template<u32 Size> auto read(u64 vaddr) -> maybe<u64> {
+    u32 paddr;
+    if(lumiverseFastPaddr<Size>(vaddr, paddr)) return dcache.read<Size>(vaddr, paddr);
     return read<Size>(devirtualize<Read, Size>(vaddr));
   }
   template<u32 Size> auto write(u64 vaddr, u64 data, bool alignedError = true) -> bool {
+    u32 paddr;
+    if(lumiverseFastPaddr<Size>(vaddr, paddr)) return dcache.write<Size>(vaddr, paddr, data), true;
     return write<Size>(devirtualize<Write, Size>(vaddr, alignedError), data);
   }
   template<u32 Size> auto vaddrAlignedError(u64 vaddr, bool write) -> bool;

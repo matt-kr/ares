@@ -104,6 +104,11 @@ auto CPU::synchronize() -> void {
     }
   });
 
+  //Lumiverse addition: the inline load/store fast path (cpu.hpp) bypasses
+  //the GDB watchpoint report, so it is suspended whenever a debugger client
+  //has breakpoints/watchpoints; re-evaluated once per batch here.
+  lumiverseFast.memoryLive = lumiverseFast.memory && !GDB::server.hasBreakpoints();
+
   clocks >>= 1;
   if(scc.count < scc.compare && scc.count + clocks >= scc.compare) {
     setInterruptPending(Interrupt::Timer, 1);
@@ -147,6 +152,58 @@ auto CPU::instruction() -> bool {
     return true;
   }
 
+  //Lumiverse addition: LUMIVERSE_ARES_N64_CPU_FAST=1 (default off) enables
+  //interpreter-path speedups. Device builds cannot obtain JIT memory (the
+  //recompiler is force-disabled outside debugger launches — see
+  //RetroGamingService.isJITAvailable), so the interpreter is what actually
+  //runs on hardware. Configuration is read once in power() into
+  //lumiverseFast (cpu.hpp). Sub-knobs, only honored while CPU_FAST=1:
+  //  LUMIVERSE_ARES_N64_CPU_FAST_BATCH  clock-tick budget between scheduler
+  //    synchronizations (default 32768, 0 = stock per-instruction sync).
+  //    Mirrors the recompiler's jitClockTarget budget: min(batch, timer
+  //    delta, queue delta); queueInsert() lowers the live target and
+  //    forceSynchronize() zeroes it, so interrupts/events still end a batch
+  //    immediately.
+  //  LUMIVERSE_ARES_N64_CPU_FAST_NOTRACE  (default 1, 0 = off) skip the
+  //    per-instruction tracer-enabled virtual call unless the instruction
+  //    tracer is armed; recompiler.callInstructionPrologue already tracks
+  //    the tracer toggle, and recompiled code compiles the same short-
+  //    circuit in, so tracer-off behavior is identical.
+  //  LUMIVERSE_ARES_N64_CPU_FAST_FETCH  (default 1, 0 = off) inline the
+  //    instruction fetch for an aligned PC in KSEG0 RDRAM (the range the
+  //    general devirtualize() already special-cases): skips the non-inlined
+  //    devirtualize/vaddrAlignedError/fetch(PhysAccess) call chain. Any
+  //    other PC (unaligned, TLB-mapped, KSEG1, ROM) takes the stock path,
+  //    so exceptions and cache behavior are unchanged.
+  //  LUMIVERSE_ARES_N64_CPU_FAST_MEM  (default 1, 0 = off) same idea for
+  //    aligned KSEG0-RDRAM loads/stores (cpu.hpp read<Size>/write<Size>);
+  //    suspended automatically while GDB breakpoints/watchpoints exist.
+  const auto& fast = lumiverseFast;
+  auto beginBatch = [&] {
+    //Timer distance is modular: count/compare are n33 and the timer next
+    //fires when count crosses compare from below, so once compare has been
+    //passed (or is unused, e.g. compare=0) the true distance is the wrap
+    //distance, not zero. The recompiler path's non-modular clamp degrades
+    //its budget to zero in that state; computing it modularly here keeps
+    //batches alive for games that never program the Compare timer.
+    s64 timerDelta = (s64)(u64)n33(scc.compare - scc.count);
+    s64 queueDelta = queue.timeToNextEvent();
+    if(queueDelta < 0) queueDelta = 0;
+    jitClockTarget = Thread::clock + min<s64>(fast.batch, min(timerDelta, queueDelta));
+  };
+  const u64 pcExec = ipu.pc;
+  u32 opcodeWord;
+
+  if(fast.fetch && !(Accuracy::CPU::Recompiler && recompiler.enabled)
+  && (pcExec - 0xffff'ffff'8000'0000ull) <= 0x03ef'ffffull && !(pcExec & 3)) {
+    //fast fetch: aligned KSEG0 RDRAM (cached). Equivalent to
+    //fetch(devirtualize<Read, Word>(pc)) for this address class.
+    if(fast.batch && Thread::clock >= jitClockTarget) beginBatch();
+    step(1 * 2);
+    u32 paddr = (u32)pcExec & 0x3eff'ffff;
+    if(context.littleEndian()) paddr ^= 4;
+    opcodeWord = icache.fetch(pcExec, paddr, cpu);
+  } else {
   auto access = devirtualize<Read, Word>(ipu.pc);
   if(!access) return true;
 
@@ -175,70 +232,52 @@ auto CPU::instruction() -> bool {
     }
   }
 
-  //Lumiverse addition: LUMIVERSE_ARES_N64_CPU_FAST=1 (default off) enables
-  //interpreter-path speedups. Device builds cannot obtain JIT memory (the
-  //recompiler is force-disabled outside debugger launches — see
-  //RetroGamingService.isJITAvailable), so the interpreter is what actually
-  //runs on hardware. Sub-knobs, only honored while CPU_FAST=1:
-  //  LUMIVERSE_ARES_N64_CPU_FAST_BATCH  clock-tick budget between scheduler
-  //    synchronizations (default 32768, 0 = stock per-instruction sync).
-  //    Mirrors the recompiler's jitClockTarget budget: min(batch, timer
-  //    delta, queue delta); queueInsert() lowers the live target and
-  //    forceSynchronize() zeroes it, so interrupts/events still end a batch
-  //    immediately.
-  //  LUMIVERSE_ARES_N64_CPU_FAST_NOTRACE  (default 1, 0 = off) skip the
-  //    per-instruction tracer-enabled virtual call unless the instruction
-  //    tracer is armed; recompiler.callInstructionPrologue already tracks
-  //    the tracer toggle, and recompiled code compiles the same short-
-  //    circuit in, so tracer-off behavior is identical.
-  static const bool lumiverseCpuFast = [] {
-    const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST");
-    return v && *v == '1';
-  }();
-  static const s64 lumiverseCpuFastBatch = [] {
-    if(!lumiverseCpuFast) return (s64)0;
-    const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_BATCH");
-    const s64 value = v ? ::atoll(v) : 32768;
-    return value > 0 ? value : (s64)0;
-  }();
-  static const bool lumiverseCpuFastNoTrace = [] {
-    if(!lumiverseCpuFast) return false;
-    const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_NOTRACE");
-    return !v || *v != '0';
-  }();
-
-  if(lumiverseCpuFastBatch && Thread::clock >= jitClockTarget) {
-    //Timer distance is modular: count/compare are n33 and the timer next
-    //fires when count crosses compare from below, so once compare has been
-    //passed (or is unused, e.g. compare=0) the true distance is the wrap
-    //distance, not zero. The recompiler path's non-modular clamp degrades
-    //its budget to zero in that state; computing it modularly here keeps
-    //batches alive for games that never program the Compare timer.
-    s64 timerDelta = (s64)(u64)n33(scc.compare - scc.count);
-    s64 queueDelta = queue.timeToNextEvent();
-    if(queueDelta < 0) queueDelta = 0;
-    jitClockTarget = Thread::clock + min<s64>(lumiverseCpuFastBatch, min(timerDelta, queueDelta));
-  }
+  if(fast.batch && Thread::clock >= jitClockTarget) beginBatch();
   auto data = fetch(access);
   if (!data) return true;
+  opcodeWord = *data;
+  }  //general fetch path
+
   pipeline.begin();
-  if(!lumiverseCpuFastNoTrace || unlikely(recompiler.callInstructionPrologue)) {
-    instructionPrologue(ipu.pc, *data);
+  if(!fast.noTrace || unlikely(recompiler.callInstructionPrologue)) {
+    instructionPrologue(ipu.pc, opcodeWord);
   }
-  decoderEXECUTE(*data);
+  decoderEXECUTE(opcodeWord);
   instructionEpilogue<0>();
   pipeline.end();
-  if(lumiverseCpuFastBatch) {
+  if(fast.batch) {
     //Lumiverse diagnostic (temporary): batch-length telemetry under
-    //LUMIVERSE_ARES_N64_CPU_DIAG=1.
-    static const bool diag = [] {
-      const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_DIAG");
-      return v && *v == '1';
-    }();
+    //LUMIVERSE_ARES_N64_CPU_DIAG=1; =2 adds an executed-PC histogram (top
+    //entries every 2^28 instructions) to expose idle/poll loops.
     const bool batchEnd = Thread::clock >= jitClockTarget;
-    if(unlikely(diag)) {
+    if(unlikely(fast.diag)) {
       static u64 instrs = 0, syncs = 0, timerCap = 0, queueCap = 0, forceCap = 0;
       instrs++;
+      if(fast.diag >= 2) {
+        static struct { u64 pc; u32 op; u64 count; } hist[1 << 16] = {};
+        auto& h = hist[(u32)(pcExec >> 2) & 0xffff];
+        if(h.pc == pcExec) h.count++;
+        else if(h.count < 256) { h.pc = pcExec; h.op = opcodeWord; h.count = 1; }
+        else h.count -= 256;
+        if((instrs & 0xfffffff) == 0) {
+          //print the 12 hottest slots
+          u32 top[12] = {}; u32 topCount = 0;
+          for(u32 index = 0; index < (1 << 16); index++) {
+            const u64 count = hist[index].count;
+            if(!count) continue;
+            u32 pos = topCount < 12 ? topCount++ : 12;
+            //insertion into a descending list
+            while(pos > 0 && hist[top[pos - 1]].count < count) { if(pos < 12) top[pos] = top[pos - 1]; pos--; }
+            if(pos < 12) top[pos] = index;
+          }
+          fprintf(stderr, "[cpu-diag] pc histogram after %llu instrs:\n", (unsigned long long)instrs);
+          for(u32 index = 0; index < topCount; index++) {
+            auto& e = hist[top[index]];
+            fprintf(stderr, "[cpu-diag]   pc=%016llx op=%08x count=%llu (%.1f%%)\n",
+              (unsigned long long)e.pc, e.op, (unsigned long long)e.count, 100.0 * (double)e.count / (double)instrs);
+          }
+        }
+      }
       if(batchEnd) {
         syncs++;
         if(jitClockTarget == 0) {
@@ -246,16 +285,16 @@ auto CPU::instruction() -> bool {
           static struct { u64 pc; u32 op; u64 count; } fhist[32] = {};
           u64 pc = ipu.pc; u32 slot = (u32)((pc >> 2) ^ (pc >> 11)) & 31;
           if(fhist[slot].pc == pc) fhist[slot].count++;
-          else if(fhist[slot].count < 8) { fhist[slot].pc = pc; fhist[slot].op = *data; fhist[slot].count = 1; }
+          else if(fhist[slot].count < 8) { fhist[slot].pc = pc; fhist[slot].op = opcodeWord; fhist[slot].count = 1; }
           if((forceCap & 0xffffff) == 0) for(auto& h : fhist) if(h.count > 65536)
             fprintf(stderr, "[cpu-diag]   forcePC=%016llx op=%08x count=%llu\n",
               (unsigned long long)h.pc, h.op, (unsigned long long)h.count);
         }
         else {
-          s64 timerDelta = (s64)scc.compare - (s64)scc.count;
+          s64 timerDelta = (s64)(u64)n33(scc.compare - scc.count);
           s64 queueDelta = queue.timeToNextEvent();
-          if(timerDelta <= queueDelta && timerDelta < lumiverseCpuFastBatch) timerCap++;
-          else if(queueDelta < lumiverseCpuFastBatch) queueCap++;
+          if(timerDelta <= queueDelta && timerDelta < fast.batch) timerCap++;
+          else if(queueDelta < fast.batch) queueCap++;
         }
         if((syncs & 0x3ffff) == 0)
           fprintf(stderr, "[cpu-diag] instrs=%llu syncs=%llu avgBatch=%.1f force=%llu timerCap=%llu queueCap=%llu\n",
@@ -267,6 +306,29 @@ auto CPU::instruction() -> bool {
     return batchEnd;
   }
   return true;
+}
+
+//Lumiverse addition: read the CPU_FAST configuration (see instruction()).
+//Called from power(); the app sets its env knobs before the core is created.
+auto CPU::lumiverseLoadFastConfig() -> void {
+  auto& f = lumiverseFast;
+  f = {};
+  const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST");
+  f.enabled = v && *v == '1';
+  if(f.enabled) {
+    const char* b = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_BATCH");
+    const s64 batch = b ? ::atoll(b) : 32768;
+    f.batch = batch > 0 ? batch : 0;
+    const char* t = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_NOTRACE");
+    f.noTrace = !t || *t != '0';
+    const char* fe = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_FETCH");
+    f.fetch = !fe || *fe != '0';
+    const char* me = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_MEM");
+    f.memory = !me || *me != '0';
+    const char* d = ::getenv("LUMIVERSE_ARES_N64_CPU_DIAG");
+    f.diag = d ? ::atoi(d) : 0;
+  }
+  f.memoryLive = f.memory && !GDB::server.hasBreakpoints();
 }
 
 auto CPU::instructionPrologue(u64 address, u32 instruction) -> void {
@@ -307,6 +369,7 @@ auto CPU::power(bool reset) -> void {
   emuxState = {};
   fenv.setRound(float_env::toNearest);
   context.setMode();
+  lumiverseLoadFastConfig();
 
   if constexpr(Accuracy::CPU::Recompiler) {
     auto buffer = ares::Memory::FixedAllocator::get().tryAcquire(63_MiB);
