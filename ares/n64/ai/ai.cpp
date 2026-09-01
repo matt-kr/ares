@@ -25,10 +25,23 @@ auto AI::unload() -> void {
 }
 
 auto AI::main() -> void {
+  //Lumiverse diagnostic (LUMIVERSE_ARES_N64_TIMING_DIAG=1): DAC sample count
+  //against the CPU Count register (pairs with the [vi] line in vi/vi.cpp)
+  static const bool timingDiag = [] {
+    const char* value = ::getenv("LUMIVERSE_ARES_N64_TIMING_DIAG");
+    return value && *value == '1';
+  }();
   while(Thread::clock < 0) {
     sample();
     stream->frame(dac.left, dac.right);
     step(dac.period);
+    if(timingDiag) {
+      static u64 samples = 0;
+      if((++samples % 160000) == 0) {
+        fprintf(stderr, "[ai] samples=%llu count=%llu dacFrequency=%u period=%u\n",
+          (unsigned long long)samples, (unsigned long long)(u64)cpu.scc.count, dac.frequency, dac.period);
+      }
+    }
   }
 }
 

@@ -90,6 +90,16 @@ auto AI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
     if(frequency != dac.frequency) {
       stream->setFrequency(dac.frequency);
       updateDecay();
+      //Lumiverse diagnostic: the game derives dacRate from the video clock
+      //it believes it runs on (osTvType), so this line exposes a PAL ROM
+      //booting in NTSC mode (dacRate ~1520 for 32 kHz) vs PAL (~1550), and
+      //VI_V_SYNC shows the field length it programmed (525 vs 625 half-lines).
+      static u32 logged = 0;
+      if(logged++ < 4) {
+        fprintf(stderr, "[ai] dacRate=%u -> %u Hz (video clock %u, VI halfLinesPerField=%u quarterLine=%u)\n",
+          (u32)io.dacRate, dac.frequency, system.videoFrequency(),
+          (u32)vi.io.halfLinesPerField, (u32)vi.io.quarterLineDuration);
+      }
     }
   }
 

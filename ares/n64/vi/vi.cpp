@@ -138,6 +138,23 @@ auto VI::main() -> void {
         }
         #endif
         refreshed = true;
+        //Lumiverse diagnostic (LUMIVERSE_ARES_N64_TIMING_DIAG=1): VI refresh
+        //count against the CPU Count register, to measure emulated field
+        //length per region (pairs with the [ai] line in ai/ai.cpp)
+        {
+          static const bool timingDiag = [] {
+            const char* value = ::getenv("LUMIVERSE_ARES_N64_TIMING_DIAG");
+            return value && *value == '1';
+          }();
+          if(timingDiag) {
+            static u64 refreshes = 0;
+            if((++refreshes % 300) == 0) {
+              fprintf(stderr, "[vi] refreshes=%llu count=%llu halfLines=%u quarterLine=%u serrate=%u\n",
+                (unsigned long long)refreshes, (unsigned long long)(u64)cpu.scc.count,
+                (u32)io.halfLinesPerField, (u32)io.quarterLineDuration, (u32)io.serrate);
+            }
+          }
+        }
         #if defined(VULKAN)
         if(shouldPresentFrame) {
           screen->frame();
