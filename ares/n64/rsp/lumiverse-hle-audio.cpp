@@ -96,13 +96,11 @@
 //LOADADPCM table (row1[0], Q14) with a Q14 input gain. All fitted against
 //isolated LLE runs via the truncated-task oracle.
 //
-//A third family ("naudio": Super Smash Bros. / Kirby) is only partially
-//decoded (fixed 0x170-byte chunks, state addresses in cmd0.lo24, an
-//80+ byte per-voice RDRAM parameter block holding per-lane vol int/frac
-//vectors, targets, 16.16 rates and wet/dry gains, envmix output at fixed
-//dmem 0x9d0/0xb40/0xcb0/0xe20). It stays OFF the whitelist; the
-//LUMIVERSE_ARES_N64_AUDIO_HLE_NAUDIO=1 gate enables the experimental
-//skeleton for further oracle work only.
+//A third family ("naudio": Super Smash Bros. / Kirby 64) uses fixed
+//0x170-byte chunks with state addresses in cmd0.lo24 and a per-voice RDRAM
+//parameter block; see lumiverseAudioExecuteNaudio for the decoded layout.
+//Validated via native-stream click counts, envelope correlation and level
+//gates on both games (round 4).
 //
 //This file is included from rsp.cpp inside namespace ares::Nintendo64 (same
 //translation unit as lumiverse-hle.cpp); no #includes allowed here.
@@ -149,17 +147,7 @@ constexpr u64 LumiverseAudioUcodeMajoraU   = 0xa8df9aeb4a7cb685ull;  //Majora's 
 
 constexpr u64 LumiverseAudioUcodeSM64WR    = 0x394bf43d72dfa31dull;  //Super Mario 64 (U) + Wave Race 64 (U), shared
 constexpr u64 LumiverseAudioUcodeSnapU     = 0x7123e4d5f82ae6a5ull;  //Pokemon Snap (U)
-constexpr u64 LumiverseAudioUcodeSmashU    = 0xbbca23e37b0bc136ull;  //Super Smash Bros. (U) (+ Kirby 64 family)
-
-//LUMIVERSE_ARES_N64_AUDIO_HLE_NAUDIO=1 enables the still-experimental naudio
-//dialect (default off until validated)
-auto lumiverseAudioNaudioEnabled() -> bool {
-  static bool enabled = [] {
-    const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NAUDIO");
-    return value && value[0] == '1';
-  }();
-  return enabled;
-}
+constexpr u64 LumiverseAudioUcodeSmashU    = 0xbbca23e37b0bc136ull;  //Super Smash Bros. (U) + Kirby 64
 
 //returns the command-set dialect for a whitelisted audio ucode, -1 otherwise
 auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
@@ -169,7 +157,7 @@ auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
   if(hash == LumiverseAudioUcodeMajoraU)   return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeSM64WR)    return LumiverseAudioDialectABI1;
   if(hash == LumiverseAudioUcodeSnapU)     return LumiverseAudioDialectABI1;
-  if(hash == LumiverseAudioUcodeSmashU && lumiverseAudioNaudioEnabled()) return LumiverseAudioDialectNaudio;
+  if(hash == LumiverseAudioUcodeSmashU)    return LumiverseAudioDialectNaudio;
   return -1;
 }
 
@@ -676,24 +664,53 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     break;
   }
   case 0x05: {  //RESAMPLE decode stream -> 184 samples at staging.
-    //The decoder writes a 16-sample history prefix before its data; the
-    //stream position persists across chunks (pos_next = pos + 184*pitch -
-    //avail), going negative into the prefix for unconsumed leftovers.
+    //Positioning: cmd1.lo12 is the engine's own stream position in 1/8-sample
+    //units (whole-sample quantized). The integer start is resynced from it
+    //every chunk relative to a per-voice anchor captured at init (bit 14 of
+    //the pitch field) — a free-running position model drifts against the
+    //engine's avail-feed and eventually clamps audibly (the round-3 click
+    //source). The sub-sample fraction is carried locally for smoothness.
     auto& state = lumiverseAudioState(w0 & 0x00ffffff);
-    const u32 pitch = w1 >> 16 & 0x3fff;   //Q13; bit 14 of the field = init
+    const u32 pitch = w1 >> 16 & 0x3fff;   //Q13, 0x2000 = 1.0
     const bool init = (w1 >> 16 & 0x4000) != 0;
-    s32 pos32 = init ? 0 : (s32)state.frac;
-    if(pos32 < -0x200000 || pos32 > 0x200000) pos32 = 0;  //sanity re-anchor
+    const s32 ptrWhole = (s32)((w1 & 0xfff) >> 3);
+    s32 anchor;
+    s64 position;
+    if(init) {
+      anchor = ptrWhole;        //stream position 0 = data start at init
+      position = 0;
+      state.samples[1] = (s16)anchor;
+    } else {
+      anchor = state.samples[1];
+      position = (s64)(s32)state.frac;   //continuous Q16 stream position
+      //voice first seen mid-stream (HLE enabled late): adopt the pointer
+      if(anchor == 0 && state.samples[2] == 0) { anchor = ptrWhole; position = 0; state.samples[1] = (s16)anchor; }
+      //drift servo: the command's 1/8-sample pointer carries the engine's
+      //own whole-sample start; resync only past a 2-sample tolerance so
+      //ordinary chunks stay sample-continuous (per-chunk snapping produced
+      //audible seams on noise content)
+      const s32 wholeStart = ptrWhole - anchor;
+      const s32 err = wholeStart - (s32)(position >> 16);
+      if(err > 2 || err < -2) position = ((s64)wholeStart << 16) | (position & 0xffff);
+    }
+    state.samples[2] = 1;       //anchor-valid marker
     const u32 dataStart = NaDecode + 32;
     const u32 step = pitch << 3;           //Q13 -> Q16 per output sample
-    auto sampleAt = [&](s32 index) -> s32 {
+    //band-limit when consuming faster than 1:1 — the microcode's short FIR
+    //rolls off high frequencies, and skipping that on downsampled NOISE
+    //content leaves aliased full-band energy (measurably more large
+    //sample-to-sample jumps than the LLE render)
+    const bool prefilter = pitch >= 0x2000;  //at or above 1:1
+    auto sampleRaw = [&](s32 index) -> s32 {
       if(index < -16) index = -16;
       return lumiverseAudioDmemReadS16(dmem, dataStart + index * 2);
     };
-    s64 position = pos32;
+    auto sampleAt = [&](s32 index) -> s32 {
+      if(!prefilter) return sampleRaw(index);
+      return (sampleRaw(index - 1) + 2 * sampleRaw(index) + sampleRaw(index + 1)) >> 2;
+    };
     for(u32 n = 0; n < NaChunk / 2; n++) {
-      s32 index = (s32)(position >> 16);
-      if((position & 0xffff) == 0 && (position < 0)) index = (s32)(position / 65536);
+      const s32 index = (s32)(position >> 16);
       const s64 f = position - ((s64)index << 16);
       const s64 x0 = sampleAt(index - 2);
       const s64 x1 = sampleAt(index - 1);
@@ -718,6 +735,7 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
       lumiverseAudioDmemWriteS16(dmem, NaStaging + n * 2, lumiverseAudioClamp16((s32)y));
       position += step;
     }
+    //carry the continuous position, rebased past the data this chunk provided
     const s32 avail = (s32)(m.naDecodeSamples ? m.naDecodeSamples : NaChunk / 2);
     state.frac = (u32)(s32)(position - ((s64)avail << 16));
     break;
@@ -767,11 +785,23 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
       const s32 current = lumiverseAudioDmemReadS16(dmem, bus + n * 2);
       lumiverseAudioDmemWriteS16(dmem, bus + n * 2, lumiverseAudioClamp16(current + value));
     };
+    //the rate's high 16 bits are a Q16 multiplier just below 1.0, applied
+    //four times per output sample (fitted: vol 0x804 -> 0x7e7 over one
+    //chunk = (0xfffe.b9e0/0x10000)^(4*184)). Ramp direction comes from the
+    //target comparison — naudio envelopes are game-side pre-shaped, so the
+    //in-ucode ramp is a fade toward the target (typically a fade-out to 0);
+    //rate values like 0x7fffffff accompany held voices (target == vol).
     auto ramp = [](s64 vol32, s32 target, u32 rate) -> s64 {
-      s64 next = vol32 * rate >> 16;
       const s64 target32 = (s64)target << 16;
-      if(rate >= 0x10000) { if(next > target32) next = target32; }
-      else { if(next < target32) next = target32; }
+      s64 next;
+      if(vol32 > target32) {
+        next = vol32 * (rate >> 16) >> 16;
+        if(next < target32) next = target32;
+      } else if(vol32 < target32) {
+        next = vol32 + ((target32 - vol32) >> 3);   //approach (rarely used)
+      } else {
+        next = vol32;
+      }
       if(next > 0x7fff0000ll) next = 0x7fff0000ll;
       if(next < 0) next = 0;
       return next;
@@ -785,8 +815,6 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
       accumulate(0x650, n, r * wet + 0x4000 >> 15);
       accumulate(0x7c0, n, l * dry + 0x4000 >> 15);
       accumulate(0x930, n, r * dry + 0x4000 >> 15);
-      //the 16.16 rate applies FOUR times per output sample (fitted from an
-      //observed init chunk: vol 0x804 -> 0x7e7 = rate^(4*184))
       for(u32 rep = 0; rep < 4; rep++) {
         vl32 = ramp(vl32, targetL, rateL);
         vr32 = ramp(vr32, targetR, rateR);
