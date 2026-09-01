@@ -1472,6 +1472,19 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       break;
     }
 
+    case 0xd5: {  //G_SPECIAL_1 (Super Smash Bros., fifo 2.04H): observed only
+                  //as d5000001/00000000 between a G_MTX and a run of
+                  //G_MW_MATRIX patches. The only semantics under which those
+                  //patches can matter is "materialize the combined MVP now"
+                  //(so the lazy MV x P recompute cannot clobber them); frames
+                  //validated against LLE checkpoints — see M1-REPORT.
+      static u32 seen = 0;
+      if(cmd1 != 0 || (cmd0 & 0x00ffffff) != 1) {
+        if(seen++ < 4) fprintf(stderr, "[rsp-hle-gfx] G_SPECIAL_1 variant cmd0=%08x cmd1=%08x\n", cmd0, cmd1);
+      }
+      lumiverseGfxUpdateCombined(m);
+      break;
+    }
     case 0xd6: break;  //G_DMA_IO: no-op (n64js)
 
     case 0xd7: {  //G_TEXTURE
@@ -1536,6 +1549,29 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       const u32 type = (cmd0 >> 16) & 0xff;
       const u32 offset = cmd0 & 0xffff;
       switch(type) {
+      case 0x00: {  //G_MW_MATRIX: patch one 32-bit word of the combined MVP
+        //(Super Smash Bros., fifo 2.04H). Empirical (own DL dumps): the game
+        //issues G_MTX, then 0xd5 (see below), then a run of these at offsets
+        //0x00..0x3c — the 64-byte DMEM matrix image, s16 integer parts at
+        //0x00..0x1f, u16 fraction parts at 0x20..0x3f, each word covering
+        //two row-major elements. The lazily-recomputed MVP must already be
+        //current (0xd5 does that) or the patch would be lost at the next
+        //vertex load; materialize defensively here as well.
+        lumiverseGfxUpdateCombined(m);
+        const u32 element = (offset & 0x1e) >> 1;
+        if(element + 1 < 16) {
+          const bool fraction = (offset & 0x20) != 0;
+          const u32 halves[2] = { cmd1 >> 16, cmd1 & 0xffff };
+          for(u32 index = 0; index < 2; index++) {
+            f32& value = m.combined[element + index];
+            s32 fixed = (s32)::lrintf(value * 65536.0f);
+            if(fraction) fixed = (fixed & ~0xffff) | (s32)halves[index];
+            else         fixed = ((s32)(s16)halves[index] << 16) | (fixed & 0xffff);
+            value = (f32)fixed / 65536.0f;
+          }
+        }
+        break;
+      }
       case 0x02:  //G_MW_NUMLIGHT: value = numLights * 24
         m.numLights = (cmd1 / 24) & 7;
         break;
@@ -1854,7 +1890,7 @@ auto lumiverseGfxOpcodeSupportedGBI2(u8 opcode) -> bool {
   switch(opcode) {
   case 0x00: case 0x01: case 0x02: case 0x03: case 0x04:
   case 0x05: case 0x06: case 0x07:
-  case 0xd6: case 0xd7: case 0xd8: case 0xd9: case 0xda:
+  case 0xd5: case 0xd6: case 0xd7: case 0xd8: case 0xd9: case 0xda:
   case 0xdb: case 0xdc: case 0xde: case 0xdf:
   case 0xe0: case 0xe1: case 0xe2: case 0xe3:
   case 0xe4: case 0xe5: case 0xe6: case 0xe7: case 0xe8:
@@ -1903,6 +1939,12 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
         fprintf(stderr,
           "[rsp-hle-gfx] unsupported gbi2 op %02x cmd0=%08x cmd1=%08x at pc=%06x (root=%06x depth=%u pending=%u) -> LLE fallback\n",
           opcode, cmd0, cmd1, pc - 8, rootPC, stackDepth, pendingCount);
+        //empirical aid: the surrounding DL commands (once per opcode)
+        for(s32 offset = -12; offset <= 12; offset++) {
+          const u32 at = pc - 8 + offset * 8;
+          fprintf(stderr, "[rsp-hle-gfx]   %s %06x: %08x %08x\n",
+            offset == 0 ? ">" : " ", at, lumiverseGfxWord(at), lumiverseGfxWord(at + 4));
+        }
       }
       supported = false;
       break;  //stop walking: a bad branch would only pollute the census
@@ -1927,7 +1969,7 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
     case 0xdb: {
       const u32 type = (cmd0 >> 16) & 0xff;
       if(type == 0x06) segments[(cmd0 >> 2) & 0xf] = cmd1 & 0x00ffffff;
-      else if(type == 0x00) supported = false;  //G_MW_MATRIX
+      //type 0x00 (G_MW_MATRIX) is implemented for GBI2 (Smash) — see executor
       break;
     }
     case 0x02: {
