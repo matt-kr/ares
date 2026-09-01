@@ -333,6 +333,10 @@ struct LumiverseAudioValidator {
   u32 aux1, aux2, aux3;
 };
 
+//index of the task being validated (for fallback diagnostics; set by the
+//entry point before validation so oracle experiments can target the task)
+u64 lumiverseAudioValidateTaskIndex = 0;
+
 auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u32 dataSize, u32 dialect) -> bool {
   LumiverseAudioValidator v;
   v.bookEntries = machine.bookEntries;
@@ -352,7 +356,8 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
   auto reject = [&](u32 offset, u32 w0, u32 w1, const char* reason) -> bool {
     if(rejectLogs < 32) {
       rejectLogs++;
-      fprintf(stderr, "[rsp-hle-audio] fallback: cmd %08x %08x at +%u: %s\n", w0, w1, offset, reason);
+      fprintf(stderr, "[rsp-hle-audio] fallback: task %llu cmd %08x %08x at +%u (cmd %u): %s\n",
+        (unsigned long long)lumiverseAudioValidateTaskIndex, w0, w1, offset, offset / 8, reason);
     }
     return false;
   };
@@ -416,8 +421,15 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
       if(v.outBuf + v.bufCount > 0x1000) return reject(offset, w0, w1, "savebuff range");
       break;
     }
-    case 0x09: {  //SETVOL (ABI1)
-      if(!abi1) return reject(offset, w0, w1, "setvol in abi2");
+    case 0x09: {  //SETVOL (ABI1) / ABI2 op 0x09 (Zelda menus; see executor)
+      if(!abi1) {
+        //ABI2: cmd0 = 09 | flags(1..3) << 16 | dmem A; cmd1 = dmem B << 16 | count bytes
+        //(observed only as 09 0[123] 0580 / 0600 0080 in OoT (U)/MQ menus)
+        const u32 a = w0 & 0xffff, b = w1 >> 16, count = w1 & 0xffff;
+        if(flags < 1 || flags > 3) return reject(offset, w0, w1, "abi2 op09 flags");
+        if(!count || (count & 0xf) || a + count > 0x1000 || b + count * flags > 0x1000) return reject(offset, w0, w1, "abi2 op09 range");
+        break;
+      }
       if(flags != 0 && flags != 2 && flags != 4 && flags != 6 && flags != 8) return reject(offset, w0, w1, "setvol flags");
       break;
     }
@@ -1017,6 +1029,26 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
     }
 
     case 0x09:  //SETVOL (ABI1): flags = A_VOL(4)|A_LEFT(2) / A_AUX(8)
+      if(!abi1) {
+        //ABI2 (Zelda family) op 0x09 = DUPLICATE with SF64's 0x1a field
+        //layout: src=cmd0.lo16, copies=flags, dst=cmd1.hi16, count=cmd1.lo16.
+        //Empirical (OoT (U) file-select / pause menus): a LOADBUFF of 0x80
+        //bytes to 0x580 is followed by 09 0[123] 0580 / 0600 0080 and then a
+        //SETBUFF in=0x580 count=0x160 + RESAMPLE — a 64-sample looped SFX
+        //waveform tiled to cover the resampler's input window. Shadow-mode
+        //RDRAM compare turned the affected tasks' writes from bad to exact
+        //with this implementation (round 6).
+        const u32 copies = flags ? flags : 1;
+        const u32 src = w0 & 0xffff;
+        const u32 dst = w1 >> 16;
+        const u32 count = w1 & 0xffff;
+        u8 scratch[0x1000];
+        for(u32 index = 0; index < count; index++) scratch[index] = dmem[(src + index) & 0xfff];
+        for(u32 copy = 0; copy < copies; copy++) {
+          for(u32 index = 0; index < count; index++) dmem[(dst + copy * count + index) & 0xfff] = scratch[index];
+        }
+        break;
+      }
       switch(flags) {
       case 0x06: m.setVolL = (s16)(w0 & 0xffff); break;
       case 0x04: m.setVolR = (s16)(w0 & 0xffff); break;
@@ -1552,6 +1584,9 @@ LumiverseAudioDebugCapture* lumiverseAudioCapture = nullptr;
 //crashes on the corrupted audio, so the comparison is settled from
 //RSP::main()'s halted path instead of the next dispatch
 bool lumiverseAudioTruncateArmed = false;
+//task index a truncation experiment targeted (either selector); the settle
+//path dumps exactly that task's DMEM images
+s64 lumiverseAudioTruncateDumpTask = -1;
 
 //settle any outstanding shadow comparison (called from every RSP task
 //dispatch so a comparison still happens when the game stops issuing audio
@@ -1569,9 +1604,12 @@ auto lumiverseAudioShadowSettle() -> void {
     }();
     //with a truncate target set, dump only that task (don't burn the dump
     //quota on earlier tasks)
-    const bool dumpWanted = truncateTask >= 0
-      ? shadow.task == (u64)truncateTask
-      : worst > 1000;
+    //with a truncation selector configured, dump ONLY the targeted task (the
+    //three-dump quota would otherwise be spent on early boot mismatches)
+    static const bool selectorConfigured = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_OP") != nullptr || truncateTask >= 0;
+    const bool dumpWanted = lumiverseAudioTruncateDumpTask >= 0
+      ? shadow.task == (u64)lumiverseAudioTruncateDumpTask
+      : (selectorConfigured ? false : worst > 1000);
     if(dumpWanted && lumiverseAudioCapture) lumiverseAudioDebugDump(*lumiverseAudioCapture, shadow.task);
   }
 }
@@ -1607,6 +1645,34 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
       const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_CMD");
       return value ? ::atoll(value) : -1;
     }();
+    //alternative selector: LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_OP=<hex opcode>
+    //truncates the FIRST task whose alist contains that opcode, right after
+    //its first occurrence (or right before it with ..._TRUNCATE_BEFORE=1),
+    //so an experiment does not depend on task numbering.
+    static s64 truncateOp = [] {
+      const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_OP");
+      return value ? ::strtoll(value, nullptr, 16) : -1;
+    }();
+    static bool truncateBefore = [] {
+      const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_BEFORE");
+      return value && *value == '1';
+    }();
+    static bool truncateOpDone = false;
+    if(truncateOp >= 0 && !truncateOpDone && truncateTask < 0) {
+      for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
+        if(lumiverseAudioRDRAMReadByte(dataPtr + offset) == (u8)truncateOp) {
+          const s64 index = (s64)(offset / 8) - (truncateBefore ? 1 : 0);
+          if(index >= 0) {
+            truncateOpDone = true;
+            truncateTask = (s64)taskIndex;
+            truncateCommand = index;
+            fprintf(stderr, "[rsp-hle-audio] truncate-op %02llx: task %llu command %lld\n",
+              (long long)truncateOp, (unsigned long long)taskIndex, (long long)index);
+          }
+          break;
+        }
+      }
+    }
     if(truncateTask >= 0 && (u64)truncateTask == taskIndex && truncateCommand >= 0) {
       //shrink the OSTask's dataSize (DMEM 0xfc0 + 13*4) so the microcode
       //stops after the chosen command; also truncate our own walk
@@ -1616,6 +1682,7 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
         rsp.dmem.write<Word>(0xfc0 + 13 * 4, truncatedSize);
       }
       lumiverseAudioTruncateArmed = true;
+      lumiverseAudioTruncateDumpTask = (s64)taskIndex;
       //optional: overwrite a 32-byte RDRAM block (e.g. a filter coefficient
       //table) with a probe pattern of distinct power-of-two taps so the
       //LLE-vs-HLE comparison reveals the exact per-tap transformation
@@ -1642,6 +1709,7 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   //completed it by now — audio tasks are serialized)
   if(level >= 2) lumiverseAudioShadowSettle();
 
+  lumiverseAudioValidateTaskIndex = taskIndex;
   if(!lumiverseAudioValidate(machine, dataPtr, dataSize, (u32)dialect)) {
     machine.tasksFallback++;
     return false;
