@@ -1586,25 +1586,14 @@ auto lumiverseGfxExecuteS2DEX(LumiverseGfxMachine& m, u8 opcode, u32 cmd0, u32 c
 auto lumiverseGfxLoadUcode(LumiverseGfxMachine& m, u32 cmd1) -> void {
   const s32 dialect = lumiverseGfxLoadUcodeDialect(cmd1);
   if(dialect < 0) { m.out.failed = true; m.running = false; return; }
-  //the RSP reloads the new microcode's DATA segment from the game's pristine
-  //RDRAM copy, so everything that lives there — segment table, other-mode
-  //shadow, geometry mode, texture scale, lights, fog, viewport, matrices —
-  //comes back at its reset value (games re-send what they need: Yoshi's
-  //Story re-issues its 16 segment movewords and other-modes after every
-  //switch); only the display-list position/stack (OSTask yield area) and
-  //the RDP itself persist. Reset like a fresh task but keep pc/stack/output.
-  const u32 pc = m.pc, stackDepth = m.stackDepth;
-  u32 stack[32];
-  for(u32 index = 0; index < stackDepth; index++) stack[index] = m.stack[index];
-  const u32 fifoCount = m.out.count;
-  const bool failed = m.out.failed;
-  const u32 gbi0Vertex = m.gbi0Vertex;
-  const bool bakedRDP = m.bakedRDP;
-  lumiverseGfxReset(m, pc, (u32)dialect, gbi0Vertex, bakedRDP);
-  m.out.count = fifoCount;
-  m.out.failed = failed;
-  m.stackDepth = stackDepth;
-  for(u32 index = 0; index < stackDepth; index++) m.stack[index] = stack[index];
+  //Interpreter state is KEPT across the switch. Empirically the RSP keeps
+  //at least the segment table and the display-list position/stack across
+  //G_LOAD_UCODE (Majora's Mask comes back from its S2DEX2 background with
+  //no segment movewords and continues through segment-relative sub-DLs; a
+  //reset-everything attempt walked garbage — "runaway display list").
+  //Yoshi's Story re-sends its segments and other-modes after every switch,
+  //so either model works there. Other-mode is re-emitted lazily.
+  lumiverseGfxSetDialect(m, (u32)dialect);
   m.otherModeDirty = true;
 }
 
