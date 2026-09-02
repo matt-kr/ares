@@ -187,10 +187,17 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
     if(data.bit(23) && !data.bit(24)) status.signal[7] = 0;
     if(data.bit(24) && !data.bit(23)) status.signal[7] = 1;
     if(lumiverseHLEComplete) {
-      //mirror BREAK semantics + the microcode's task-done signal (SIG2)
-      status.broken = 1;
-      status.signal[2] = 1;
-      if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+      if(lumiverseHLERequestedCompletionCycles > 0) {
+        //deferred: report "running" and let RSP::main deliver the
+        //completion after the requested emulated duration
+        status.halted = 0;
+        lumiverseHLEPendingCycles = lumiverseHLERequestedCompletionCycles;
+      } else {
+        //mirror BREAK semantics + the microcode's task-done signal (SIG2)
+        status.broken = 1;
+        status.signal[2] = 1;
+        if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+      }
     }
     //Lumiverse addition: hand a requested audio task to the worker thread
     //only now, after the start write's own set/clear bits (which typically

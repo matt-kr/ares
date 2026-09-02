@@ -49,7 +49,20 @@ auto RSP::main() -> void {
   while(Thread::clock < 0) {
     auto clock = Thread::clock;
 
-    if(status.halted) {
+    if(lumiverseHLEPendingCycles > 0) {
+      //Lumiverse addition: a natively-executed task "runs" for its
+      //requested duration, then completes exactly like BREAK would
+      step(128);
+      profile.cycles += 128;
+      lumiverseHLEPendingCycles -= 128;
+      if(lumiverseHLEPendingCycles <= 0) {
+        lumiverseHLEPendingCycles = 0;
+        status.halted = 1;
+        status.broken = 1;
+        status.signal[2] = 1;
+        if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+      }
+    } else if(status.halted) {
       //Lumiverse addition: settle a truncated-task audio-HLE shadow compare
       //(debug tool; the game typically crashes after the experiment, so the
       //normal settle-on-next-dispatch never runs)

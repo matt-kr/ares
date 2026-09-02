@@ -276,6 +276,12 @@ struct RSP : Thread, Memory::RCP<RSP> {
   //Lumiverse addition: OSTask dispatch census/HLE hook; returns true when the
   //task was executed natively and the RSP should stay halted.
   auto lumiverseTaskDispatchHook() -> bool;
+  //Lumiverse: deferred HLE task completion (LUMIVERSE_ARES_N64_RSP_HLE_GFX_
+  //COMPLETE_US / _AUDIO_COMPLETE_US). A natively-executed task's BREAK +
+  //task-done signal + SP interrupt are delivered this many RSP cycles after
+  //dispatch instead of instantly, mimicking the microcode's real duration;
+  //the RSP reports "running" meanwhile and executes nothing.
+  s32 lumiverseHLEPendingCycles = 0;
 
   //lumiverse-async-audio.cpp
   //Lumiverse addition: opt-in worker-thread execution of audio (type-2)
