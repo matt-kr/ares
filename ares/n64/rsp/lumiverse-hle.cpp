@@ -65,6 +65,27 @@ auto lumiverseHLELevel() -> int {
 
 //per-task debug prints (task fields, RDRAM probes). Default off: these hit
 //stderr on every graphics task and are measurable on device.
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_COMPLETE_US / _AUDIO_COMPLETE_US (default 0 =
+//instant completion, stock behavior of the HLE): emulated microseconds
+//between dispatch and completion of a natively-executed task. Instant
+//completion perturbs game-side audio scheduling at sound transitions
+//(measured: Zelda MQ title Start-press seams — 0 extra clicks with audio
+//HLE alone, 2 with gfx HLE alone, 10-14 with both — all timing, not
+//samples); a realistic duration restores the interrupt cadence the game was
+//written against. RSP clock is 62.5 MHz: 62.5 cycles per microsecond.
+auto lumiverseHLECompletionCycles(u32 taskType) -> s32 {
+  static const s32 gfx = [] {
+    const char* value = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_COMPLETE_US");
+    return value ? (s32)(::atof(value) * 62.5) : 0;
+  }();
+  static const s32 audio = [] {
+    const char* value = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_AUDIO_COMPLETE_US");
+    return value ? (s32)(::atof(value) * 62.5) : 0;
+  }();
+  return taskType == 1 ? gfx : audio;
+}
+s32 lumiverseHLERequestedCompletionCycles = 0;
+
 auto lumiverseHLEDebug() -> int {
   static int debug = [] {
     const char* value = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_DEBUG");
@@ -153,7 +174,21 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
   //sanity guard: some games start the RSP before a valid OSTask is present
   //in DMEM (boot/IPL noise: garbage type field, absurd sizes). Never let
   //those reach the census or HLE dispatch logic; LLE runs them unchanged.
-  if(taskType != 1 && taskType != 2) return false;
+  //(diagnostic: count what the guard turns away, so a game that drives the
+  //RSP with a non-OSTask convention — e.g. a CPU-side audio mixer that only
+  //uses the RSP for a private ucode — is visible in the census rather than
+  //silently absent from it)
+  static u64 guardedDispatches = 0;
+  static u32 guardedTypes[4];
+  if(taskType != 1 && taskType != 2) {
+    guardedDispatches++;
+    if(guardedDispatches <= 3 || (guardedDispatches & 1023) == 0) {
+      fprintf(stderr, "[rsp-hle] non-OSTask dispatch #%llu: type=%08x ucode=%06x/%u data=%06x/%u dl=%06x/%u\n",
+        (unsigned long long)guardedDispatches, taskType, ucode, ucodeSize, ucodeData, ucodeDataSize,
+        dataPtr, dataSize);
+    }
+    return false;
+  }
   if(!ucode || ucodeSize == 0 || ucodeSize > 0x1000) return false;
   if(ucodeDataSize > 0x1000) return false;
 
@@ -296,6 +331,7 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
 
   //level 2: execute recognized graphics tasks natively; anything else (and
   //any failure) falls back to LLE by returning false.
+  lumiverseHLERequestedCompletionCycles = lumiverseHLECompletionCycles(taskType);
   if(level >= 2 && taskType == 1) {
     if(lumiverseExecuteGraphicsTask(task, ucodeHash)) {
       //task ran natively. The caller (io.cpp SP_STATUS write) applies the

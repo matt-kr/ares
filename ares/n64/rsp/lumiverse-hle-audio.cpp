@@ -68,7 +68,10 @@
 //                 embedded in cmd0 (count=bits12-23, out=bits0-11) when
 //                 nonzero (Zeldas), else from SETBUFF (SF64)
 //  0x0f SETLOOP   loop state addr=cmd1 (16 s16 decoded samples at loop point)
-//  0x11 COPY      (SF64) count samples=cmd0.lo16, src=cmd1.hi16, dst=cmd1.lo16
+//  0x11 DECIMATE  count=cmd0.lo16 OUTPUT samples, src=cmd1.hi16, dst=cmd1.lo16:
+//                 dst[i] = src[2i] (2:1 pre-halving for high pitch ratios;
+//                 oracle-exact on OoT (U) and SF64 — was mis-implemented as
+//                 a plain copy through round 6)
 //  0x12 ENVSETUP1 wet send=cmd0.b2 (Q8), ramp rates=cmd1 (s16 L,R; applied
 //                 to the volume once per 8-sample vector)
 //  0x13 ENVMIX    in=cmd0.b2<<4, count samples=cmd0.b1, cmd1 = four output
@@ -511,10 +514,10 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
       if(!(w1 & 0x00ffffff)) return reject(offset, w0, w1, "setloop addr");
       v.loopAddr = w1 & 0x00ffffff;
       break;
-    case 0x11: {  //COPY (SF64)
-      const u32 count = (w0 & 0xffff) * 2;
+    case 0x11: {  //DECIMATE (2:1 copy): count OUTPUT samples, reads 2*count
+      const u32 count = w0 & 0xffff;
       const u32 src = w1 >> 16, dst = w1 & 0xffff;
-      if(!count || src + count > 0x1000 || dst + count > 0x1000) return reject(offset, w0, w1, "copy range");
+      if(!count || src + count * 4 > 0x1000 || dst + count * 2 > 0x1000) return reject(offset, w0, w1, "decimate range");
       break;
     }
     case 0x12:  //ENVSETUP1
@@ -1351,12 +1354,22 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
       m.loopAddr = address;
       break;
 
-    case 0x11: {  //COPY (SF64): count samples from src to dst
-      const u32 count = (w0 & 0xffff) * 2;
+    case 0x11: {  //DECIMATE: dst[i] = src[2i] for count output samples.
+      //Previously implemented as a plain sample copy ("COPY"), which is
+      //WRONG: the truncated-task oracle (LUMIVERSE_ARES_N64_AUDIO_HLE_
+      //TRUNCATE_OP=11) on both Zelda OoT (U) task 534 and Star Fox 64 shows
+      //LLE writing exactly every second source sample (src 0x5a0 samples
+      //0,2,4.. -> dst 0x3e0; src 0x610 -> dst 0x470). The alist uses it to
+      //pre-halve voices whose pitch ratio exceeds the resampler's range
+      //(the following RESAMPLE runs at half the nominal ratio), so the
+      //plain copy played every such voice an OCTAVE LOW at half speed —
+      //the "instrument bent flat" in Zelda's menus; MQ's intro exercises
+      //it in 4356 of 9342 tasks. Even-sample phase; no filtering.
+      const u32 count = w0 & 0xffff;
       const u32 src = w1 >> 16, dst = w1 & 0xffff;
-      u8 scratch[0x1000];
-      for(u32 index = 0; index < count; index++) scratch[index] = dmem[(src + index) & 0xfff];
-      for(u32 index = 0; index < count; index++) dmem[(dst + index) & 0xfff] = scratch[index];
+      s16 scratch[0x800];
+      for(u32 index = 0; index < count && index < 0x800; index++) scratch[index] = lumiverseAudioDmemReadS16(dmem, src + index * 4);
+      for(u32 index = 0; index < count && index < 0x800; index++) lumiverseAudioDmemWriteS16(dmem, dst + index * 2, scratch[index]);
       break;
     }
 
@@ -1452,44 +1465,63 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
 //byte-compare our buffered writes against what LLE actually wrote
 //----------------------------------------------------------------------------
 
+//lowest zero-lag correlation among the last compared task's buffer writes
+//(2.0 = nothing compared); the debug dump keys on it
+f64 lumiverseAudioShadowWorstCorr = 2.0;
+
 auto lumiverseAudioShadowCompare(LumiverseAudioShadow& shadow) -> void {
   if(!shadow.pending) return;
   shadow.pending = false;
-  u32 exact = 0, close = 0, bad = 0;
+  //Writes are judged in two classes: sample BUFFERS (SAVEBUFF of mixed
+  //output, > 32 bytes) and STATE blobs (<= 32 bytes: resampler/ADPCM
+  //history saved for the next chunk). State blobs are private to the
+  //microcode's own format — this interpreter keeps its own per-voice state
+  //table — so they always differ and say nothing about audibility; only
+  //buffer writes are reported in the "bad" figure. For a bad buffer write
+  //the zero-lag correlation coefficient and RMS ratio are printed: an
+  //approximation mismatch (resampler kernel) keeps corr ~0.99 / ratio ~1,
+  //a wrong pitch or envelope collapses corr or moves the ratio.
+  u32 exact = 0, close = 0, bad = 0, stateDiff = 0;
   s32 taskMax = 0;
   static u64 detailLines = 0;
+  lumiverseAudioShadowWorstCorr = 2.0;
   for(u32 w = 0; w < shadow.writeCount; w++) {
     const auto& write = shadow.writes[w];
     s32 maxDiff = 0;
     u32 firstBad = 0xffffffff;
-    u64 sumMine = 0, sumTheirs = 0;
+    f64 sumMine2 = 0, sumTheirs2 = 0, sumCross = 0;
     for(u32 index = 0; index + 1 < write.length; index += 2) {
       const s16 mine = (s16)((u16)shadow.data[write.offset + index] << 8 | shadow.data[write.offset + index + 1]);
       const s16 theirs = (s16)((u16)lumiverseAudioRDRAMReadByte(write.addr + index) << 8 | lumiverseAudioRDRAMReadByte(write.addr + index + 1));
-      sumMine += mine < 0 ? -mine : mine;
-      sumTheirs += theirs < 0 ? -theirs : theirs;
+      sumMine2 += (f64)mine * mine;
+      sumTheirs2 += (f64)theirs * theirs;
+      sumCross += (f64)mine * theirs;
       s32 diff = (s32)mine - theirs;
       if(diff < 0) diff = -diff;
       if(diff > maxDiff) { maxDiff = diff; if(firstBad == 0xffffffff && diff > 64) firstBad = index; }
     }
+    const bool stateBlob = write.length <= 32;
+    if(stateBlob) { if(maxDiff) stateDiff++; continue; }
     if(maxDiff > taskMax) taskMax = maxDiff;
     if(maxDiff == 0) exact++;
     else if(maxDiff <= 64) close++;
     else {
       bad++;
-      if(maxDiff > 5000 && detailLines < 1200) {
+      if(detailLines < 2000) {
         detailLines++;
-        fprintf(stderr, "[rsp-hle-audio-shadow]   write cmd=%u addr=%06x len=%u maxdiff=%d firstbad=+%u ratio=%.3f\n",
-          write.command, write.addr, write.length, maxDiff, firstBad,
-          sumTheirs ? (double)sumMine / (double)sumTheirs : -1.0);
+        const f64 corr = (sumMine2 > 0 && sumTheirs2 > 0) ? sumCross / (sqrt(sumMine2) * sqrt(sumTheirs2)) : -2.0;
+        const f64 ratio = sumTheirs2 > 0 ? sqrt(sumMine2 / sumTheirs2) : -1.0;
+        if(corr > -2.0 && corr < lumiverseAudioShadowWorstCorr) lumiverseAudioShadowWorstCorr = corr;
+        fprintf(stderr, "[rsp-hle-audio-shadow]   write cmd=%u addr=%06x len=%u maxdiff=%d firstbad=+%u corr=%.3f ratio=%.3f\n",
+          write.command, write.addr, write.length, maxDiff, firstBad, corr, ratio);
       }
     }
   }
   static u64 compared = 0;
   compared++;
   if(bad || (compared & 255) == 1) {
-    fprintf(stderr, "[rsp-hle-audio-shadow] task %llu: writes=%u exact=%u close=%u bad=%u maxdiff=%d%s\n",
-      (unsigned long long)shadow.task, shadow.writeCount, exact, close, bad, taskMax,
+    fprintf(stderr, "[rsp-hle-audio-shadow] task %llu: writes=%u exact=%u close=%u bad=%u stateDiff=%u maxdiff=%d%s\n",
+      (unsigned long long)shadow.task, shadow.writeCount, exact, close, bad, stateDiff, taskMax,
       shadow.overflow ? " (overflow)" : "");
   }
 }
@@ -1503,8 +1535,18 @@ struct LumiverseAudioDebugCapture {
 };
 
 auto lumiverseAudioDebugDump(const LumiverseAudioDebugCapture& capture, u64 task) -> void {
+  //LUMIVERSE_ARES_N64_AUDIO_HLE_DUMP_MIN_TASK=<n>: ignore tasks before n so
+  //the quota is not spent on boot-time mismatches (run timing is not
+  //reproducible across runs — the RDP's deferred SyncFull makes DP
+  //interrupt timing wall-clock dependent — so a task cannot be targeted by
+  //number from a previous run)
+  static const u64 minTask = [] {
+    const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_DUMP_MIN_TASK");
+    return value ? (u64)::atoll(value) : 0;
+  }();
+  if(task < minTask) return;
   static u32 dumps = 0;
-  if(dumps >= 3) return;
+  if(dumps >= 6) return;
   dumps++;
   char path[128];
   snprintf(path, sizeof(path), "/tmp/lumiverse-audio-debug-%llu.txt", (unsigned long long)task);
@@ -1552,7 +1594,7 @@ auto lumiverseAudioShadowCompareDMEM(const LumiverseAudioMachine& machine, u64 t
       if(diff > rangeMax) rangeMax = diff;
     } else if(inRange) {
       inRange = false;
-      if(rangeMax > 256 && lines < 600) {
+      if(rangeMax > 256 && lines < (lumiverseAudioHLEDebug() >= 3 ? 20000 : 600)) {
         lines++;
         fprintf(stderr, "[rsp-hle-audio-dmem] task %llu: dmem %03x..%03x maxdiff=%d\n",
           (unsigned long long)task, rangeStart, offset, rangeMax);
@@ -1607,9 +1649,13 @@ auto lumiverseAudioShadowSettle() -> void {
     //with a truncation selector configured, dump ONLY the targeted task (the
     //three-dump quota would otherwise be spent on early boot mismatches)
     static const bool selectorConfigured = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_OP") != nullptr || truncateTask >= 0;
+    //without a selector, dump the tasks whose OUTPUT buffers correlate
+    //poorly with LLE's (an audible divergence), not merely DMEM scratch
+    //differences (the resampler approximation alone exceeds 1000 LSB)
     const bool dumpWanted = lumiverseAudioTruncateDumpTask >= 0
       ? shadow.task == (u64)lumiverseAudioTruncateDumpTask
-      : (selectorConfigured ? false : worst > 1000);
+      : (selectorConfigured ? false : lumiverseAudioShadowWorstCorr < 0.6);
+    (void)worst;
     if(dumpWanted && lumiverseAudioCapture) lumiverseAudioDebugDump(*lumiverseAudioCapture, shadow.task);
   }
 }
