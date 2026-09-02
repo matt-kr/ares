@@ -281,6 +281,15 @@ struct LumiverseGfxMachine {
   u64 trisRejected = 0;
 };
 
+//Banjo-Tooie emits GBI2 op 0x08 (cmd0=08000800 cmd1=00040200) in every
+//post-intro display list; n64js lists 0x08 as G_LINE3D (line microcodes
+//only). Experiment knob: treat it as a no-op instead of failing the task
+//over to LLE, validated against LLE frame checkpoints (round 8).
+auto lumiverseGfxOp08NoOp() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_GBI2_OP08_NOOP"); return v && v[0] == '1'; }();
+  return value;
+}
+
 auto lumiverseGfxLogLevel() -> int {
   static int level = [] {
     const char* value = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_LOG");
@@ -1529,6 +1538,15 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       break;
     }
 
+    case 0x08: {  //(experiment) G_LINE3D-slot opcode as a no-op (Banjo-Tooie)
+      if(!lumiverseGfxOp08NoOp()) {
+        static u32 logged = 0;
+        if(logged++ < 4) fprintf(stderr, "[rsp-hle-gfx] executor hit gbi2 op 08 at pc=%06x (depth=%u) cmd0=%08x cmd1=%08x -> task abort\n", m.pc - 8, m.stackDepth, cmd0, cmd1);
+        return false;
+      }
+      break;
+    }
+
     case 0xd5: {  //G_SPECIAL_1 (Super Smash Bros., fifo 2.04H): observed only
                   //as d5000001/00000000 between a G_MTX and a run of
                   //G_MW_MATRIX patches. The only semantics under which those
@@ -1980,6 +1998,7 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
 
 auto lumiverseGfxOpcodeSupportedGBI2(u8 opcode) -> bool {
   switch(opcode) {
+  case 0x08: return lumiverseGfxOp08NoOp();
   case 0x00: case 0x01: case 0x02: case 0x03: case 0x04:
   case 0x05: case 0x06: case 0x07:
   case 0xd5: case 0xd6: case 0xd7: case 0xd8: case 0xd9: case 0xda:
@@ -2122,7 +2141,19 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   case LumiverseUcodeF3DZEXNoN208J: dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DZEXNoN206H: dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DZEXNoN208I: dialect = LumiverseDialectGBI2; break;
-  case LumiverseUcodeF3DEX2NoN208:  dialect = LumiverseDialectGBI2; break;
+  //Banjo-Tooie (U) "F3DEX.NoN fifo 2.08": DE-WHITELISTED in round 8. The
+  //intro validated in the M-GBI2 round, but every post-intro display list
+  //carries op 0x08 (whole-task LLE fallback) and — worse — the scenes that
+  //do run under the GBI2 executor render as black/garbage triangles
+  //(cutscene at steps 4500/6000 vs the LLE reference, see the round-8
+  //report), and an LLE task after HLE tasks leaves the fifo microcode
+  //spinning forever (frozen picture). Opt back in with
+  //LUMIVERSE_ARES_N64_BT_GFX_HLE=1 for further work.
+  case LumiverseUcodeF3DEX2NoN208: {
+    static const bool optIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_BT_GFX_HLE"); return v && v[0] == '1'; }();
+    if(!optIn) return false;
+    dialect = LumiverseDialectGBI2; break;
+  }
   case LumiverseUcodeF3DEX2204H:    dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DEX2206:     dialect = LumiverseDialectGBI2; break;
   //LumiverseUcodeF3DEX2207 (DK64) deliberately absent — see its declaration
@@ -2146,6 +2177,15 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
     const char* optOut = ::getenv("LUMIVERSE_ARES_N64_GE_HLE");
     if(optOut && optOut[0] == '0') return false;
     dialect = LumiverseDialectGBI0; geBaked = true; break;
+  }
+  //Conker's Bad Fur Day (U): "RSP Gfx ucode F3DEXBG.NoN fifo 2.08" — a
+  //custom F3DEX2 build (round 8 census; the engine keeps the ucode resident
+  //and dispatches with ucode_size 0). Tried as plain GBI2 behind an opt-in
+  //until its dialect differences are validated (LUMIVERSE_ARES_N64_CONKER_GFX_HLE=1).
+  case 0x63a15d2f6bdae1f5ull: {
+    static const bool optIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_GFX_HLE"); return v && v[0] == '1'; }();
+    if(!optIn) return false;
+    dialect = LumiverseDialectGBI2; break;
   }
   default: return false;
   }

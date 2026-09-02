@@ -189,8 +189,21 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
     }
     return false;
   }
-  if(!ucode || ucodeSize == 0 || ucodeSize > 0x1000) return false;
-  if(ucodeDataSize > 0x1000) return false;
+  //ucode_size 0 = "microcode already resident" (Conker's Bad Fur Day passes
+  //0 for every task; its engine loads the ucode itself): hash the full
+  //4 KiB IMEM image at ucode_boot like the census does for tiny sizes
+  if(!ucode || ucodeSize > 0x1000 || ucodeDataSize > 0x1000) {
+    //diagnostic: an OSTask with sizes outside the sanity window is skipped
+    //silently otherwise (Conker's engine dispatches with ucode_size 0 —
+    //round 8 census)
+    static u64 oddDispatches = 0;
+    oddDispatches++;
+    if(oddDispatches <= 3 || (oddDispatches & 1023) == 0) {
+      fprintf(stderr, "[rsp-hle] OSTask with odd sizes #%llu: type=%u ucode=%06x/%u data=%06x/%u dl=%06x/%u\n",
+        (unsigned long long)oddDispatches, taskType, ucode, ucodeSize, ucodeData, ucodeDataSize, dataPtr, dataSize);
+    }
+    return false;
+  }
 
   //hash the microcode text: identity of the task's program
   const u32 hashLength = ucodeSize >= 256 && ucodeSize <= 0x1000 ? ucodeSize : 0x1000;
