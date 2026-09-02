@@ -2138,7 +2138,15 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   //menus; in-game every task also carries baked RDP triangle streams
   //(0xb4/0xb2/0xb3 word runs), which are passed through verbatim after
   //structural validation in the dry-run (see LumiverseGfxMachine::bakedRDP)
-  case 0xc8f38644ac25bbabull: dialect = LumiverseDialectGBI0; geBaked = true; break;
+  case 0xc8f38644ac25bbabull: {
+    //LUMIVERSE 2026-09-01: device report "007 is worse now" right after the
+    //baked-stream pass-through shipped (host: 0 fallbacks, ~70% paced util).
+    //Until a device log explains it, GoldenEye stays on the LLE path unless
+    //explicitly opted in.
+    const char* optIn = ::getenv("LUMIVERSE_ARES_N64_GE_HLE");
+    if(!optIn || optIn[0] != '1') return false;
+    dialect = LumiverseDialectGBI0; geBaked = true; break;
+  }
   default: return false;
   }
   if(!vulkan.enable) return false;

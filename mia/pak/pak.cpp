@@ -117,9 +117,16 @@ auto Pak::save(string name, string extension, string location) -> bool {
   if(auto save = pak->read(name)) {
     auto saveFilePath = saveLocation(location, name, extension);
     directory::create(Location::dir(saveFilePath));
-    if(auto fp = file::open(saveLocation(location, name, extension), file::mode::write)) {
+    //LUMIVERSE: write to a sibling temp file and rename over the target, so a
+    //kill/crash mid-write (the app is flushed on scene deactivate) can never
+    //leave a truncated battery save behind.
+    string tempFilePath = {saveFilePath, ".tmp"};
+    if(auto fp = file::open(tempFilePath, file::mode::write)) {
       fp.write({save->data(), save->size()});
-      return true;
+      fp.close();
+      if(std::rename((const char*)tempFilePath, (const char*)saveFilePath) == 0) return true;
+      file::remove(tempFilePath);
+      return false;
     }
   }
   return true;
