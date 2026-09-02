@@ -2139,12 +2139,12 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   //(0xb4/0xb2/0xb3 word runs), which are passed through verbatim after
   //structural validation in the dry-run (see LumiverseGfxMachine::bakedRDP)
   case 0xc8f38644ac25bbabull: {
-    //LUMIVERSE 2026-09-01: device report "007 is worse now" right after the
-    //baked-stream pass-through shipped (host: 0 fallbacks, ~70% paced util).
-    //Until a device log explains it, GoldenEye stays on the LLE path unless
-    //explicitly opted in.
-    const char* optIn = ::getenv("LUMIVERSE_ARES_N64_GE_HLE");
-    if(!optIn || optIn[0] != '1') return false;
+    //LUMIVERSE 2026-09-01: device log with this path = 45-70% speed at
+    //24-36 ms/field (CPU-bound; GoldenEye is the heaviest title and the
+    //device has no JIT) — still faster than the LLE RSP path it replaced,
+    //so it stays ON. LUMIVERSE_ARES_N64_GE_HLE=0 forces the LLE path for A/B.
+    const char* optOut = ::getenv("LUMIVERSE_ARES_N64_GE_HLE");
+    if(optOut && optOut[0] == '0') return false;
     dialect = LumiverseDialectGBI0; geBaked = true; break;
   }
   default: return false;
