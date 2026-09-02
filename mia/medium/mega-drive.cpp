@@ -62,7 +62,9 @@ auto MegaDrive::load(string location) -> LoadResult {
   pak->append("manifest.bml", manifest);
 
   //add SVP ROM to image if it is missing
-  if(document["game/board/memory(type=ROM,content=SVP)"]) {
+  //(Lumiverse: the bundled SVP firmware may be a stripped placeholder; only
+  //patch the image when a full 0x800-byte firmware is actually compiled in)
+  if(document["game/board/memory(type=ROM,content=SVP)"] && sizeof(Resource::MegaDrive::SVP) == 0x800) {
     if(memory::compare(rom.data() + rom.size() - 0x800, Resource::MegaDrive::SVP, 0x800)) {
       rom.resize(rom.size() + 0x800);
       memory::copy(rom.data() + rom.size() - 0x800, Resource::MegaDrive::SVP, 0x800);
