@@ -116,7 +116,14 @@ constexpr u32 LumiverseGeom2CullFront      = 0x00000200;
 constexpr u32 LumiverseGeom2CullBack      = 0x00000400;
 constexpr u32 LumiverseGeom2ShadingSmooth  = 0x00200000;
 
-enum : u32 { LumiverseDialectGBI1 = 0, LumiverseDialectGBI2 = 1, LumiverseDialectGBI0 = 2 };
+enum : u32 { LumiverseDialectGBI1 = 0, LumiverseDialectGBI2 = 1, LumiverseDialectGBI0 = 2,
+  //S2DEX (2D sprite/background microcode): S2DEX 1.xx shares GBI1's flow
+  //control (Yoshi's Story), S2DEX2 shares GBI2's (loaded via G_LOAD_UCODE
+  //by the Zeldas and Kirby 64 for their 2D screens)
+  LumiverseDialectS2DEX = 3, LumiverseDialectS2DEX2 = 4 };
+//Yoshi's Story (U): "RSP Gfx ucode S2DEX  1.06 Yoshitaka Yasumoto Nintendo." — every
+//graphics task of the game (round-9 census: 2557 of 2557)
+constexpr u64 LumiverseUcodeS2DEX106 = 0x0de2cc6b5e6b2759ull;
 
 //GBI0 G_VTX encoding variants (n64js gbi0.js subclasses)
 enum : u32 { LumiverseGBI0VertexStandard = 0, LumiverseGBI0VertexWaveRace = 1, LumiverseGBI0VertexSOTE = 2 };
@@ -327,6 +334,16 @@ struct LumiverseGfxMachine {
   u32 baked[64];
   u32 bakedCount = 0;
 
+  //S2DEX object state (round 10): uObjMtx 2x2 (16.16) + translation (10.2)
+  //+ base scale (5.10), and the gSPObjRenderMode flags. Field layouts from
+  //n64js gbi_s2dex.js (MIT); rendering semantics established against our
+  //own LLE RDP streams (Yoshi's Story title sprites)
+  f32 objA = 1.0f, objB = 0.0f, objC = 0.0f, objD = 1.0f;
+  f32 objX = 0.0f, objY = 0.0f;
+  f32 objScaleX = 1.0f, objScaleY = 1.0f;
+  u32 objRenderMode = 0;
+  u32 objTileToggle = 0;
+
   //dialect (GBI1 = F3DEX v1, GBI2 = F3DEX2/F3DZEX, GBI0 = Fast3D) and its
   //bit positions
   u32 dialect = LumiverseDialectGBI1;
@@ -370,6 +387,82 @@ auto lumiverseGfxSegmentAddress(LumiverseGfxMachine& m, u32 address) -> u32 {
   return (m.segments[segment] + (address & 0x00ffffff)) & 0x00ffffff;
 }
 
+//per-dialect bit positions / index stride; used by reset and by G_LOAD_UCODE
+//mid-task switches (state other than these is deliberately kept)
+auto lumiverseGfxSetDialect(LumiverseGfxMachine& m, u32 dialect) -> void {
+  m.dialect = dialect;
+  if(dialect == LumiverseDialectGBI2 || dialect == LumiverseDialectS2DEX2) {
+    m.smoothMask = LumiverseGeom2ShadingSmooth;
+    m.cullFrontMask = LumiverseGeom2CullFront;
+    m.cullBackMask = LumiverseGeom2CullBack;
+    m.shadeMask = 0;  //GBI2: shade coefficients always generated (n64js)
+    m.triStride = 2;
+  } else {
+    //GBI0 shares GBI1's geometry-mode bit positions (n64js: GBI0 extends
+    //GBI1 without overriding them); only the index stride differs
+    m.smoothMask = LumiverseGeom1ShadingSmooth;
+    m.cullFrontMask = LumiverseGeom1CullFront;
+    m.cullBackMask = LumiverseGeom1CullBack;
+    m.shadeMask = LumiverseGeomShade;
+    if(dialect == LumiverseDialectGBI0) {
+      m.triStride = m.gbi0Vertex == LumiverseGBI0VertexStandard ? 10 : 5;
+    } else {
+      m.triStride = 2;
+    }
+  }
+}
+
+//G_LOAD_UCODE target identification (round 10): the text image at the
+//command's address is hashed exactly like the census hashes an OSTask's
+//ucode (FNV-1a over 4 KiB), so the same constants identify it. Cached per
+//text address (validated by the first and middle words of the image).
+//Returns the dialect or -1 for anything not whitelisted here. Every new
+//(address, hash) pair is logged once so unknown loads can be censused.
+auto lumiverseGfxLoadUcodeDialect(u32 textAddress) -> s32 {
+  textAddress &= 0x00ffffff;
+  struct Entry { u32 address; u32 word0; u32 word800; s32 dialect; u64 hash; };
+  static Entry cache[8];
+  static u32 cacheCount = 0;
+  const u32 word0 = lumiverseGfxWord(textAddress);
+  const u32 word800 = lumiverseGfxWord(textAddress + 0x800);
+  for(u32 index = 0; index < cacheCount; index++) {
+    auto& entry = cache[index];
+    if(entry.address == textAddress && entry.word0 == word0 && entry.word800 == word800) return entry.dialect;
+  }
+  u64 hash = 14695981039346656037ull;
+  for(u32 index = 0; index < 0x1000; index++) {
+    hash = (hash ^ lumiverseGfxByte(textAddress + index)) * 1099511628211ull;
+  }
+  s32 dialect = -1;
+  switch(hash) {
+  case LumiverseUcodeF3DEXNoN122: case LumiverseUcodeF3DEX121:
+  case LumiverseUcodeF3DEXNoN100: case LumiverseUcodeF3DEX095:
+  case 0x2d3bb1207b5332deull:
+    dialect = LumiverseDialectGBI1; break;
+  case LumiverseUcodeS2DEX106:
+    dialect = LumiverseDialectS2DEX; break;
+  //S2DEX2 images loaded mid-task by Majora's Mask (text 1abab0) and Kirby 64
+  //(text 03be30; Kirby also dispatches it as a standalone OSTask)
+  case 0x2dbd2c59e8565ef7ull: case 0x9e66b240ccd2d588ull:
+    dialect = LumiverseDialectS2DEX2; break;
+  case LumiverseUcodeF3DZEXNoN208J: case LumiverseUcodeF3DZEXNoN206H: case LumiverseUcodeF3DZEXNoN208I:
+  case LumiverseUcodeF3DEX2NoN208: case LumiverseUcodeF3DEX2204H: case LumiverseUcodeF3DEX2206:
+  case LumiverseUcodeF3DEX2207: case 0xfdeacd35544ff754ull: case LumiverseUcodeF3DEX2NoN208H:
+  case LumiverseUcodeF3DEX2208K: case LumiverseUcodeF3DEX2208:
+    dialect = LumiverseDialectGBI2; break;
+  default: break;
+  }
+  static u32 logged = 0;
+  if(logged < 8) {
+    logged++;
+    fprintf(stderr, "[rsp-hle-gfx] load-ucode text=%06x hash=%016llx -> dialect %d\n",
+      textAddress, (unsigned long long)hash, dialect);
+  }
+  if(cacheCount < 8) cache[cacheCount++] = { textAddress, word0, word800, dialect, hash };
+  else cache[(u32)(hash & 7)] = { textAddress, word0, word800, dialect, hash };
+  return dialect;
+}
+
 auto lumiverseGfxReset(LumiverseGfxMachine& m, u32 pc, u32 dialect, u32 gbi0Vertex = LumiverseGBI0VertexStandard, bool bakedRDP = false) -> void {
   //Per-task, not per-process. `machine` is a function-local static that lives
   //for the whole process, and nothing else ever clears these two: once a
@@ -387,27 +480,13 @@ auto lumiverseGfxReset(LumiverseGfxMachine& m, u32 pc, u32 dialect, u32 gbi0Vert
   m.pc = pc;
   m.stackDepth = 0;
   m.running = true;
-  m.dialect = dialect;
   m.gbi0Vertex = gbi0Vertex;
-  if(dialect == LumiverseDialectGBI2) {
-    m.smoothMask = LumiverseGeom2ShadingSmooth;
-    m.cullFrontMask = LumiverseGeom2CullFront;
-    m.cullBackMask = LumiverseGeom2CullBack;
-    m.shadeMask = 0;  //GBI2: shade coefficients always generated (n64js)
-    m.triStride = 2;
-  } else {
-    //GBI0 shares GBI1's geometry-mode bit positions (n64js: GBI0 extends
-    //GBI1 without overriding them); only the index stride differs
-    m.smoothMask = LumiverseGeom1ShadingSmooth;
-    m.cullFrontMask = LumiverseGeom1CullFront;
-    m.cullBackMask = LumiverseGeom1CullBack;
-    m.shadeMask = LumiverseGeomShade;
-    if(dialect == LumiverseDialectGBI0) {
-      m.triStride = gbi0Vertex == LumiverseGBI0VertexStandard ? 10 : 5;
-    } else {
-      m.triStride = 2;
-    }
-  }
+  lumiverseGfxSetDialect(m, dialect);
+  m.objA = 1.0f; m.objB = 0.0f; m.objC = 0.0f; m.objD = 1.0f;
+  m.objX = 0.0f; m.objY = 0.0f;
+  m.objScaleX = 1.0f; m.objScaleY = 1.0f;
+  m.objRenderMode = 0;
+  m.objTileToggle = 0;
   for(u32 index = 0; index < 16; index++) m.segments[index] = 0;
   //identity matrices
   for(u32 index = 0; index < 16; index++) {
@@ -1068,6 +1147,467 @@ auto lumiverseGfxDrawTriangle(LumiverseGfxMachine& m, u32 index0, u32 index1, u3
   }
 }
 
+auto lumiverseGfxEmitOtherMode(LumiverseGfxMachine& m) -> void;  //defined with the GBI2 interpreter
+
+//----------------------------------------------------------------------------
+//S2DEX object commands (round 10). Shared by the S2DEX 1.xx (GBI1 base,
+//Yoshi's Story) and S2DEX2 (GBI2 base) dialects; only opcode numbers differ.
+//Structure layouts: n64js gbi_s2dex.js (MIT). The RDP command sequences
+//(texture load, tile setup, the two textured triangles of a sprite, the
+//shrink/bilerp trimming) were established from our own LLE RDP stream dumps
+//of the same display lists.
+//----------------------------------------------------------------------------
+
+//gSPObjLoadTxtr: uObjTxtr at `at` (24 bytes). Always loads (the sid/flag/
+//mask texture-cache test is not modelled: a redundant load is harmless)
+auto lumiverseGfxS2DEXLoadTexture(LumiverseGfxMachine& m, u32 at) -> bool {
+  const u32 type = lumiverseGfxWord(at + 0);
+  const u32 image = lumiverseGfxSegmentAddress(m, lumiverseGfxWord(at + 4));
+  const u32 f8 = lumiverseGfxHalf(at + 8);
+  const u32 f10 = lumiverseGfxHalf(at + 10);
+  const u32 f12 = lumiverseGfxHalf(at + 12);
+  const u32 command = type & 0xff;
+  const u32 fmtSiz = (type >> 8) & 0xff;
+  const u32 lineMask = (type >> 16) & 0xff;
+  switch(command) {
+  case 0x33: {  //G_OBJLT_TXTRBLOCK: tmem, tsize (qwords - 1), tline (dxt)
+    lumiverseGfxEmit2(m.out, 0xfd000000 | fmtSiz << 16 | (f10 & 0xfff), image);
+    lumiverseGfxEmit2(m.out, 0xf5000000 | fmtSiz << 16 | ((((f10 + 1) & lineMask) >> 2) & 0x1ff) << 9 | (f8 & 0x1ff), 0x07000000);
+    lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+    lumiverseGfxEmit2(m.out, 0xf3000000, 0x07000000 | ((f10 << 2) & 0xfff) << 12 | (f12 & 0xfff));
+    return true;
+  }
+  case 0x30: {  //G_OBJLT_TLUT: phead = TMEM word address (0x100 = the TLUT
+                //half), pnum = entries - 1 (LLE: SETTIMG width-1 = pnum,
+                //SETTILE tmem = phead, LOADTLUT lrs = pnum << 2)
+    lumiverseGfxEmit2(m.out, 0xfd100000 | (f10 & 0xfff), image);
+    lumiverseGfxEmit2(m.out, 0xe8000000, 0);
+    lumiverseGfxEmit2(m.out, 0xf5000000 | (f8 & 0x1ff), 0x07000000);
+    lumiverseGfxEmit2(m.out, 0xf0000000, 0x07000000 | ((f10 << 2) & 0xfff) << 12);
+    return true;
+  }
+  case 0x34: {  //G_OBJLT_TXTRTILE: tmem, twidth (16-bit texels - 1), theight (10.2)
+    //Yoshi's Story gameplay sprites (24x21 CI8: twidth 11, theight 83 =
+    //20.75): SETTIMG width twidth+1, tile line ((twidth+1) & lineMask) >> 2,
+    //LOADTILE lrs = twidth << 2, lrt = theight
+    lumiverseGfxEmit2(m.out, 0xfd000000 | fmtSiz << 16 | (f10 & 0xfff), image);
+    lumiverseGfxEmit2(m.out, 0xf5000000 | fmtSiz << 16 | ((((f10 + 1) & lineMask) >> 2) & 0x1ff) << 9 | (f8 & 0x1ff), 0x07000000);
+    lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+    lumiverseGfxEmit2(m.out, 0xf4000000, 0x07000000 | ((f10 << 2) & 0xfff) << 12 | (f12 & 0xfff));
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+//gSPObjSprite / gSPObjLoadTxSprite: uObjSprite at `at` (24 bytes), drawn
+//with the current uObjMtx as two textured triangles
+auto lumiverseGfxS2DEXDrawSprite(LumiverseGfxMachine& m, u32 at) -> void {
+  const f32 objX = (f32)lumiverseGfxShort(at + 0) / 4.0f;
+  const f32 scaleW = (f32)lumiverseGfxHalf(at + 2) / 1024.0f;
+  const f32 imageW = (f32)lumiverseGfxHalf(at + 4) / 32.0f;
+  const f32 objY = (f32)lumiverseGfxShort(at + 8) / 4.0f;
+  const f32 scaleH = (f32)lumiverseGfxHalf(at + 10) / 1024.0f;
+  const f32 imageH = (f32)lumiverseGfxHalf(at + 12) / 32.0f;
+  const u32 stride = lumiverseGfxHalf(at + 16);
+  const u32 adrs = lumiverseGfxHalf(at + 18);
+  const u32 fmt = lumiverseGfxByte(at + 20) & 7;
+  const u32 siz = lumiverseGfxByte(at + 21) & 3;
+  const u32 pal = lumiverseGfxByte(at + 22) & 0xf;
+  const u32 flags = lumiverseGfxByte(at + 23);
+  if(scaleW <= 0.0f || scaleH <= 0.0f || imageW <= 0.0f || imageH <= 0.0f) return;
+
+  //the microcode programs the TLUT type per sprite format (LLE: an I4
+  //sprite after a G_TT_RGBA16 game setting is drawn with TEXTLUT none)
+  u32 otherModeH = m.otherModeH;
+  if(fmt == 2) { if((otherModeH & 0xc000) == 0) otherModeH |= 0x8000; }
+  else otherModeH &= ~0xc000u;
+  if(otherModeH != m.otherModeH) { m.otherModeH = otherModeH; m.otherModeDirty = true; }
+  lumiverseGfxEmitOtherMode(m);
+
+  //render tile: sprite format, line = stride, tmem = adrs, clamp S/T. LLE
+  //alternates consecutive sprites between tiles 0 and 2 (RDP tile-descriptor
+  //double buffering); reproduced so the streams compare like for like
+  const u32 tile = m.objTileToggle;
+  m.objTileToggle ^= 2;
+  const bool clamp = !(m.objRenderMode & 0x01);  //G_OBJRM_NOTXCLAMP
+  lumiverseGfxEmit2(m.out,
+    0xf5000000 | fmt << 21 | siz << 19 | (stride & 0x1ff) << 9 | (adrs & 0x1ff),
+    tile << 24 | pal << 20 | (clamp ? (2u << 18 | 2u << 8) : 0));
+  const u32 lrs = ((u32)(imageW - 1.0f) << 2) & 0xfff;
+  const u32 lrt = ((u32)(imageH - 1.0f) << 2) & 0xfff;
+  lumiverseGfxEmit2(m.out, 0xf2000000, tile << 24 | lrs << 12 | lrt);
+  lumiverseGfxEmit2(m.out, 0xe7000000, 0);
+
+  //object rectangle in object space; SHRINKSIZE_1/2 (0x10/0x20) and BILERP
+  //(0x08) each trim one half texel off the FAR end of the object (LLE with
+  //mode 0x18: a 128x50 sprite at scale 1 covers x 96..223 with S 0..127;
+  //with a flipping matrix D<0 the trimmed end lands at the screen top —
+  //Yoshi's "Select Yoshi" sprites, D=-1.8: LLE y 208.0..235.0 = raw
+  //206.4+1.8 .. 235.2, floored to quarter pixels)
+  const u32 mode = m.objRenderMode;
+  const f32 shrink = ((mode & 0x10) ? 0.5f : (mode & 0x20) ? 1.0f : 0.0f) + ((mode & 0x08) ? 0.5f : 0.0f);
+  const f32 objW = (imageW - shrink) / scaleW;
+  const f32 objH = (imageH - shrink) / scaleH;
+  const f32 sLo = 0.0f, sHi = imageW - shrink;
+  const f32 tLo = 0.0f, tHi = imageH - shrink;
+  auto quarter = [](f32 value) -> f32 { return ::floorf(value * 4.0f) / 4.0f; };
+
+  LumiverseEmitVertex v[4];
+  for(auto& e : v) { e.x = e.y = 0.0f; e.r = e.g = e.b = e.a = 1.0f; e.s = e.t = 0.0f; e.invW = 1.0f; e.z = 0.0f; }
+  const bool axisAligned = m.objB == 0.0f && m.objC == 0.0f;
+  if(axisAligned) {
+    f32 x0 = quarter(m.objX + m.objA * objX), x1 = quarter(m.objX + m.objA * (objX + objW));
+    f32 y0 = quarter(m.objY + m.objD * objY), y1 = quarter(m.objY + m.objD * (objY + objH));
+    f32 s0 = sLo, s1 = sHi, t0 = tLo, t1 = tHi;
+    if(x1 < x0) { f32 t = x0; x0 = x1; x1 = t; t = s0; s0 = s1; s1 = t; }
+    if(y1 < y0) { f32 t = y0; y0 = y1; y1 = t; t = t0; t0 = t1; t1 = t; }
+    if(flags & 0x01) { f32 t = s0; s0 = s1; s1 = t; }  //G_OBJ_FLAG_FLIPS
+    if(flags & 0x10) { f32 t = t0; t0 = t1; t1 = t; }  //G_OBJ_FLAG_FLIPT
+    if(x1 <= x0 || y1 <= y0) return;
+    v[0].x = x0; v[0].y = y0; v[0].s = s0; v[0].t = t0;
+    v[1].x = x1; v[1].y = y0; v[1].s = s1; v[1].t = t0;
+    v[2].x = x0; v[2].y = y1; v[2].s = s0; v[2].t = t1;
+    v[3].x = x1; v[3].y = y1; v[3].s = s1; v[3].t = t1;
+  } else {
+    //rotated sprite: full 2x2 transform of the four object corners; no
+    //shrink modelling (not yet observed on LLE)
+    const f32 ox[4] = { objX, objX + objW, objX, objX + objW };
+    const f32 oy[4] = { objY, objY, objY + objH, objY + objH };
+    f32 su[4] = { sLo, sHi, sLo, sHi };
+    f32 tv[4] = { tLo, tLo, tHi, tHi };
+    if(flags & 0x01) { su[0] = su[2] = sHi; su[1] = su[3] = sLo; }
+    if(flags & 0x10) { tv[0] = tv[1] = tHi; tv[2] = tv[3] = tLo; }
+    for(u32 index = 0; index < 4; index++) {
+      v[index].x = m.objX + m.objA * ox[index] + m.objB * oy[index];
+      v[index].y = m.objY + m.objC * ox[index] + m.objD * oy[index];
+      v[index].s = su[index];
+      v[index].t = tv[index];
+    }
+  }
+  const u32 savedTile = m.texTile, savedLevel = m.texLevel;
+  m.texTile = tile; m.texLevel = 0;
+  lumiverseEmitTriangle(m, false, true, false, &v[0], &v[1], &v[2]);
+  lumiverseEmitTriangle(m, false, true, false, &v[1], &v[3], &v[2]);
+  m.texTile = savedTile; m.texLevel = savedLevel;
+}
+
+//gSPObjRectangle / gSPObjRectangleR: uObjSprite drawn as one TEXRECT; the R
+//form applies the sub-matrix (translation + 1/BaseScale) and its scale as
+//the rectangle's texel step. Derived from LLE (Yoshi's Story HUD, task 706:
+//X 253, Y 189.75, BaseScale 2.201/1.636, 304x16 I4 at (-492,-235) ->
+//TEXRECT (29.25,45.75)-(167,55) dsdx 0x08ce dtdy 0x068b). BILERP offsets the
+//object start by half a texel; the shrink trims the far end as for sprites.
+auto lumiverseGfxS2DEXDrawRect(LumiverseGfxMachine& m, u32 at, bool subMatrix) -> void {
+  const f32 objX = (f32)lumiverseGfxShort(at + 0) / 4.0f;
+  const u32 scaleWRaw = lumiverseGfxHalf(at + 2);
+  const f32 scaleW = (f32)scaleWRaw / 1024.0f;
+  const f32 imageW = (f32)lumiverseGfxHalf(at + 4) / 32.0f;
+  const f32 objY = (f32)lumiverseGfxShort(at + 8) / 4.0f;
+  const u32 scaleHRaw = lumiverseGfxHalf(at + 10);
+  const f32 scaleH = (f32)scaleHRaw / 1024.0f;
+  const f32 imageH = (f32)lumiverseGfxHalf(at + 12) / 32.0f;
+  const u32 stride = lumiverseGfxHalf(at + 16);
+  const u32 adrs = lumiverseGfxHalf(at + 18);
+  const u32 fmt = lumiverseGfxByte(at + 20) & 7;
+  const u32 siz = lumiverseGfxByte(at + 21) & 3;
+  const u32 pal = lumiverseGfxByte(at + 22) & 0xf;
+  const u32 flags = lumiverseGfxByte(at + 23);
+  if(scaleW <= 0.0f || scaleH <= 0.0f || imageW <= 0.0f || imageH <= 0.0f) return;
+
+  u32 otherModeH = m.otherModeH;
+  if(fmt == 2) { if((otherModeH & 0xc000) == 0) otherModeH |= 0x8000; }
+  else otherModeH &= ~0xc000u;
+  if(otherModeH != m.otherModeH) { m.otherModeH = otherModeH; m.otherModeDirty = true; }
+  lumiverseGfxEmitOtherMode(m);
+
+  const u32 tile = m.objTileToggle;
+  m.objTileToggle ^= 2;
+  const bool clamp = !(m.objRenderMode & 0x01);
+  lumiverseGfxEmit2(m.out,
+    0xf5000000 | fmt << 21 | siz << 19 | (stride & 0x1ff) << 9 | (adrs & 0x1ff),
+    tile << 24 | pal << 20 | (clamp ? (2u << 18 | 2u << 8) : 0));
+  lumiverseGfxEmit2(m.out, 0xf2000000, tile << 24 | (((u32)(imageW - 1.0f) << 2) & 0xfff) << 12 | (((u32)(imageH - 1.0f) << 2) & 0xfff));
+  lumiverseGfxEmit2(m.out, 0xe7000000, 0);
+
+  const u32 mode = m.objRenderMode;
+  const f32 shrink = ((mode & 0x10) ? 0.5f : (mode & 0x20) ? 1.0f : 0.0f) + ((mode & 0x08) ? 0.5f : 0.0f);
+  const f32 bilerp = (mode & 0x08) ? 0.5f : 0.0f;
+  //object-space extents (texels / scale): the whole rectangle sits half a
+  //texel early under BILERP and the far end is trimmed by the shrink (LLE
+  //task 706: far edges 167.0 / 55.0 = nearest quarter of the -0.5 / -1.5
+  //texel bounds; -1.0 alone would give 167.25 / 55.25)
+  f32 ox0 = objX - bilerp / scaleW, ox1 = objX + (imageW - shrink - bilerp) / scaleW;
+  f32 oy0 = objY - bilerp / scaleH, oy1 = objY + (imageH - shrink - bilerp) / scaleH;
+  //texel step per pixel (5.10): the sprite scale, times the base scale for R
+  f32 dsdx = scaleW, dtdy = scaleH;
+  f32 x0, x1, y0, y1;
+  if(subMatrix) {
+    if(m.objScaleX <= 0.0f || m.objScaleY <= 0.0f) return;
+    x0 = m.objX + ox0 / m.objScaleX; x1 = m.objX + ox1 / m.objScaleX;
+    y0 = m.objY + oy0 / m.objScaleY; y1 = m.objY + oy1 / m.objScaleY;
+    dsdx *= m.objScaleX; dtdy *= m.objScaleY;
+  } else {
+    x0 = ox0; x1 = ox1; y0 = oy0; y1 = oy1;
+  }
+  auto quarterNear = [](f32 value) -> f32 { return ::floorf(value * 4.0f + 0.5f) / 4.0f; };
+  x0 = quarterNear(x0); x1 = quarterNear(x1); y0 = quarterNear(y0); y1 = quarterNear(y1);
+  if(x1 <= x0 || y1 <= y0) return;
+  if(x0 < 0.0f) x0 = 0.0f;
+  if(y0 < 0.0f) y0 = 0.0f;
+  if(x1 > 1023.0f) x1 = 1023.0f;
+  if(y1 > 1023.0f) y1 = 1023.0f;
+  const u32 xl = (u32)(x1 * 4.0f) & 0xfff, yl = (u32)(y1 * 4.0f) & 0xfff;
+  const u32 xh = (u32)(x0 * 4.0f) & 0xfff, yh = (u32)(y0 * 4.0f) & 0xfff;
+  u32 s0 = 0, t0 = 0;
+  if(flags & 0x01) s0 = ((u32)((imageW - 1.0f) * 32.0f)) & 0xffff;
+  if(flags & 0x10) t0 = ((u32)((imageH - 1.0f) * 32.0f)) & 0xffff;
+  s32 ds = (s32)(dsdx * 1024.0f), dt = (s32)(dtdy * 1024.0f);
+  if(flags & 0x01) ds = -ds;
+  if(flags & 0x10) dt = -dt;
+  lumiverseGfxEmit2(m.out, 0xe4000000 | xl << 12 | yl, tile << 24 | xh << 12 | yh);
+  lumiverseGfxEmit2(m.out, s0 << 16 | t0, ((u32)ds & 0xffff) << 16 | ((u32)dt & 0xffff));
+  (void)scaleWRaw; (void)scaleHRaw;
+}
+
+//gSPBgRect1Cyc: uObjBg at `at` (40 bytes). Supported: unscaled, unflipped,
+//unscrolled images (imageX = imageY = 0, scale 1.0) of any format — the
+//Zeldas' saved-frame backgrounds (pause/transition screens, title) and
+//Yoshi's static screens; scrolling backgrounds fall back (dry-run). LLE
+//draws the image in strips: one LOADTILE of (rows + 1) lines into tile 7
+//then a 1-cycle TEXRECT of `rows` lines from tile 0, rows chosen so a strip
+//fits TMEM (Majora, 320x240 RGBA16: 48 strips of 5). Loads use the RGBA16
+//view of the row (CI8 loads as half-width RGBA16, like LLE).
+auto lumiverseGfxS2DEXBackgroundSupported(u32 at) -> bool {
+  const u32 imageW = lumiverseGfxHalf(at + 2) >> 2, imageH = lumiverseGfxHalf(at + 10) >> 2;
+  const u32 frameW = lumiverseGfxHalf(at + 6) >> 2, frameH = lumiverseGfxHalf(at + 14) >> 2;
+  const u32 imageLoad = lumiverseGfxHalf(at + 20);
+  const u32 imageSiz = lumiverseGfxByte(at + 23) & 3;
+  const u32 imageFlip = lumiverseGfxHalf(at + 26);
+  const u32 scaleW = lumiverseGfxHalf(at + 28), scaleH = lumiverseGfxHalf(at + 30);
+  if(imageFlip != 0) return false;
+  if(scaleW != 0x400 || scaleH != 0x400) return false;
+  if(imageLoad != 0xfff4 && imageLoad != 0x0033) return false;
+  if(imageSiz != 1 && imageSiz != 2) return false;  //8/16-bit validated (Yoshi CI8, Majora RGBA16)
+  if(!imageW || !imageH || !frameW || !frameH) return false;
+  //a horizontal wrap (imageX != 0) needs an 8-texel margin (see draw); an
+  //unscrolled row only has to fit
+  const u32 imageX = lumiverseGfxHalf(at + 0);
+  if(imageX ? frameW + 8 > imageW : frameW > imageW) return false;
+  if(frameH > imageH) return false;
+  return true;
+}
+
+auto lumiverseGfxS2DEXDrawBackground(LumiverseGfxMachine& m, u32 at) -> void {
+  const f32 imageXf = (f32)lumiverseGfxHalf(at + 0) / 32.0f;
+  const u32 imageW = lumiverseGfxHalf(at + 2) >> 2;
+  const f32 frameX = (f32)lumiverseGfxShort(at + 4) / 4.0f;
+  const u32 frameW = lumiverseGfxHalf(at + 6) >> 2;
+  const u32 imageYi = lumiverseGfxHalf(at + 8) >> 5;
+  const u32 imageH = lumiverseGfxHalf(at + 10) >> 2;
+  const f32 frameY = (f32)lumiverseGfxShort(at + 12) / 4.0f;
+  const u32 frameH = lumiverseGfxHalf(at + 14) >> 2;
+  const u32 imagePtr = lumiverseGfxSegmentAddress(m, lumiverseGfxWord(at + 16));
+  const u32 imageFmt = lumiverseGfxByte(at + 22) & 7;
+  const u32 imageSiz = lumiverseGfxByte(at + 23) & 3;
+  const u32 imagePal = lumiverseGfxHalf(at + 24) & 0xf;
+
+  u32 otherModeH = m.otherModeH;
+  if(imageFmt == 2) { if((otherModeH & 0xc000) == 0) otherModeH |= 0x8000; }
+  else otherModeH &= ~0xc000u;
+  if(otherModeH != m.otherModeH) { m.otherModeH = otherModeH; m.otherModeDirty = true; }
+  lumiverseGfxEmitOtherMode(m);
+
+  //bytes per row of the image and its RGBA16 view used for loading; TMEM
+  //holds 4 KiB, half of it for CI images (the TLUT lives in the upper half:
+  //LLE loads Yoshi's 336-wide CI8 rows in strips of 5 = 2048/336 - 1,
+  //Majora's 320-wide RGBA16 in strips of 5 = 4096/640 - 1)
+  const u32 bytesPerTexel = imageSiz == 1 ? 1 : 2;
+  const u32 rowBytes = imageW * bytesPerTexel;
+  const u32 line = (rowBytes + 7) / 8;              //qwords per row
+  if(!line) return;
+  const u32 loadWidth = line * 4;                   //16-bit texels per loaded row
+  u32 rows = (imageFmt == 2 ? 2048 : 4096) / (line * 8);
+  if(rows < 2) return;
+  rows -= 1;                                        //one extra line for bilinear filtering
+  //horizontal scroll: the load starts at the 8-byte-aligned column below
+  //imageX and runs one full row, which in RDRAM continues into the NEXT
+  //row's first columns — exactly how LLE serves the wrap (its strips load
+  //from column 328 of a 336-wide image scrolled to 335.375 and draw with
+  //S = 7.375); the seam samples the neighbouring row, as on hardware
+  const u32 scrollBytes = ((u32)(imageXf * (f32)bytesPerTexel)) & ~7u;
+  const f32 sStart = imageXf - (f32)scrollBytes / (f32)bytesPerTexel;
+  const u32 fmtSizLoad = 0x10;                      //RGBA16
+  const u32 fmtSizDraw = imageFmt << 5 | imageSiz << 3;
+  lumiverseGfxEmit2(m.out, 0xf5000000 | fmtSizLoad << 16 | (line & 0x1ff) << 9, 0x07000000);
+  lumiverseGfxEmit2(m.out, 0xf5000000 | fmtSizDraw << 16 | (line & 0x1ff) << 9, imagePal << 20 | 0x0007c1f0);
+  lumiverseGfxEmit2(m.out, 0xf2000000, 0);
+  const f32 x0 = frameX, x1 = ::floorf(frameX + (f32)frameW);
+  const u32 sWord = ((u32)(sStart * 32.0f)) & 0xffff;
+  //vertical scroll with wrap: strips never cross the image's last row
+  u32 y = 0;
+  while(y < frameH) {
+    const u32 srcRow = (imageYi + y) % imageH;
+    u32 count = frameH - y < rows ? frameH - y : rows;
+    if(srcRow + count > imageH) count = imageH - srcRow;
+    lumiverseGfxEmit2(m.out, 0xfd000000 | fmtSizLoad << 16 | ((loadWidth - 1) & 0xfff), imagePtr + srcRow * rowBytes + scrollBytes);
+    lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+    lumiverseGfxEmit2(m.out, 0xf4000000, 0x07000000 | (((loadWidth - 1) << 2) & 0xfff) << 12 | (((count + 1) << 2) - 1));
+    lumiverseGfxEmit2(m.out, 0xe7000000, 0);
+    const f32 ya = frameY + (f32)y, yb = frameY + (f32)(y + count);
+    const u32 xl = (u32)(x1 * 4.0f) & 0xfff, yl = (u32)(yb * 4.0f) & 0xfff;
+    const u32 xh = (u32)(x0 * 4.0f) & 0xfff, yh = (u32)(ya * 4.0f) & 0xfff;
+    lumiverseGfxEmit2(m.out, 0xe4000000 | xl << 12 | yl, xh << 12 | yh);
+    lumiverseGfxEmit2(m.out, sWord << 16, 0x04000400);
+    y += count;
+  }
+}
+
+auto lumiverseGfxS2DEXLoadMatrix(LumiverseGfxMachine& m, u32 at, bool full) -> void {
+  if(full) {
+    m.objA = (f32)(s32)lumiverseGfxWord(at + 0) / 65536.0f;
+    m.objB = (f32)(s32)lumiverseGfxWord(at + 4) / 65536.0f;
+    m.objC = (f32)(s32)lumiverseGfxWord(at + 8) / 65536.0f;
+    m.objD = (f32)(s32)lumiverseGfxWord(at + 12) / 65536.0f;
+    at += 16;
+  }
+  m.objX = (f32)lumiverseGfxShort(at + 0) / 4.0f;
+  m.objY = (f32)lumiverseGfxShort(at + 2) / 4.0f;
+  m.objScaleX = (f32)lumiverseGfxHalf(at + 4) / 1024.0f;
+  m.objScaleY = (f32)lumiverseGfxHalf(at + 6) / 1024.0f;
+}
+
+//executes one S2DEX-specific command; false = not an S2DEX command (the
+//base dialect's interpreter handles it)
+auto lumiverseGfxExecuteS2DEX(LumiverseGfxMachine& m, u8 opcode, u32 cmd0, u32 cmd1, bool gbi2) -> bool {
+  //inline RDP triangle (G_RDP_TRI*: the CPU computed the coefficients, the
+  //microcode forwards the whole command)
+  if(opcode >= 0xc8 && opcode <= 0xcf) {
+    lumiverseGfxEmitOtherMode(m);
+    const u32 qwords = lumiverseGfxRDPCommandQwords[opcode & 0x3f];
+    lumiverseGfxEmit2(m.out, cmd0, cmd1);
+    for(u32 q = 1; q < qwords; q++) {
+      if(!lumiverseGfxNextCommand(m)) { m.out.failed = true; return true; }
+      lumiverseGfxEmit2(m.out, m.cmd0, m.cmd1);
+    }
+    m.trisEmitted++;
+    return true;
+  }
+  const u32 at = lumiverseGfxSegmentAddress(m, cmd1);
+  if(!gbi2) {
+    switch(opcode) {
+    case 0x01:  //G_BG_1CYC
+      lumiverseGfxS2DEXDrawBackground(m, at);
+      return true;
+    case 0x03:  //G_OBJ_RECTANGLE
+      lumiverseGfxS2DEXDrawRect(m, at, false);
+      return true;
+    case 0xb2:  //G_OBJ_RECTANGLE_R
+      lumiverseGfxS2DEXDrawRect(m, at, true);
+      return true;
+    case 0xc3:  //G_OBJ_LDTX_RECT
+      if(!lumiverseGfxS2DEXLoadTexture(m, at)) { m.out.failed = true; return true; }
+      lumiverseGfxS2DEXDrawRect(m, at + 24, false);
+      return true;
+    case 0xc4:  //G_OBJ_LDTX_RECT_R
+      if(!lumiverseGfxS2DEXLoadTexture(m, at)) { m.out.failed = true; return true; }
+      lumiverseGfxS2DEXDrawRect(m, at + 24, true);
+      return true;
+    case 0x04:  //G_OBJ_SPRITE
+      lumiverseGfxS2DEXDrawSprite(m, at);
+      return true;
+    case 0x05: {  //G_OBJ_MOVEMEM: 0 = uObjMtx, 2 = uObjSubMtx
+      const u32 index = cmd0 & 0xffff;
+      if(index == 0) lumiverseGfxS2DEXLoadMatrix(m, at, true);
+      else if(index == 2) lumiverseGfxS2DEXLoadMatrix(m, at, false);
+      return true;
+    }
+    case 0xb1:  //G_OBJ_RENDERMODE
+      m.objRenderMode = cmd1 & 0xffff;
+      return true;
+    case 0xc1:  //G_OBJ_LOADTXTR
+      if(!lumiverseGfxS2DEXLoadTexture(m, at)) m.out.failed = true;
+      return true;
+    case 0xc2:  //G_OBJ_LDTX_SPRITE
+      if(!lumiverseGfxS2DEXLoadTexture(m, at)) { m.out.failed = true; return true; }
+      lumiverseGfxS2DEXDrawSprite(m, at + 24);
+      return true;
+    default:
+      return false;
+    }
+  }
+  switch(opcode) {
+  case 0x01:  //G_OBJ_RECTANGLE
+    lumiverseGfxS2DEXDrawRect(m, at, false);
+    return true;
+  case 0xda:  //G_OBJ_RECTANGLE_R
+    lumiverseGfxS2DEXDrawRect(m, at, true);
+    return true;
+  case 0x07:  //G_OBJ_LDTX_RECT
+    if(!lumiverseGfxS2DEXLoadTexture(m, at)) { m.out.failed = true; return true; }
+    lumiverseGfxS2DEXDrawRect(m, at + 24, false);
+    return true;
+  case 0x08:  //G_OBJ_LDTX_RECT_R
+    if(!lumiverseGfxS2DEXLoadTexture(m, at)) { m.out.failed = true; return true; }
+    lumiverseGfxS2DEXDrawRect(m, at + 24, true);
+    return true;
+  case 0x09:  //G_BG_1CYC
+    lumiverseGfxS2DEXDrawBackground(m, at);
+    return true;
+  case 0x02:  //G_OBJ_SPRITE
+    lumiverseGfxS2DEXDrawSprite(m, at);
+    return true;
+  case 0x05:  //G_OBJ_LOADTXTR
+    if(!lumiverseGfxS2DEXLoadTexture(m, at)) m.out.failed = true;
+    return true;
+  case 0x06:  //G_OBJ_LDTX_SPRITE
+    if(!lumiverseGfxS2DEXLoadTexture(m, at)) { m.out.failed = true; return true; }
+    lumiverseGfxS2DEXDrawSprite(m, at + 24);
+    return true;
+  case 0x0b:  //G_OBJ_RENDERMODE
+    m.objRenderMode = cmd1 & 0xffff;
+    return true;
+  case 0xdc: {  //G_MOVEMEM types 0/2 = uObjMtx / uObjSubMtx
+    const u32 type = cmd0 & 0xfe;
+    if(type == 0) { lumiverseGfxS2DEXLoadMatrix(m, at, true); return true; }
+    if(type == 2) { lumiverseGfxS2DEXLoadMatrix(m, at, false); return true; }
+    return false;
+  }
+  default:
+    return false;
+  }
+}
+
+//G_LOAD_UCODE (GBI1 0xaf / GBI2 0xdd): switch the interpreter's dialect;
+//the RSP keeps the display list position, segment table and RDP state,
+//which is exactly what our machine keeps too. Unknown targets fail the task
+//(the dry-run refuses them first).
+auto lumiverseGfxLoadUcode(LumiverseGfxMachine& m, u32 cmd1) -> void {
+  const s32 dialect = lumiverseGfxLoadUcodeDialect(cmd1);
+  if(dialect < 0) { m.out.failed = true; m.running = false; return; }
+  //the RSP reloads the new microcode's DATA segment from the game's pristine
+  //RDRAM copy, so everything that lives there — segment table, other-mode
+  //shadow, geometry mode, texture scale, lights, fog, viewport, matrices —
+  //comes back at its reset value (games re-send what they need: Yoshi's
+  //Story re-issues its 16 segment movewords and other-modes after every
+  //switch); only the display-list position/stack (OSTask yield area) and
+  //the RDP itself persist. Reset like a fresh task but keep pc/stack/output.
+  const u32 pc = m.pc, stackDepth = m.stackDepth;
+  u32 stack[32];
+  for(u32 index = 0; index < stackDepth; index++) stack[index] = m.stack[index];
+  const u32 fifoCount = m.out.count;
+  const bool failed = m.out.failed;
+  const u32 gbi0Vertex = m.gbi0Vertex;
+  const bool bakedRDP = m.bakedRDP;
+  lumiverseGfxReset(m, pc, (u32)dialect, gbi0Vertex, bakedRDP);
+  m.out.count = fifoCount;
+  m.out.failed = failed;
+  m.stackDepth = stackDepth;
+  for(u32 index = 0; index < stackDepth; index++) m.stack[index] = stack[index];
+  m.otherModeDirty = true;
+}
+
 //----------------------------------------------------------------------------
 //display-list interpreter (F3DEX / GBI1 command set, from n64js gbi1.js)
 //----------------------------------------------------------------------------
@@ -1095,10 +1635,19 @@ auto lumiverseGfxExecuteTask(LumiverseGfxMachine& m, u32 pc,
     const u32 cmd1 = m.cmd1;
     const u8 opcode = cmd0 >> 24;
 
+    if(m.dialect == LumiverseDialectS2DEX && lumiverseGfxExecuteS2DEX(m, opcode, cmd0, cmd1, false)) {
+      if(m.out.failed) break;
+      continue;
+    }
+
     switch(opcode) {
 
     case 0x00: break;  //G_SPNOOP
     case 0xc0: break;  //G_NOOP
+
+    case 0xaf:  //G_LOAD_UCODE (Yoshi's Story: S2DEX <-> F3DEX twice per task)
+      lumiverseGfxLoadUcode(m, cmd1);
+      break;
 
     case 0x01: {  //G_MTX
       const u32 flags = (cmd0 >> 16) & 0xff;
@@ -1545,10 +2094,19 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
     const u32 cmd1 = m.cmd1;
     const u8 opcode = cmd0 >> 24;
 
+    if(m.dialect == LumiverseDialectS2DEX2 && lumiverseGfxExecuteS2DEX(m, opcode, cmd0, cmd1, true)) {
+      if(m.out.failed) break;
+      continue;
+    }
+
     switch(opcode) {
 
     case 0x00: break;  //G_NOOP
     case 0xe0: break;  //G_SPNOOP
+
+    case 0xdd:  //G_LOAD_UCODE (Zeldas / Kirby: F3DZEX <-> S2DEX2 for 2D screens)
+      lumiverseGfxLoadUcode(m, cmd1);
+      break;
 
     case 0x01: {  //G_VTX: n in bits 12-19, vend*2 in low byte, v0 = vend - n
       const u32 n = (cmd0 >> 12) & 0xff;
@@ -1957,6 +2515,13 @@ auto lumiverseGfxLogRejectOnce(u32 reason, u8 opcode, u32 cmd0, u32 cmd1, const 
   }
 }
 
+//S2DEX dry-run helpers (defined after the GBI1 walker)
+auto lumiverseGfxS2DEXDumpFile() -> FILE*;
+auto lumiverseGfxS2DEXDumpTaskWanted() -> bool;
+auto lumiverseGfxS2DEXDumpCommand(FILE* fp, u32 pc, u32 cmd0, u32 cmd1, u32 structAt, u32 structBytes, const char* tag) -> void;
+auto lumiverseGfxS2DEXStructBytes(u8 opcode, u32 cmd0, bool gbi2) -> u32;
+auto lumiverseGfxS2DEXAdmit(u8 opcode, u32 cmd0, u32 cmd1, bool gbi2, u32 structAt, const char*& why) -> bool;
+
 //dry-run walker shared by GBI1 and GBI0 (Fast3D): flow control + segment
 //table only; any unsupported opcode fails the whole task over to LLE
 auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = LumiverseDialectGBI1, bool bakedRDP = false) -> bool {
@@ -1984,6 +2549,13 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
   }();
   if(dlDump) fprintf(dlDump, "task dl=%06x dialect=%u\n", pc, dialect);
 
+  //S2DEX (round 10): a task may start in S2DEX (Yoshi's Story) or switch
+  //into/out of it with G_LOAD_UCODE; while in S2DEX the object commands are
+  //admitted per lumiverseGfxS2DEXAdmit and inline RDP triangles are skipped
+  bool s2dex = dialect == LumiverseDialectS2DEX;
+  FILE* s2dexDump = s2dex && lumiverseGfxS2DEXDumpTaskWanted() ? lumiverseGfxS2DEXDumpFile() : nullptr;
+  if(s2dexDump) fprintf(s2dexDump, "task %llu dl=%06x dialect=s2dex\n", (unsigned long long)lumiverseRdpTaskTag, pc);
+
   u32 steps = 0;
   while(pc && steps++ < 1000000) {
     const u32 cmd0 = lumiverseGfxWord(pc + 0);
@@ -1995,6 +2567,49 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
     census.counts[opcode]++;
     if(!census.seen[opcode]) { census.seen[opcode] = true; newOpcode = true; }
 
+    if(opcode == 0xaf) {  //G_LOAD_UCODE
+      const s32 target = lumiverseGfxLoadUcodeDialect(cmd1);
+      if(s2dexDump) lumiverseGfxS2DEXDumpCommand(s2dexDump, pc - 8, cmd0, cmd1, 0, 0, target == LumiverseDialectS2DEX ? " ->s2dex" : target == LumiverseDialectGBI1 ? " ->f3dex" : " ->?");
+      if(target == LumiverseDialectS2DEX) s2dex = true;
+      else if(target == LumiverseDialectGBI1 && dialect != LumiverseDialectGBI0) s2dex = false;
+      else { lumiverseGfxLogRejectOnce(6, opcode, cmd0, cmd1, "load-ucode target"); supported = false; break; }
+      continue;
+    }
+    if(s2dex) {
+      const u32 structBytes = lumiverseGfxS2DEXStructBytes(opcode, cmd0, false);
+      const u32 structAt = structBytes ? segmentAddress(cmd1) : 0;
+      const char* why = nullptr;
+      const bool admitted = lumiverseGfxS2DEXAdmit(opcode, cmd0, cmd1, false, structAt, why);
+      if(s2dexDump && steps < 20000) lumiverseGfxS2DEXDumpCommand(s2dexDump, pc - 8, cmd0, cmd1, structAt, structBytes, admitted ? "" : " !");
+      if(opcode >= 0xc8 && opcode <= 0xcf) {
+        const u32 qwords = lumiverseGfxRDPCommandQwords[opcode & 0x3f];
+        if(s2dexDump && steps < 20000) for(u32 q = 1; q < qwords; q++) fprintf(s2dexDump, "  %06x:   %08x %08x\n", pc + (q - 1) * 8, lumiverseGfxWord(pc + (q - 1) * 8), lumiverseGfxWord(pc + (q - 1) * 8 + 4));
+        pc += (qwords - 1) * 8;
+        continue;
+      }
+      if(!admitted) {
+        static bool logged[256];
+        if(!logged[opcode]) {
+          logged[opcode] = true;
+          fprintf(stderr, "[rsp-hle-gfx] unsupported s2dex op %02x (%s) cmd0=%08x cmd1=%08x at pc=%06x -> LLE fallback\n", opcode, why ? why : "", cmd0, cmd1, pc - 8);
+        }
+        lumiverseGfxRejectCounts[7]++;
+        supported = false;
+        break;
+      }
+      switch(opcode) {  //S2DEX-specific opcodes that overlap GBI1 numbers are consumed here
+      case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+      case 0xb0: case 0xb1: case 0xb2: case 0xc1: case 0xc2: case 0xc3: case 0xc4:
+        continue;
+      default: break;
+      }
+      if(!lumiverseGfxOpcodeSupported(opcode)) {
+        static bool logged[256];
+        if(!logged[opcode]) { logged[opcode] = true; fprintf(stderr, "[rsp-hle-gfx] unsupported s2dex-base op %02x cmd0=%08x cmd1=%08x -> LLE fallback\n", opcode, cmd0, cmd1); }
+        supported = false;
+        break;
+      }
+    } else
     if(!lumiverseGfxOpcodeSupported(opcode)) {
       static bool logged[256];
       if(!logged[opcode]) {
@@ -2082,6 +2697,7 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
     }
   }
 
+  if(s2dexDump) fflush(s2dexDump);
   if(steps >= 1000000) {
     fprintf(stderr, "[rsp-hle-gfx] dry-run exceeded step limit -> LLE fallback\n");
     return false;
@@ -2100,6 +2716,140 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
   }
 
   return supported;
+}
+
+//----------------------------------------------------------------------------
+//S2DEX dry-run / census (round 10). Walks the display list with the base
+//dialect's flow control (GBI1 for S2DEX 1.xx, GBI2 for S2DEX2), skips the
+//inline RDP triangle commands (0xc8..0xcf carry a whole RDP command: the
+//CPU computed the coefficients, the microcode only forwards them) and dumps
+//every command plus the RDRAM structures the object commands point at into
+//the DL dump file, for empirical derivation against LLE's RDP stream.
+//----------------------------------------------------------------------------
+
+//bytes of the RDRAM structure an S2DEX object command points at (n64js
+//gbi_s2dex.js field layouts; MIT): 0 = no structure
+auto lumiverseGfxS2DEXStructBytes(u8 opcode, u32 cmd0, bool gbi2) -> u32 {
+  if(!gbi2) {
+    switch(opcode) {
+    case 0x01: case 0x02: return 40;          //BG_1CYC / BG_COPY (uObjBg)
+    case 0x03: case 0x04: case 0xb2: return 24; //OBJ_RECTANGLE / OBJ_SPRITE / OBJ_RECTANGLE_R (uObjSprite)
+    case 0x05: return (cmd0 & 0xffff) == 0 ? 24 : 8;  //OBJ_MOVEMEM: matrix / submatrix
+    case 0xc1: return 24;                     //OBJ_LOADTXTR (uObjTxtr)
+    case 0xc2: case 0xc3: case 0xc4: return 48; //OBJ_LDTX_* (uObjTxtr + uObjSprite)
+    default: return 0;
+    }
+  }
+  switch(opcode) {
+  case 0x01: case 0x02: case 0xda: return 24;
+  case 0x05: return 24;
+  case 0x06: case 0x07: case 0x08: return 48;
+  case 0x09: case 0x0a: return 40;
+  case 0xdc: return (cmd0 & 0xfe) == 0 ? 24 : ((cmd0 & 0xfe) == 2 ? 8 : 0);
+  default: return 0;
+  }
+}
+
+auto lumiverseGfxOpcodeSupportedS2DEX(u8 opcode, bool gbi2) -> bool {
+  //RDP passthrough + syncs shared by both variants
+  switch(opcode) {
+  case 0xe4: case 0xe5: case 0xe6: case 0xe7: case 0xe8:
+  case 0xe9: case 0xea: case 0xeb: case 0xec: case 0xed:
+  case 0xee: case 0xef: case 0xf0: case 0xf2: case 0xf3:
+  case 0xf4: case 0xf5: case 0xf6: case 0xf7: case 0xf8:
+  case 0xf9: case 0xfa: case 0xfb: case 0xfc: case 0xfd:
+  case 0xfe: case 0xff:
+  case 0xc8: case 0xc9: case 0xca: case 0xcb:
+  case 0xcc: case 0xcd: case 0xce: case 0xcf:
+    return true;
+  default: break;
+  }
+  if(!gbi2) {
+    switch(opcode) {
+    case 0x00: case 0x06: case 0xb8: case 0xbc: case 0xb4: case 0xb3: case 0xc0:
+    case 0xb6: case 0xb7: case 0xb9: case 0xba: case 0xbb:  //GBI1 immediates
+    case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+    case 0xb0: case 0xb1: case 0xb2:
+    case 0xc1: case 0xc2: case 0xc3: case 0xc4:
+      return true;
+    default: return false;
+    }
+  }
+  switch(opcode) {
+  case 0x00: case 0xde: case 0xdf: case 0xdb: case 0xdc: case 0xe0: case 0xe1: case 0xf1:
+  case 0xe2: case 0xe3:
+  case 0x01: case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
+  case 0x09: case 0x0a: case 0x0b: case 0xd5: case 0xda:
+    return true;
+  default: return false;
+  }
+}
+
+//S2DEX command dump (LUMIVERSE_ARES_N64_RSP_HLE_S2DEX_DUMP=<path>, first
+//..._GFX_DL_DUMP_TASKS tasks after ..._GFX_DL_DUMP_SKIP): every walked
+//command plus the RDRAM structure it points at, tagged with the task ordinal
+//the RDP stream dump carries — empirical derivation of S2DEX semantics
+auto lumiverseGfxS2DEXDumpFile() -> FILE* {
+  static FILE* dlDump = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_S2DEX_DUMP");
+    return path && path[0] ? fopen(path, "w") : nullptr;
+  }();
+  return dlDump;
+}
+auto lumiverseGfxS2DEXDumpTaskWanted() -> bool {
+  static const u32 limit = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP_TASKS"); return v ? (u32)::atoi(v) : 400u; }();
+  static const u32 skip = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP_SKIP"); return v ? (u32)::atoi(v) : 0u; }();
+  static u32 seen = 0;
+  if(!lumiverseGfxS2DEXDumpFile()) return false;
+  seen++;
+  return seen > skip && seen <= skip + limit;
+}
+auto lumiverseGfxS2DEXDumpCommand(FILE* fp, u32 pc, u32 cmd0, u32 cmd1, u32 structAt, u32 structBytes, const char* tag) -> void {
+  fprintf(fp, "  %06x: %08x %08x%s", pc, cmd0, cmd1, tag);
+  if(structBytes) {
+    fprintf(fp, "  @%06x |", structAt);
+    for(u32 b = 0; b < structBytes; b += 2) fprintf(fp, " %04x", lumiverseGfxHalf(structAt + b));
+  }
+  fprintf(fp, "\n");
+}
+
+//dry-run admission of the S2DEX object commands actually implemented:
+//sprites (with/without texture load), the matrix movemems, render mode,
+//inline RDP triangles; texture loads of type block/TLUT only. Backgrounds
+//(BG_1CYC/BG_COPY), rectangles and select-DL are rejected until validated.
+auto lumiverseGfxS2DEXAdmit(u8 opcode, u32 cmd0, u32 cmd1, bool gbi2, u32 structAt, const char*& why) -> bool {
+  why = nullptr;
+  (void)cmd1;
+  if(opcode >= 0xc8 && opcode <= 0xcf) return true;
+  auto textureOk = [&](u32 at) -> bool {
+    const u32 command = lumiverseGfxWord(at) & 0xff;
+    if(command == 0x33 || command == 0x30 || command == 0x34) return true;
+    why = "s2dex texture type";
+    return false;
+  };
+  if(!gbi2) {
+    switch(opcode) {
+    case 0x04: case 0xb1: return true;
+    case 0x05: { const u32 index = cmd0 & 0xffff; if(index == 0 || index == 2) return true; why = "s2dex movemem index"; return false; }
+    case 0xc1: case 0xc2: case 0xc3: case 0xc4: return textureOk(structAt);
+    case 0x03: case 0xb2: return true;
+    case 0x01: if(lumiverseGfxS2DEXBackgroundSupported(structAt)) return true; why = "s2dex BG_1CYC (scrolled/scaled/flipped)"; return false;
+    case 0x02: why = "s2dex BG_COPY"; return false;
+    case 0xb0: why = "s2dex SELECT_DL"; return false;
+    default: return true;  //base GBI1 command
+    }
+  }
+  switch(opcode) {
+  case 0x02: case 0x0b: return true;
+  case 0x05: case 0x06: case 0x07: case 0x08: return textureOk(structAt);
+  case 0xdc: return true;  //types 0/2 are the object matrices; others: base GBI2 rules
+  case 0x01: case 0xda: return true;
+  case 0x04: why = "s2dex2 SELECT_DL"; return false;
+  case 0x09: if(lumiverseGfxS2DEXBackgroundSupported(structAt)) return true; why = "s2dex2 BG_1CYC (scrolled/scaled/flipped)"; return false;
+  case 0x0a: why = "s2dex2 BG_COPY"; return false;
+  case 0xd5: why = "s2dex2 DL_COUNT"; return false;
+  default: return true;  //base GBI2 command
+  }
 }
 
 auto lumiverseGfxOpcodeSupportedGBI2(u8 opcode) -> bool {
@@ -2137,6 +2887,9 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
   auto segmentAddress = [&](u32 address) -> u32 {
     return (segments[(address >> 24) & 0xf] + (address & 0x00ffffff)) & 0x00ffffff;
   };
+  bool s2dex = false;
+  FILE* s2dexDump = lumiverseGfxS2DEXDumpTaskWanted() ? lumiverseGfxS2DEXDumpFile() : nullptr;
+  if(s2dexDump) fprintf(s2dexDump, "task %llu dl=%06x dialect=gbi2\n", (unsigned long long)lumiverseRdpTaskTag, rootPC);
 
   u32 steps = 0;
   u32 pc = rootPC;
@@ -2148,6 +2901,47 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
 
     census.counts[opcode]++;
     if(!census.seen[opcode]) { census.seen[opcode] = true; newOpcode = true; }
+
+    if(opcode == 0xdd) {  //G_LOAD_UCODE (round 10: F3DZEX <-> S2DEX2)
+      const s32 target = lumiverseGfxLoadUcodeDialect(cmd1);
+      if(s2dexDump) lumiverseGfxS2DEXDumpCommand(s2dexDump, pc - 8, cmd0, cmd1, 0, 0, target == LumiverseDialectS2DEX2 ? " ->s2dex2" : target == LumiverseDialectGBI2 ? " ->gbi2" : " ->?");
+      if(target == LumiverseDialectS2DEX2) s2dex = true;
+      else if(target == LumiverseDialectGBI2) s2dex = false;
+      else { lumiverseGfxLogRejectOnce(6, opcode, cmd0, cmd1, "load-ucode target"); supported = false; break; }
+      continue;
+    }
+    if(s2dex) {
+      const u32 structBytes = lumiverseGfxS2DEXStructBytes(opcode, cmd0, true);
+      const u32 structAt = structBytes ? segmentAddress(cmd1) : 0;
+      const char* why = nullptr;
+      const bool admitted = lumiverseGfxS2DEXAdmit(opcode, cmd0, cmd1, true, structAt, why);
+      if(s2dexDump && steps < 20000) lumiverseGfxS2DEXDumpCommand(s2dexDump, pc - 8, cmd0, cmd1, structAt, structBytes, admitted ? "" : " !");
+      if(opcode >= 0xc8 && opcode <= 0xcf) {
+        const u32 qwords = lumiverseGfxRDPCommandQwords[opcode & 0x3f];
+        if(s2dexDump && steps < 20000) for(u32 q = 1; q < qwords; q++) fprintf(s2dexDump, "  %06x:   %08x %08x\n", pc + (q - 1) * 8, lumiverseGfxWord(pc + (q - 1) * 8), lumiverseGfxWord(pc + (q - 1) * 8 + 4));
+        pc += (qwords - 1) * 8;
+        continue;
+      }
+      if(!admitted) {
+        static bool logged[256];
+        if(!logged[opcode]) {
+          logged[opcode] = true;
+          fprintf(stderr, "[rsp-hle-gfx] unsupported s2dex2 op %02x (%s) cmd0=%08x cmd1=%08x at pc=%06x -> LLE fallback\n", opcode, why ? why : "", cmd0, cmd1, pc - 8);
+        }
+        lumiverseGfxRejectCounts[7]++;
+        supported = false;
+        break;
+      }
+      switch(opcode) {  //S2DEX2-specific opcodes that overlap GBI2 numbers are consumed here
+      case 0x01: case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
+      case 0x09: case 0x0a: case 0x0b: case 0xd5: case 0xda:
+        continue;
+      case 0xdc:
+        if((cmd0 & 0xfe) == 0 || (cmd0 & 0xfe) == 2) continue;
+        break;
+      default: break;
+      }
+    }
 
     if(!lumiverseGfxOpcodeSupportedGBI2(opcode)) {
       static bool logged[256];
@@ -2212,6 +3006,7 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
     }
   }
 
+  if(s2dexDump) fflush(s2dexDump);
   if(steps >= 1000000) {
     fprintf(stderr, "[rsp-hle-gfx] gbi2 dry-run exceeded step limit -> LLE fallback\n");
     return false;
@@ -2274,14 +3069,20 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   //report), and an LLE task after HLE tasks leaves the fifo microcode
   //spinning forever (frozen picture). Opt back in with
   //LUMIVERSE_ARES_N64_BT_GFX_HLE=1 for further work.
+  //Round 10: RE-WHITELISTED. With the round-9 fifo/FREEZE writeback fix the
+  //round-8 symptoms do not reproduce: 40,000 steps (title, file select,
+  //the whole opening cutscene through Gruntilda's sisters, Bottles' ghost
+  //and Banjo's house) with 12,097 HLE tasks, 0 fallbacks — no op 0x08/0x20
+  //was ever issued — no hang, and a 20,000-step HLE-vs-LLE checkpoint
+  //series byte-identical at 2000/9000/11000/17000 and phase-only elsewhere.
+  //Gameplay past the cutscene was not reached by the harness script; if the
+  //Rare ops appear there the dry-run falls those tasks back per task, and
+  //LUMIVERSE_ARES_N64_BT_GFX_HLE=0 opts the game out entirely.
   case LumiverseUcodeF3DEX2NoN208: {
-    static const bool optIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_BT_GFX_HLE"); return v && v[0] == '1'; }();
-    //Tony Hawk's Pro Skater 2 (U) ships the same microcode image but never
-    //issues Rare's 0x08/0x20 (round-9 gate: 0 fallbacks over 4000 steps,
-    //menus + skater model checkpoints identical to LLE), so it is told
-    //apart by the cartridge header's game code (NTQ = THPS2) and stays on
-    //by default; LUMIVERSE_ARES_N64_THPS2_GFX_HLE=0 opts out
-    if(!optIn && !(lumiverseGfxCartridgeCode() == "NTQ" && lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_THPS2_GFX_HLE"))) return false;
+    //Tony Hawk's Pro Skater 2 (U) ships the same microcode image (NTQ);
+    //LUMIVERSE_ARES_N64_THPS2_GFX_HLE=0 opts it out separately
+    const bool thps2 = lumiverseGfxCartridgeCode() == "NTQ";
+    if(thps2 ? !lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_THPS2_GFX_HLE") : !lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_BT_GFX_HLE")) return false;
     dialect = LumiverseDialectGBI2; break;
   }
   case LumiverseUcodeF3DEX2204H:    dialect = LumiverseDialectGBI2; break;
@@ -2322,6 +3123,11 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   case LumiverseUcodeF3DEX2NoN208H: dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DEX2208K:    dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DEX2208:     dialect = LumiverseDialectGBI2; break;
+  //Yoshi's Story (U) S2DEX 1.06 — round 10 (opt-out LUMIVERSE_ARES_N64_YOSHI_GFX_HLE=0)
+  case LumiverseUcodeS2DEX106: {
+    if(!lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_YOSHI_GFX_HLE")) return false;
+    dialect = LumiverseDialectS2DEX; break;
+  }
   case LumiverseUcodeFast3DSM64:    dialect = LumiverseDialectGBI0; break;
   case LumiverseUcodeFast3DPW64:    dialect = LumiverseDialectGBI0; break;
   case LumiverseUcodeFast3DCUSA:    dialect = LumiverseDialectGBI0; break;

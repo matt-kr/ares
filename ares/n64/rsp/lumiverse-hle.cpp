@@ -224,6 +224,7 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
   static u32 signatureCount = 0;
   static u64 totalDispatches = 0;
   totalDispatches++;
+  if(taskType == 1) lumiverseRdpTaskTag++;
 
   LumiverseTaskSignature* signature = nullptr;
   for(u32 index = 0; index < signatureCount; index++) {

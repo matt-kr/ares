@@ -30,6 +30,7 @@ namespace {
 //Lumiverse diagnostic hooks defined in rdp/io.cpp (LUMIVERSE_ARES_N64_IO_POLL_LOG)
 auto lumiverseIOPollLog() -> bool;
 auto lumiverseIOPollNote(u32 slot, u32 value) -> void;
+extern u64 lumiverseRdpTaskTag;  //rdp/io.cpp: graphics-task ordinal for dump alignment
 #include "lumiverse-async-audio.cpp"
 #include "lumiverse-hle.cpp"
 #include "lumiverse-hle-gfx.cpp"

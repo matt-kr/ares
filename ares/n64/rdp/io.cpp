@@ -22,6 +22,10 @@ auto lumiverseDpcLogLimit() -> u32 {
   return value;
 }
 
+//Lumiverse diagnostic: graphics-task ordinal (bumped by the RSP dispatch
+//hook) so RDP stream dumps and display-list dumps can be aligned per task
+u64 lumiverseRdpTaskTag = 0;
+
 auto lumiverseIOPollLog() -> bool {
   static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_IO_POLL_LOG"); return v && v[0] == '1'; }();
   return value;
@@ -275,8 +279,8 @@ auto RDP::flushCommands() -> void {
   }();
   if(lumiverseStreamDump && command.end > command.current) {
     auto& memory = !command.source ? (Memory::Writable&)rdram.ram : (Memory::Writable&)rsp.dmem;
-    fprintf(lumiverseStreamDump, "kick src=%s cur=%06x end=%06x\n",
-      command.source ? "xbus" : "rdram", (u32)command.current, (u32)command.end);
+    fprintf(lumiverseStreamDump, "kick task=%llu src=%s cur=%06x end=%06x\n",
+      (unsigned long long)lumiverseRdpTaskTag, command.source ? "xbus" : "rdram", (u32)command.current, (u32)command.end);
     static const u32 dumpBytes = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RDP_STREAM_DUMP_BYTES"); return v ? (u32)::strtoul(v, nullptr, 0) : 0x4000u; }();
     for(u32 address = command.current; address + 8 <= command.end && address < command.current + dumpBytes; address += 8) {
       fprintf(lumiverseStreamDump, "  %08x %08x\n",
