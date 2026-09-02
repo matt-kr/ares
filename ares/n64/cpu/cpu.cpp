@@ -204,10 +204,29 @@ auto CPU::instruction() -> bool {
     //8, LumiverseTlbMemo). Equivalent to fetch(devirtualize<Read, Word>(pc))
     //for these address classes.
     if(fast.batch && Thread::clock >= jitClockTarget) beginBatch();
-    step(1 * 2);
     u32 paddr = fastFetchPaddr;
     if(context.littleEndian()) paddr ^= 4;
     opcodeWord = icache.fetch(pcExec, paddr, cpu);
+    //idle-loop skip (CPU_FAST_IDLE): `j self` with a nop delay slot, seen
+    //at the loop head (not in the delay slot). Step the whole machine one
+    //quantum (bounded by the Compare timer and the next queued event) and
+    //return to the scheduler; a pending interrupt is taken at the next
+    //instruction() exactly as it would be after another loop iteration.
+    if(fast.idle && (opcodeWord >> 26) == 2 && !pipeline.inDelaySlot()
+    && (((pcExec + 4) & ~0x0fff'ffffull) | (u64)((opcodeWord & 0x03ff'ffff) << 2)) == pcExec
+    && icache.fetch(pcExec + 4, paddr + 4, cpu) == 0) {
+      s64 wait = fast.idle;
+      const s64 timerDelta = (s64)(u64)n33(scc.compare - scc.count) * 2;
+      const s64 queueDelta = queue.timeToNextEvent();
+      if(timerDelta > 0 && timerDelta < wait) wait = timerDelta;
+      if(queueDelta > 0 && queueDelta < wait) wait = queueDelta;
+      wait &= ~1;
+      if(wait >= 4) {
+        step((u32)wait);
+        return true;
+      }
+    }
+    step(1 * 2);
   } else {
   auto access = devirtualize<Read, Word>(ipu.pc);
   if(!access) return true;
@@ -334,6 +353,17 @@ auto CPU::lumiverseLoadFastConfig() -> void {
     //the last TLB translation per direction (see LumiverseTlbMemo)
     const char* te = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_TLB");
     f.tlb = !te || *te != '0';
+    //LUMIVERSE_ARES_N64_CPU_FAST_IDLE (default 1024, 0 = off): clock quantum
+    //(2 per CPU cycle) stepped at once while the CPU sits in a `j self; nop`
+    //idle loop — round 10, from the CPU_DIAG histogram of Star Wars: Rogue
+    //Squadron (60% of all executed instructions were that loop at
+    //0x80001804). Only an interrupt leaves such a loop, so stepping the
+    //machine in quanta instead of interpreting two instructions per two
+    //cycles changes nothing but the interrupt latency (<= the quantum,
+    //1024 clocks = 5.5 us, against a hardware latency of a few cycles).
+    const char* id = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_IDLE");
+    const s64 idle = id ? ::atoll(id) : 1024;
+    f.idle = idle > 0 ? (idle & ~1) : 0;
     const char* d = ::getenv("LUMIVERSE_ARES_N64_CPU_DIAG");
     f.diag = d ? ::atoi(d) : 0;
   }

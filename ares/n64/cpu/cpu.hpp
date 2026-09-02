@@ -365,6 +365,7 @@ struct CPU : Thread {
     bool memory = false;  //CPU_FAST_MEM: inline KSEG0-RDRAM aligned loads/stores
     bool memoryLive = false;  //memory && no GDB breakpoints/watchpoints (refreshed per synchronize)
     bool tlb = false;     //CPU_FAST_TLB: one-page translation memo for TLB-mapped RDRAM (fetch/load/store)
+    s64  idle = 0;        //CPU_FAST_IDLE: clock quantum stepped through a `j self; nop` idle loop (0 = off)
     int  diag = 0;        //CPU_DIAG: 1 = batch telemetry, 2 = + PC histogram
   } lumiverseFast;
 
