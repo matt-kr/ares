@@ -173,6 +173,7 @@ auto CPU::setControlRegister(n5 index, n64 data) -> void {
     scc.count = data.bit(0,31) << 1;
     break;
   case 10:  //entryhi
+    lumiverseTlbMemoInvalidate();  //ASID may change
     scc.tlb.addressSpaceID            = data.bit( 0, 7);
     scc.tlb.virtualAddress.bit(13,39) = data.bit(13,39);
     scc.tlb.region                    = data.bit(62,63);
@@ -352,6 +353,7 @@ auto CPU::TLBWI() -> void {
   }
   if(scc.index.tlbEntry >= TLB::Entries) return;
   devirtualizeCache = {};
+  lumiverseTlbMemoInvalidate();
   tlb.entry[scc.index.tlbEntry] = scc.tlb;
   tlb.entry[scc.index.tlbEntry].synchronize();
   debugger.tlbWrite(scc.index.tlbEntry);
@@ -364,6 +366,7 @@ auto CPU::TLBWR() -> void {
   u8 index = getControlRandom();
   if(index >= TLB::Entries) return;
   devirtualizeCache = {};
+  lumiverseTlbMemoInvalidate();
   tlb.entry[index] = scc.tlb;
   tlb.entry[index].synchronize();
   debugger.tlbWrite(index);

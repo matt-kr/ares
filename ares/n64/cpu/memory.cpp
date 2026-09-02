@@ -107,8 +107,8 @@ auto CPU::devirtualize(u64 vaddr, bool raiseAlignedError, bool raiseExceptions) 
     }
     return PhysAccess{false};
   case Context::Segment::Mapped:
-    if constexpr(Dir == Read)  if(auto access = tlb.load (vaddr, !raiseExceptions)) return access;
-    if constexpr(Dir == Write) if(auto access = tlb.store(vaddr, !raiseExceptions)) return access;
+    if constexpr(Dir == Read)  if(auto access = tlb.load (vaddr, !raiseExceptions)) { lumiverseTlbMemoFill<false>(access); return access; }
+    if constexpr(Dir == Write) if(auto access = tlb.store(vaddr, !raiseExceptions)) { lumiverseTlbMemoFill<true>(access); return access; }
     return PhysAccess{false};
   case Context::Segment::Cached:
     return PhysAccess{true, true,  (u32)(vaddr & 0x1fff'ffff), vaddr};
@@ -120,6 +120,16 @@ auto CPU::devirtualize(u64 vaddr, bool raiseAlignedError, bool raiseExceptions) 
     return PhysAccess{true, false,  (u32)(vaddr & 0xffff'ffff), vaddr};
   }
   unreachable;
+}
+
+//Lumiverse addition (round 8): remember a Mapped-segment translation that
+//resolved to cached RDRAM (see LumiverseTlbMemo in cpu.hpp)
+template<bool Write>
+auto CPU::lumiverseTlbMemoFill(const PhysAccess& access) -> void {
+  if(!lumiverseFast.tlb || !access.cache || access.paddr > 0x03ef'ffffull) return;
+  auto& memo = lumiverseTlbMemo[Write];
+  memo.vpage = access.vaddr >> 12;
+  memo.ppage = (u32)access.paddr & ~0xfffu;
 }
 
 auto CPU::devirtualizeDebug(u64 vaddr) -> u64 {

@@ -364,8 +364,33 @@ struct CPU : Thread {
     bool fetch = false;   //CPU_FAST_FETCH: inline KSEG0-RDRAM instruction fetch
     bool memory = false;  //CPU_FAST_MEM: inline KSEG0-RDRAM aligned loads/stores
     bool memoryLive = false;  //memory && no GDB breakpoints/watchpoints (refreshed per synchronize)
+    bool tlb = false;     //CPU_FAST_TLB: one-page translation memo for TLB-mapped RDRAM (fetch/load/store)
     int  diag = 0;        //CPU_DIAG: 1 = batch telemetry, 2 = + PC histogram
   } lumiverseFast;
+
+  //Lumiverse addition (round 8): last successful TLB translation per
+  //direction, 4 KiB granularity, for games whose code and data live in
+  //TLB-mapped KUSEG (Conker's Bad Fur Day: TLB::load was 14% of the
+  //emulation thread). Only translations that resolved to a CACHED RDRAM
+  //page are memoized, so a hit is exactly what devirtualize() would have
+  //returned; anything else (uncached mapping, invalid/non-dirty page,
+  //ASID mismatch, exceptions) takes the general path as before. Cleared on
+  //TLBWI/TLBWR, EntryHi (ASID) writes and processor-mode changes
+  //(lumiverseTlbMemoInvalidate). Index 0 = read/fetch, 1 = write.
+  struct LumiverseTlbMemo {
+    u64 vpage = ~0ull;  //vaddr >> 12 (~0 = empty)
+    u32 ppage = 0;      //paddr & ~0xfff
+  } lumiverseTlbMemo[2];
+  auto lumiverseTlbMemoInvalidate() -> void {
+    lumiverseTlbMemo[0].vpage = ~0ull;
+    lumiverseTlbMemo[1].vpage = ~0ull;
+  }
+  template<bool Write> auto lumiverseTlbMemoHit(u64 vaddr, u32& paddr) const -> bool {
+    const auto& memo = lumiverseTlbMemo[Write];
+    if((vaddr >> 12) != memo.vpage) return false;
+    paddr = memo.ppage | (u32)(vaddr & 0xfff);
+    return true;
+  }
 
   //Lumiverse addition: inline fast path for the dominant case — an aligned
   //access into KSEG0 RDRAM (0xffffffff80000000..83efffff, the range the
@@ -375,11 +400,14 @@ struct CPU : Thread {
   //watchpoints exist (memoryLive), so debugger behavior is unchanged.
   //Unaligned or non-RDRAM addresses fall through to the general path, whose
   //results are identical for the addresses the fast path accepts.
-  template<u32 Size> auto lumiverseFastPaddr(u64 vaddr, u32& paddr) const -> bool {
+  template<u32 Size, bool Write = false> auto lumiverseFastPaddr(u64 vaddr, u32& paddr) const -> bool {
     if(!lumiverseFast.memoryLive) return false;
-    if((vaddr - 0xffff'ffff'8000'0000ull) > 0x03ef'ffffull) return false;
     if(vaddr & (Size - 1)) return false;
-    paddr = (u32)vaddr & 0x3eff'ffff;
+    if((vaddr - 0xffff'ffff'8000'0000ull) <= 0x03ef'ffffull) {
+      paddr = (u32)vaddr & 0x3eff'ffff;
+    } else if(!lumiverseTlbMemoHit<Write>(vaddr, paddr)) {
+      return false;
+    }
     if(context.littleEndian()) {
       if constexpr(Size == Byte) paddr ^= 7;
       if constexpr(Size == Half) paddr ^= 6;
@@ -394,10 +422,11 @@ struct CPU : Thread {
   }
   template<u32 Size> auto write(u64 vaddr, u64 data, bool alignedError = true) -> bool {
     u32 paddr;
-    if(lumiverseFastPaddr<Size>(vaddr, paddr)) return dcache.write<Size>(vaddr, paddr, data), true;
+    if(lumiverseFastPaddr<Size, true>(vaddr, paddr)) return dcache.write<Size>(vaddr, paddr, data), true;
     return write<Size>(devirtualize<Write, Size>(vaddr, alignedError), data);
   }
   template<u32 Size> auto vaddrAlignedError(u64 vaddr, bool write) -> bool;
+  template<bool Write> auto lumiverseTlbMemoFill(const PhysAccess& access) -> void;
   auto addressException(u64 vaddr) -> void;
   auto emuxException(u8 kind) -> void;
 

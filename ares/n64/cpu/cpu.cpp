@@ -194,13 +194,18 @@ auto CPU::instruction() -> bool {
   const u64 pcExec = ipu.pc;
   u32 opcodeWord;
 
-  if(fast.fetch && !(Accuracy::CPU::Recompiler && recompiler.enabled)
-  && (pcExec - 0xffff'ffff'8000'0000ull) <= 0x03ef'ffffull && !(pcExec & 3)) {
-    //fast fetch: aligned KSEG0 RDRAM (cached). Equivalent to
-    //fetch(devirtualize<Read, Word>(pc)) for this address class.
+  u32 fastFetchPaddr = 0;
+  if(fast.fetch && !(Accuracy::CPU::Recompiler && recompiler.enabled) && !(pcExec & 3)
+  && ((pcExec - 0xffff'ffff'8000'0000ull) <= 0x03ef'ffffull
+      ? (fastFetchPaddr = (u32)pcExec & 0x3eff'ffff, true)
+      : lumiverseTlbMemoHit<false>(pcExec, fastFetchPaddr))) {
+    //fast fetch: aligned KSEG0 RDRAM (cached), or a TLB-mapped page whose
+    //translation to cached RDRAM was memoized by the general path (round
+    //8, LumiverseTlbMemo). Equivalent to fetch(devirtualize<Read, Word>(pc))
+    //for these address classes.
     if(fast.batch && Thread::clock >= jitClockTarget) beginBatch();
     step(1 * 2);
-    u32 paddr = (u32)pcExec & 0x3eff'ffff;
+    u32 paddr = fastFetchPaddr;
     if(context.littleEndian()) paddr ^= 4;
     opcodeWord = icache.fetch(pcExec, paddr, cpu);
   } else {
@@ -325,10 +330,15 @@ auto CPU::lumiverseLoadFastConfig() -> void {
     f.fetch = !fe || *fe != '0';
     const char* me = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_MEM");
     f.memory = !me || *me != '0';
+    //LUMIVERSE_ARES_N64_CPU_FAST_TLB (default 1, 0 = off): one-page memo of
+    //the last TLB translation per direction (see LumiverseTlbMemo)
+    const char* te = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_TLB");
+    f.tlb = !te || *te != '0';
     const char* d = ::getenv("LUMIVERSE_ARES_N64_CPU_DIAG");
     f.diag = d ? ::atoi(d) : 0;
   }
   f.memoryLive = f.memory && !GDB::server.hasBreakpoints();
+  lumiverseTlbMemoInvalidate();
 }
 
 auto CPU::instructionPrologue(u64 address, u32 instruction) -> void {
