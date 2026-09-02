@@ -155,6 +155,12 @@ constexpr u64 LumiverseAudioUcodeMajoraU   = 0xa8df9aeb4a7cb685ull;  //Majora's 
 
 constexpr u64 LumiverseAudioUcodeSM64WR    = 0x394bf43d72dfa31dull;  //Super Mario 64 (U) + Wave Race 64 (U), shared
 constexpr u64 LumiverseAudioUcodeSnapU     = 0x7123e4d5f82ae6a5ull;  //Pokemon Snap (U)
+//round 9: found by the library census + AUDIO_HLE_TRY executor trials; both
+//pass the WAV gate on the ABI1 executor with zero fallbacks (Doom 64:
+//envCorr 0.98/0.94, level 1.005/1.012, 0 clicks; Cruis'n USA: envCorr
+//1.000/1.000, level 1.007, 0 clicks; 4000-step runs vs LLE audio)
+constexpr u64 LumiverseAudioUcodeDoom64    = 0xd74cbe704463fdd3ull;  //Doom 64 (U)
+constexpr u64 LumiverseAudioUcodeCruisnUSA = 0xecd40fd97f420e51ull;  //Cruis'n USA (U)
 constexpr u64 LumiverseAudioUcodeSmashU    = 0xbbca23e37b0bc136ull;  //Super Smash Bros. (U) + Kirby 64
 //Rare's engines (round 8 census): Banjo-Kazooie's and Banjo-Tooie's audio
 //ucodes issue the same fixed-0x170-chunk command set as naudio (04/06
@@ -172,14 +178,30 @@ auto lumiverseAudioRareOptIn() -> bool {
   return value;
 }
 
+//LUMIVERSE_ARES_N64_AUDIO_HLE_TRY=<16-hex ucode hash>:<dialect 0|1|2>: run
+//one un-whitelisted ucode on a chosen executor (census/shadow work only)
+auto lumiverseAudioTryDialect(u64 hash) -> s32 {
+  static const u64 tryHash = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRY"); return v ? (u64)::strtoull(v, nullptr, 16) : 0ull; }();
+  static const s32 tryDialect = [] {
+    const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRY");
+    const char* colon = v ? ::strchr(v, ':') : nullptr;
+    return colon ? (s32)::atoi(colon + 1) : -1;
+  }();
+  if(tryHash && hash == tryHash && tryDialect >= 0 && tryDialect <= 2) return tryDialect;
+  return -1;
+}
+
 //returns the command-set dialect for a whitelisted audio ucode, -1 otherwise
 auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
+  if(const s32 tried = lumiverseAudioTryDialect(hash); tried >= 0) return tried;
   if(hash == LumiverseAudioUcodeStarFox64) return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeZeldaMQ)   return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeZeldaOoTU) return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeMajoraU)   return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeSM64WR)    return LumiverseAudioDialectABI1;
   if(hash == LumiverseAudioUcodeSnapU)     return LumiverseAudioDialectABI1;
+  if(hash == LumiverseAudioUcodeDoom64)    return LumiverseAudioDialectABI1;
+  if(hash == LumiverseAudioUcodeCruisnUSA) return LumiverseAudioDialectABI1;
   if(hash == LumiverseAudioUcodeSmashU)    return LumiverseAudioDialectNaudio;
   if(hash == LumiverseAudioUcodeBanjoK && lumiverseAudioRareOptIn()) return LumiverseAudioDialectNaudio;
   if(hash == LumiverseAudioUcodeBanjoT && lumiverseAudioRareOptIn()) return LumiverseAudioDialectNaudio;
