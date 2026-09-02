@@ -559,9 +559,17 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
       v.loopAddr = w1 & 0x00ffffff;
       break;
     case 0x11: {  //DECIMATE (2:1 copy): count OUTPUT samples, reads 2*count
+      //round 10: the source read wraps at the end of DMEM (12-bit RSP
+      //addressing). Pokemon Stadium 2's reverb chain issues the in-place form
+      //`11 0000d0 0e10 0e10` (208 output samples from 0xe10: the read runs to
+      //0x1150); the truncated-task oracle (TRUNCATE_MATCH) shows LLE writing
+      //all 208 outputs at 0xe10..0xfb0 with dst[n] = src[(0xe10 + 4n) & 0xfff]
+      //(192/192 verifiable samples). Only the first 0x50 are consumed (the
+      //SAVEBUFF that follows); the wrapped tail is dead data. Whole-task LLE
+      //fallback for 291/3364 of its tasks before this.
       const u32 count = w0 & 0xffff;
-      const u32 src = w1 >> 16, dst = w1 & 0xffff;
-      if(!count || src + count * 4 > 0x1000 || dst + count * 2 > 0x1000) return reject(offset, w0, w1, "decimate range");
+      const u32 dst = w1 & 0xffff;
+      if(!count || dst + count * 2 > 0x1000) return reject(offset, w0, w1, "decimate range");
       break;
     }
     case 0x12:  //ENVSETUP1
@@ -1438,6 +1446,7 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
       const u32 count = w0 & 0xffff;
       const u32 src = w1 >> 16, dst = w1 & 0xffff;
       s16 scratch[0x800];
+      //source reads wrap at 0x1000 (the accessor masks) — see the validator
       for(u32 index = 0; index < count && index < 0x800; index++) scratch[index] = lumiverseAudioDmemReadS16(dmem, src + index * 4);
       for(u32 index = 0; index < count && index < 0x800; index++) lumiverseAudioDmemWriteS16(dmem, dst + index * 2, scratch[index]);
       break;
@@ -2002,6 +2011,45 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
       const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_MIN_TASK");
       return value ? (u64)::atoll(value) : 0;
     }();
+    //LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_MATCH=<w0 hex>:<w1 hex>[:<skip>]:
+    //truncate the first task (after skipping `skip` matching tasks) whose
+    //alist contains exactly that command pair, right after it (or before it
+    //with TRUNCATE_BEFORE=1). Unlike TRUNCATE_OP this counts EVERY task,
+    //validated or not, so a command form the validator rejects can still be
+    //put under the oracle (Pokemon Stadium 2's in-place DECIMATE, round 10).
+    static const bool matchConfigured = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_MATCH") != nullptr;
+    static u32 matchW0 = 0, matchW1 = 0;
+    static u64 matchSkip = 0;
+    static bool matchParsed = false;
+    static u64 seenTasks = 0;
+    if(matchConfigured && !matchParsed) {
+      matchParsed = true;
+      const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_MATCH");
+      char* end = nullptr;
+      matchW0 = (u32)::strtoul(value, &end, 16);
+      if(end && *end == ':') matchW1 = (u32)::strtoul(end + 1, &end, 16);
+      if(end && *end == ':') matchSkip = (u64)::strtoull(end + 1, nullptr, 10);
+    }
+    seenTasks++;
+    if(matchConfigured && !truncateOpDone && truncateTask < 0) {
+      for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
+        u32 w0 = 0, w1 = 0;
+        for(u32 b = 0; b < 4; b++) w0 = w0 << 8 | lumiverseAudioRDRAMReadByte(dataPtr + offset + b);
+        for(u32 b = 0; b < 4; b++) w1 = w1 << 8 | lumiverseAudioRDRAMReadByte(dataPtr + offset + 4 + b);
+        if(w0 == matchW0 && w1 == matchW1) {
+          if(matchSkip > 0) { matchSkip--; break; }
+          const s64 index = (s64)(offset / 8) - (truncateBefore ? 1 : 0);
+          if(index >= 0) {
+            truncateOpDone = true;
+            truncateTask = (s64)taskIndex;
+            truncateCommand = index;
+            fprintf(stderr, "[rsp-hle-audio] truncate-match %08x %08x: seen-task %llu (executed index %llu) command %lld\n",
+              matchW0, matchW1, (unsigned long long)seenTasks - 1, (unsigned long long)taskIndex, (long long)index);
+          }
+          break;
+        }
+      }
+    }
     if(truncateOp >= 0 && !truncateOpDone && truncateTask < 0 && taskIndex >= truncateMinTask) {
       for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
         const u32 head = truncateOpWithFlags
@@ -2020,7 +2068,11 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
         }
       }
     }
-    if(truncateTask >= 0 && (u64)truncateTask == taskIndex && truncateCommand >= 0) {
+    //fire once: taskIndex only advances on validated tasks, so a rejected
+    //target would otherwise be re-truncated on every following task
+    static bool truncateApplied = false;
+    if(truncateTask >= 0 && (u64)truncateTask == taskIndex && truncateCommand >= 0 && !truncateApplied) {
+      truncateApplied = true;
       //shrink the OSTask's dataSize (DMEM 0xfc0 + 13*4) so the microcode
       //stops after the chosen command; also truncate our own walk
       const u32 truncatedSize = (u32)(truncateCommand + 1) * 8;
@@ -2059,6 +2111,25 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   lumiverseAudioValidateTaskIndex = taskIndex;
   if(!lumiverseAudioValidate(machine, dataPtr, dataSize, (u32)dialect)) {
     machine.tasksFallback++;
+    //oracle on a task the validator rejects: nothing of ours to compare, but
+    //LLE's DMEM after the truncated prefix is exactly the evidence wanted —
+    //stash the alist and arm a write-less settle so the dump still happens
+    if(level >= 2 && lumiverseAudioTruncateArmed && lumiverseAudioTruncateDumpTask == (s64)taskIndex) {
+      if(capture) {
+        capture->alistWords = 0;
+        for(u32 offset = 0; offset + 4 <= dataSize && capture->alistWords < 0x2000; offset += 4) {
+          u32 word = 0;
+          for(u32 b = 0; b < 4; b++) word = word << 8 | lumiverseAudioRDRAMReadByte(dataPtr + offset + b);
+          capture->alist[capture->alistWords++] = word;
+        }
+      }
+      shadow.active = false;
+      shadow.writeCount = 0;
+      shadow.byteCount = 0;
+      shadow.overflow = false;
+      shadow.task = taskIndex;
+      shadow.pending = true;
+    }
     return false;
   }
 
