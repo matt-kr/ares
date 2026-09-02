@@ -246,6 +246,19 @@ struct LumiverseGfxMachine {
   u32 texTile = 0, texLevel = 0;
   u32 rdpHalf1 = 0;
   LumiverseGfxTileSize tileSizes[8];
+  //GoldenEye 2.0G "baked RDP stream": the game pre-computes RDP triangle
+  //commands on the CPU and embeds them in the display list as a run of
+  //0xb4/0xb2 pairs (one 32-bit RDP word per GBI command, in cmd1) closed by
+  //0xb3 carrying the final word. Format established EMPIRICALLY from our own
+  //DL dumps (LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP) cross-checked against
+  //the RDP stream the LLE microcode kicked for the same task
+  //(LUMIVERSE_ARES_N64_RDP_STREAM_DUMP): the cmd1 words concatenate to
+  //exactly the RDP command LLE emits (e.g. 40 words = one 0xce
+  //shade+texture+z triangle), which the microcode kicks qword by qword.
+  //n64js (MIT) documents the same word-stream shape for its GBI0GE class.
+  bool bakedRDP = false;
+  u32 baked[64];
+  u32 bakedCount = 0;
 
   //dialect (GBI1 = F3DEX v1, GBI2 = F3DEX2/F3DZEX, GBI0 = Fast3D) and its
   //bit positions
@@ -281,7 +294,7 @@ auto lumiverseGfxSegmentAddress(LumiverseGfxMachine& m, u32 address) -> u32 {
   return (m.segments[segment] + (address & 0x00ffffff)) & 0x00ffffff;
 }
 
-auto lumiverseGfxReset(LumiverseGfxMachine& m, u32 pc, u32 dialect, u32 gbi0Vertex = LumiverseGBI0VertexStandard) -> void {
+auto lumiverseGfxReset(LumiverseGfxMachine& m, u32 pc, u32 dialect, u32 gbi0Vertex = LumiverseGBI0VertexStandard, bool bakedRDP = false) -> void {
   //Per-task, not per-process. `machine` is a function-local static that lives
   //for the whole process, and nothing else ever clears these two: once a
   //single task overflowed the buffer or lost a queueHLECommands, `failed`
@@ -343,6 +356,26 @@ auto lumiverseGfxReset(LumiverseGfxMachine& m, u32 pc, u32 dialect, u32 gbi0Vert
   m.texTile = 0; m.texLevel = 0;
   m.rdpHalf1 = 0;
   for(auto& size : m.tileSizes) size = {};
+  m.bakedRDP = bakedRDP;
+  m.bakedCount = 0;
+}
+
+//RDP command length in 64-bit words by 6-bit command code (the table
+//paraLLEl-RDP's dispatch in vulkan.cpp uses; ares' own vendored source)
+constexpr u32 lumiverseGfxRDPCommandQwords[64] = {
+  1, 1, 1, 1, 1, 1, 1, 1, 4, 6,12,14,12,14,20,22,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+
+//expected word count of a baked RDP command from its first word (only the
+//triangle family and the fixed-size RDP commands are accepted; anything
+//else is rejected by the dry-run so the task falls back to LLE)
+auto lumiverseGfxBakedExpectedWords(u32 firstWord) -> u32 {
+  const u32 code = firstWord >> 24 & 0x3f;
+  if(firstWord >> 24 < 0xc8) return 0;  //not an RDP command opcode
+  return lumiverseGfxRDPCommandQwords[code] * 2;
 }
 
 //advance to the next display-list command; false when the list is finished
@@ -973,8 +1006,8 @@ auto lumiverseGfxLogUnimplementedOnce(u8 opcode, u32 cmd0, u32 cmd1) -> void {
 //shared GBI1/GBI0 interpreter (Fast3D reuses the GBI1 command set with the
 //divergences handled per-case above: G_VTX/TRI4/CULLDL/RDPHalf_Cont/0xb0)
 auto lumiverseGfxExecuteTask(LumiverseGfxMachine& m, u32 pc,
-  u32 dialect = LumiverseDialectGBI1, u32 gbi0Vertex = LumiverseGBI0VertexStandard) -> bool {
-  lumiverseGfxReset(m, pc, dialect, gbi0Vertex);
+  u32 dialect = LumiverseDialectGBI1, u32 gbi0Vertex = LumiverseGBI0VertexStandard, bool bakedRDP = false) -> bool {
+  lumiverseGfxReset(m, pc, dialect, gbi0Vertex, bakedRDP);
   u32 safety = 0;
 
   while(lumiverseGfxNextCommand(m)) {
@@ -1119,7 +1152,12 @@ auto lumiverseGfxExecuteTask(LumiverseGfxMachine& m, u32 pc,
       break;
     }
 
-    case 0xb2: {  //GBI1: G_MODIFYVTX; GBI0: RDPHalf_Cont (n64js: warn + ignore)
+    case 0xb2: {  //GBI1: G_MODIFYVTX; GBI0: RDPHalf_Cont (n64js: warn + ignore);
+                  //GoldenEye: continuation word of a baked RDP command
+      if(m.bakedRDP) {
+        if(m.bakedCount < 64) m.baked[m.bakedCount++] = cmd1;
+        break;
+      }
       if(m.dialect == LumiverseDialectGBI0) {
         lumiverseGfxLogUnimplementedOnce(opcode, cmd0, cmd1);
         break;
@@ -1226,10 +1264,29 @@ auto lumiverseGfxExecuteTask(LumiverseGfxMachine& m, u32 pc,
       break;
     }
 
-    case 0xb4:  //G_RDPHALF_1
+    case 0xb4:  //G_RDPHALF_1 (GoldenEye: first word of a baked RDP command)
       m.rdpHalf1 = cmd1;
+      if(m.bakedRDP && m.bakedCount < 64) m.baked[m.bakedCount++] = cmd1;
       break;
-    case 0xb3:  //G_RDPHALF_2
+    case 0xb3:  //G_RDPHALF_2 (GoldenEye: final word -> emit the baked command)
+      if(m.bakedRDP) {
+        if(m.bakedCount < 64) m.baked[m.bakedCount++] = cmd1;
+        const u32 expected = m.bakedCount ? lumiverseGfxBakedExpectedWords(m.baked[0]) : 0;
+        if(expected && expected == m.bakedCount) {
+          //same lazily-flushed other-mode as every other draw
+          if(m.otherModeDirty) {
+            lumiverseGfxEmit2(m.out, 0xef000000 | (m.otherModeH & 0x00ffffff), m.otherModeL);
+            m.otherModeDirty = false;
+          }
+          for(u32 index = 0; index + 1 < m.bakedCount; index += 2) lumiverseGfxEmit2(m.out, m.baked[index], m.baked[index + 1]);
+          m.trisEmitted += (m.baked[0] >> 24) >= 0xc8 && (m.baked[0] >> 24) <= 0xcf;
+        } else {
+          //the dry-run validated every sequence, so this cannot happen; fail
+          //the task rather than emit a partial command
+          m.out.failed = true;
+        }
+        m.bakedCount = 0;
+      }
       break;
 
     case 0xbf: {  //G_TRI1 (byte indices divided by the dialect's stride)
@@ -1775,15 +1832,33 @@ auto lumiverseGfxOpcodeSupported(u8 opcode) -> bool {
   }
 }
 
+//one line per distinct silent rejection reason (the dry-run used to fall a
+//task back to LLE for these without any trace — GoldenEye's in-game
+//fallbacks were invisible in the logs); counts are kept for the summary
+u64 lumiverseGfxRejectCounts[8];
+auto lumiverseGfxLogRejectOnce(u32 reason, u8 opcode, u32 cmd0, u32 cmd1, const char* what) -> void {
+  static bool logged[8];
+  if(reason < 8) lumiverseGfxRejectCounts[reason]++;
+  if(reason < 8 && !logged[reason]) {
+    logged[reason] = true;
+    fprintf(stderr, "[rsp-hle-gfx] %s: op %02x cmd0=%08x cmd1=%08x -> LLE fallback\n", what, opcode, cmd0, cmd1);
+  }
+}
+
 //dry-run walker shared by GBI1 and GBI0 (Fast3D): flow control + segment
 //table only; any unsupported opcode fails the whole task over to LLE
-auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = LumiverseDialectGBI1, bool rejectBakedRDP = false) -> bool {
+auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = LumiverseDialectGBI1, bool bakedRDP = false) -> bool {
   u32 segments[16] = {};
   u32 stack[32];
   u32 stackDepth = 0;
   u32 rdpHalf1 = 0;
   bool newOpcode = false;
   bool supported = true;
+  //GoldenEye baked RDP stream validation: every 0xb4/0xb2.../0xb3 run must
+  //form exactly one RDP command of the length its first word implies, with
+  //no other GBI command interleaved; anything else fails the task to LLE
+  u32 bakedFirst = 0;
+  u32 bakedCount = 0;
 
   auto segmentAddress = [&](u32 address) -> u32 {
     return (segments[(address >> 24) & 0xf] + (address & 0x00ffffff)) & 0x00ffffff;
@@ -1818,22 +1893,29 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
       continue;  //keep walking to complete the census
     }
 
-    //GoldenEye 2.0G bakes raw RDP command streams into the DL via
-    //0xb4/0xb2/0xb3; that format is not implemented, so any task containing
-    //them falls back to LLE (never observed in menus; expected in gameplay)
-    if(rejectBakedRDP && (opcode == 0xb4 || opcode == 0xb2 || opcode == 0xb3)) {
-      static bool geLogged = false;
-      if(!geLogged) {
-        geLogged = true;
-        fprintf(stderr, "[rsp-hle-gfx] GE baked-RDP op %02x -> LLE fallback\n", opcode);
+    if(bakedRDP) {
+      if(opcode == 0xb4 || opcode == 0xb2 || opcode == 0xb3) {
+        if(bakedCount == 0) bakedFirst = cmd1;
+        bakedCount++;
+        if(opcode == 0xb3) {
+          const u32 expected = lumiverseGfxBakedExpectedWords(bakedFirst);
+          if(!expected || expected != bakedCount || bakedCount > 64) {
+            lumiverseGfxLogRejectOnce(4, opcode, bakedFirst, cmd1, "GE baked-RDP stream shape");
+            supported = false;
+          }
+          bakedCount = 0;
+        }
+      } else if(bakedCount) {
+        lumiverseGfxLogRejectOnce(5, opcode, cmd0, cmd1, "GE baked-RDP stream interrupted");
+        supported = false;
+        bakedCount = 0;
       }
-      supported = false;
     }
 
     switch(opcode) {
     case 0x06:
       if(((cmd0 >> 16) & 0xff) == 0) {
-        if(stackDepth >= 32) return false;
+        if(stackDepth >= 32) { lumiverseGfxLogRejectOnce(0, opcode, cmd0, cmd1, "DL stack overflow"); return false; }
         stack[stackDepth++] = pc;
       }
       pc = segmentAddress(cmd1);
@@ -1844,7 +1926,7 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
       break;
     case 0xb0:
       //GBI1: G_BRANCH_Z (branch always, n64js); GBI0: unknown opcode
-      if(dialect == LumiverseDialectGBI0) supported = false;
+      if(dialect == LumiverseDialectGBI0) { lumiverseGfxLogRejectOnce(1, opcode, cmd0, cmd1, "GBI0 op b0"); supported = false; }
       else pc = segmentAddress(rdpHalf1);
       break;
     case 0xb4:
@@ -1852,14 +1934,20 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
       break;
     case 0xbc:
       if((cmd0 & 0xff) == 0x06) segments[((cmd0 >> 8) & 0xffff) >> 2 & 0xf] = cmd1 & 0x00ffffff;
-      else if((cmd0 & 0xff) == 0x00 || (cmd0 & 0xff) == 0x0c) supported = false;  //MW_MATRIX / MW_POINTS
+      else if((cmd0 & 0xff) == 0x00 || (cmd0 & 0xff) == 0x0c) {  //MW_MATRIX / MW_POINTS
+        lumiverseGfxLogRejectOnce(2, opcode, cmd0, cmd1, "moveword MATRIX/POINTS");
+        supported = false;
+      }
       break;
     case 0xb2: {
       //GBI1: G_MODIFYVTX (only RGBA/ST cases handled); GBI0: RDPHalf_Cont,
       //ignored like n64js (no state effect)
       if(dialect == LumiverseDialectGBI0) break;
       const u32 where = (cmd0 >> 16) & 0xff;
-      if(where != 0x10 && where != 0x14) supported = false;  //XY/ZSCREEN unhandled
+      if(where != 0x10 && where != 0x14) {  //XY/ZSCREEN unhandled
+        lumiverseGfxLogRejectOnce(3, opcode, cmd0, cmd1, "modifyvtx XY/ZSCREEN");
+        supported = false;
+      }
       break;
     }
     case 0xe4: case 0xe5:
@@ -1873,6 +1961,10 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
   if(steps >= 1000000) {
     fprintf(stderr, "[rsp-hle-gfx] dry-run exceeded step limit -> LLE fallback\n");
     return false;
+  }
+  if(bakedRDP && bakedCount) {
+    lumiverseGfxLogRejectOnce(5, 0xb8, 0, 0, "GE baked-RDP stream unterminated");
+    supported = false;
   }
 
   if(newOpcode && lumiverseGfxLogLevel() >= 1) {
@@ -2043,9 +2135,9 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   case LumiverseUcodeFast3DWR64:    dialect = LumiverseDialectGBI0; gbi0Vertex = LumiverseGBI0VertexWaveRace; break;
   case LumiverseUcodeFast3DSOTE:    dialect = LumiverseDialectGBI0; gbi0Vertex = LumiverseGBI0VertexSOTE; break;
   //GoldenEye (U) "RSP SW Version: 2.0G": standard Fast3D command set in the
-  //menus (5M-command census over 3600 steps showed zero 0xb4/0xb2/0xb3);
-  //the baked raw-RDP stream feature those opcodes select is NOT implemented
-  //and the dry-run rejects any task using them (per-task LLE fallback).
+  //menus; in-game every task also carries baked RDP triangle streams
+  //(0xb4/0xb2/0xb3 word runs), which are passed through verbatim after
+  //structural validation in the dry-run (see LumiverseGfxMachine::bakedRDP)
   case 0xc8f38644ac25bbabull: dialect = LumiverseDialectGBI0; geBaked = true; break;
   default: return false;
   }
@@ -2083,16 +2175,19 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
 
   const bool ok = dialect == LumiverseDialectGBI2
     ? lumiverseGfxExecuteTaskGBI2(machine, dataPtr)
-    : lumiverseGfxExecuteTask(machine, dataPtr, dialect, gbi0Vertex);
+    : lumiverseGfxExecuteTask(machine, dataPtr, dialect, gbi0Vertex, geBaked);
   if(ok) tasksExecuted++;
   else tasksFallback++;
 
   if(lumiverseGfxLogLevel() >= 1 && ((tasksExecuted + tasksFallback) & 63) == 1) {
     fprintf(stderr,
-      "[rsp-hle-gfx] tasks=%llu fallback=%llu tris=%llu clipped=%llu rejected=%llu\n",
+      "[rsp-hle-gfx] tasks=%llu fallback=%llu tris=%llu clipped=%llu rejected=%llu rejects(stack/b0/mw/mvtx/baked/bakedcut)=%llu/%llu/%llu/%llu/%llu/%llu\n",
       (unsigned long long)tasksExecuted, (unsigned long long)tasksFallback,
       (unsigned long long)machine.trisEmitted, (unsigned long long)machine.trisClipped,
-      (unsigned long long)machine.trisRejected);
+      (unsigned long long)machine.trisRejected,
+      (unsigned long long)lumiverseGfxRejectCounts[0], (unsigned long long)lumiverseGfxRejectCounts[1],
+      (unsigned long long)lumiverseGfxRejectCounts[2], (unsigned long long)lumiverseGfxRejectCounts[3],
+      (unsigned long long)lumiverseGfxRejectCounts[4], (unsigned long long)lumiverseGfxRejectCounts[5]);
   }
 
   return ok;
