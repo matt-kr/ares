@@ -15,6 +15,13 @@ auto lumiverseRelaxDPCReadSync() -> int {
 //Lumiverse diagnostic (LUMIVERSE_ARES_N64_IO_POLL_LOG=1): count CPU reads of
 //the DPC registers (and SP_STATUS in rsp/io.cpp) and print the histogram with
 //the last value seen every 2^16 reads — shows what a stalled game is polling
+//LUMIVERSE_ARES_N64_RSP_HLE_DPC_LOG_LIMIT: how many [rdp-dpc] lines each of
+//the two DPC logs prints (default 64; raise to trace a hang)
+auto lumiverseDpcLogLimit() -> u32 {
+  static const u32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_DPC_LOG_LIMIT"); return v ? (u32)::strtoul(v, nullptr, 10) : 64u; }();
+  return value;
+}
+
 auto lumiverseIOPollLog() -> bool {
   static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_IO_POLL_LOG"); return v && v[0] == '1'; }();
   return value;
@@ -126,9 +133,9 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
     }();
     if(dpcLog >= 1) {
       static u32 logged = 0;
-      if(logged++ < 64) {
-        fprintf(stderr, "[rdp-dpc] end=%06x start=%06x startValid=%u origin=%s\n",
-          (u32)data.bit(0,23), command.start, (u32)command.startValid, &thread == &cpu ? "cpu" : "rsp");
+      if(logged++ < lumiverseDpcLogLimit()) {
+        fprintf(stderr, "[rdp-dpc] end=%06x start=%06x startValid=%u origin=%s freeze=%u cur=%06x\n",
+          (u32)data.bit(0,23), command.start, (u32)command.startValid, &thread == &cpu ? "cpu" : "rsp", (u32)command.freeze, command.current);
       }
     }
     command.end = data.bit(0,23) & ~7;
@@ -151,7 +158,7 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
     static int dpcStatusLog = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_DPC_LOG"); return v ? ::atoi(v) : 0; }();
     if(dpcStatusLog >= 1) {
       static u32 logged = 0;
-      if(logged++ < 96) fprintf(stderr, "[rdp-dpc] STATUS write %08x origin=%s (freeze=%u source=%u start=%06x end=%06x current=%06x)\n",
+      if(logged++ < lumiverseDpcLogLimit()) fprintf(stderr, "[rdp-dpc] STATUS write %08x origin=%s (freeze=%u source=%u start=%06x end=%06x current=%06x)\n",
         (u32)data, &thread == &cpu ? "cpu" : "rsp", (u32)command.freeze, (u32)command.source, command.start, command.end, command.current);
     }
     if(data.bit(0)) command.source = 0;
@@ -270,7 +277,8 @@ auto RDP::flushCommands() -> void {
     auto& memory = !command.source ? (Memory::Writable&)rdram.ram : (Memory::Writable&)rsp.dmem;
     fprintf(lumiverseStreamDump, "kick src=%s cur=%06x end=%06x\n",
       command.source ? "xbus" : "rdram", (u32)command.current, (u32)command.end);
-    for(u32 address = command.current; address + 8 <= command.end && address < command.current + 0x4000; address += 8) {
+    static const u32 dumpBytes = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RDP_STREAM_DUMP_BYTES"); return v ? (u32)::strtoul(v, nullptr, 0) : 0x4000u; }();
+    for(u32 address = command.current; address + 8 <= command.end && address < command.current + dumpBytes; address += 8) {
       fprintf(lumiverseStreamDump, "  %08x %08x\n",
         memory.readUnaligned<Word>(address), memory.readUnaligned<Word>(address + 4));
     }

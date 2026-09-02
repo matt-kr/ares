@@ -287,26 +287,50 @@ auto Vulkan::render() -> bool {
   u32* buffer = implementation->buffer;
   u32& queueSize = implementation->queueSize;
   u32& queueOffset = implementation->queueOffset;
-  if(queueSize + length >= 0x8000) return true;
-
-  if(!command.source) {
-    do {
-      buffer[queueSize * 2 + 0] = rdram.ram.read<Word>(current, RBusDevice::DP_DMA); current += 4;
-      buffer[queueSize * 2 + 1] = rdram.ram.read<Word>(current, RBusDevice::DP_DMA); current += 4;
-      queueSize++;
-    } while(--length);
-  } else {
-    do {
-      buffer[queueSize * 2 + 0] = rsp.dmem.read<Word>(current); current += 4;
-      buffer[queueSize * 2 + 1] = rsp.dmem.read<Word>(current); current += 4;
-      if(system.homebrewMode) {
-        rsp.debugger.dmemReadWord(current - 8, 8, "RDP XBUS");
-      }
-      queueSize++;
-    } while(--length);
+  //LUMIVERSE (round 9): a range that ended inside a command leaves that
+  //partial command at buffer[queueOffset .. queueSize); compact it to the
+  //front so the capacity check sees the real backlog, and feed a large
+  //range in pieces. The old `queueSize + length >= 0x8000 -> return`
+  //silently discarded the whole kick — with the HLE fifo path kicking
+  //160 KB ranges after a split command, Donkey Kong 64 lost the SyncFull
+  //of a frame and waited for the DP interrupt forever.
+  constexpr u32 queueCapacity = 0x8000;
+  if(queueOffset > 0) {
+    memmove(buffer, buffer + queueOffset * 2, (queueSize - queueOffset) * 8);
+    queueSize -= queueOffset;
+    queueOffset = 0;
+  }
+  bool complete = true;
+  while(length) {
+    u32 piece = length;
+    if(queueSize + piece > queueCapacity) piece = queueCapacity - queueSize;
+    if(piece == 0) break;  //cannot happen: a partial command is < 22 qwords
+    length -= piece;
+    if(!command.source) {
+      do {
+        buffer[queueSize * 2 + 0] = rdram.ram.read<Word>(current, RBusDevice::DP_DMA); current += 4;
+        buffer[queueSize * 2 + 1] = rdram.ram.read<Word>(current, RBusDevice::DP_DMA); current += 4;
+        queueSize++;
+      } while(--piece);
+    } else {
+      do {
+        buffer[queueSize * 2 + 0] = rsp.dmem.read<Word>(current); current += 4;
+        buffer[queueSize * 2 + 1] = rsp.dmem.read<Word>(current); current += 4;
+        if(system.homebrewMode) {
+          rsp.debugger.dmemReadWord(current - 8, 8, "RDP XBUS");
+        }
+        queueSize++;
+      } while(--piece);
+    }
+    complete = processQueuedCommands();
+    if(!complete && queueOffset > 0) {
+      memmove(buffer, buffer + queueOffset * 2, (queueSize - queueOffset) * 8);
+      queueSize -= queueOffset;
+      queueOffset = 0;
+    }
   }
 
-  if(!processQueuedCommands()) {
+  if(!complete) {
     //partial command, keep data around for next processing call
     command.start = command.current = command.end;
     return true;

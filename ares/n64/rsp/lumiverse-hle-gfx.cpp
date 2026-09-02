@@ -39,12 +39,9 @@ constexpr u64 LumiverseUcodeF3DEX2NoN208 = 0x64df8bf96faf6149ull;
 constexpr u64 LumiverseUcodeF3DEX2204H = 0xef47e4ae07558fa7ull;
 //Pokemon Stadium (U): "RSP Gfx ucode F3DEX fifo 2.06"
 constexpr u64 LumiverseUcodeF3DEX2206 = 0x9a69128077e0353bull;
-//Donkey Kong 64 (U): "RSP Gfx ucode F3DEX fifo 2.07" — hash kept for the
-//census, but NOT whitelisted: under HLE the game hangs (CPU stuck at the
-//exception vector, gfx dispatch stops) right as the DK Rap starts, while
-//rendering up to that point is correct and the opcode census is ordinary.
-//Rare-engine pattern (BK type-2 gfx, BT slower with HLE): their engines
-//appear to depend on RSP task timing/DPC behavior HLE doesn't reproduce.
+//Donkey Kong 64 (U): "RSP Gfx ucode F3DEX fifo 2.07" — whitelisted again
+//in round 9 (see the dispatch switch for the two fifo bugs that used to
+//crash/hang it at the DK Rap)
 constexpr u64 LumiverseUcodeF3DEX2207 = 0xfcf475ff1d56eb94ull;
 //Pokemon Snap (U): "RSP Gfx ucode F3DEX.NoN fifo 2.08H"
 constexpr u64 LumiverseUcodeF3DEX2NoN208H = 0xe444097f7a0d4d6eull;
@@ -153,24 +150,92 @@ struct LumiverseGfxOut {
   bool fifo = false;
   u32 fifoStart = 0;
   u32 fifoEnd = 0;
+  //round 9: the fifo is written like the microcode writes it — sequentially
+  //from fifoStart, DPC_END extended per flush, wrapping only once the RDP
+  //has consumed the buffer. The old per-flush "restart at fifoStart" lost
+  //every flush but the last while the game held DPC FREEZE (Rare engines:
+  //Donkey Kong 64 / Banjo-Tooie / THPS2 set FREEZE around each task), which
+  //dropped whole command runs (missing SetColorImage/texture loads) and
+  //crashed DK64 at the DK Rap
+  u32 fifoPos = 0;
+  bool fifoStarted = false;
+  //qwords still to come for the RDP command being emitted (0 = at a
+  //command boundary); flushes and fifo chunks are cut on boundaries only
+  u32 pendingQwords = 0;
 };
+
+u64 lumiverseGfxFifoWrapsFrozen = 0;  //diagnostic: wraps forced under FREEZE
+
+extern const u32 lumiverseGfxRDPCommandQwords[64];
+
+//largest command-aligned prefix of out.words[offset .. offset+limit)
+auto lumiverseGfxAlignedChunk(const LumiverseGfxOut& out, u32 offset, u32 limit) -> u32 {
+  u32 pos = 0, boundary = 0;
+  while(pos < limit) {
+    const u32 code = out.words[offset + pos] >> 24 & 0x3f;
+    const u32 length = lumiverseGfxRDPCommandQwords[code] * 2;
+    if(pos + length > limit) break;
+    pos += length;
+    boundary = pos;
+  }
+  return boundary;
+}
 
 auto lumiverseGfxFlush(LumiverseGfxOut& out) -> void {
   if(out.count == 0) return;
 
   if(out.fifo) {
-    const u32 capacityWords = (out.fifoEnd - out.fifoStart) / 4;
+    const u32 capacityWords = ((out.fifoEnd - out.fifoStart) / 4) & ~1u;
     if(capacityWords >= 2) {
       u32 offset = 0;
       while(offset < out.count) {
-        u32 chunk = out.count - offset;
-        if(chunk > capacityWords) chunk = capacityWords & ~1u;
-        for(u32 index = 0; index < chunk; index++) {
-          rdram.ram.Memory::Writable::write<Word>(out.fifoStart + index * 4, out.words[offset + index]);
+        u32 space = ((out.fifoEnd - out.fifoPos) / 4) & ~1u;
+        const u32 remaining = out.count - offset;
+        if(space < 2 || (remaining > space && out.fifoPos != out.fifoStart)) {
+          //wrap to the start of the fifo. paraLLEl consumed everything up to
+          //DPC_END synchronously at the last kick, unless the game holds
+          //DPC FREEZE (the RDP then never consumes and the buffer cannot be
+          //reused): release the freeze for the pending range and restore it,
+          //exactly the state the game will see after its own unfreeze
+          if(rdp.command.freeze) {
+            lumiverseGfxFifoWrapsFrozen++;
+            rdp.writeWord(0x0c, 0x0004, rsp);
+            rdp.writeWord(0x0c, 0x0008, rsp);
+          }
+          out.fifoPos = out.fifoStart;
+          out.fifoStarted = false;
+          space = capacityWords;
         }
-        //DPC_START then DPC_END; paraLLEl consumes the range synchronously
-        rdp.writeWord(0x00, out.fifoStart, rsp);
-        rdp.writeWord(0x04, out.fifoStart + chunk * 4, rsp);
+        u32 chunk = remaining;
+        if(chunk > space) {
+          //cut on an RDP command boundary: a command split across the fifo
+          //end leaves a partial command in paraLLEl's queue, and the fork's
+          //render() used to drop the next kick outright when that backlog
+          //plus a full-fifo range exceeded its queue (DK64 hang, round 9)
+          chunk = lumiverseGfxAlignedChunk(out, offset, space);
+          if(chunk == 0) {  //fifo too small for one command: wrap and retry
+            if(out.fifoPos == out.fifoStart) { out.failed = true; out.count = 0; return; }
+            if(rdp.command.freeze) {
+              lumiverseGfxFifoWrapsFrozen++;
+              rdp.writeWord(0x0c, 0x0004, rsp);
+              rdp.writeWord(0x0c, 0x0008, rsp);
+            }
+            out.fifoPos = out.fifoStart;
+            out.fifoStarted = false;
+            continue;
+          }
+        }
+        for(u32 index = 0; index < chunk; index++) {
+          rdram.ram.Memory::Writable::write<Word>(out.fifoPos + index * 4, out.words[offset + index]);
+        }
+        //DPC_START once per fifo pass, then DPC_END per flush: the RDP runs
+        //current..end at every END write (or at the game's unfreeze)
+        if(!out.fifoStarted) {
+          rdp.writeWord(0x00, out.fifoPos, rsp);
+          out.fifoStarted = true;
+        }
+        out.fifoPos += chunk * 4;
+        rdp.writeWord(0x04, out.fifoPos, rsp);
         offset += chunk;
       }
       out.count = 0;
@@ -192,9 +257,11 @@ auto lumiverseGfxEmit(LumiverseGfxOut& out, u32 word) -> void {
 }
 
 auto lumiverseGfxEmit2(LumiverseGfxOut& out, u32 hi, u32 lo) -> void {
+  if(out.pendingQwords == 0) out.pendingQwords = lumiverseGfxRDPCommandQwords[hi >> 24 & 0x3f];
   lumiverseGfxEmit(out, hi);
   lumiverseGfxEmit(out, lo);
-  if(out.count >= LumiverseGfxOut::FlushAt) lumiverseGfxFlush(out);
+  out.pendingQwords--;
+  if(out.count >= LumiverseGfxOut::FlushAt && out.pendingQwords == 0) lumiverseGfxFlush(out);
 }
 
 //----------------------------------------------------------------------------
@@ -371,7 +438,7 @@ auto lumiverseGfxReset(LumiverseGfxMachine& m, u32 pc, u32 dialect, u32 gbi0Vert
 
 //RDP command length in 64-bit words by 6-bit command code (the table
 //paraLLEl-RDP's dispatch in vulkan.cpp uses; ares' own vendored source)
-constexpr u32 lumiverseGfxRDPCommandQwords[64] = {
+const u32 lumiverseGfxRDPCommandQwords[64] = {
   1, 1, 1, 1, 1, 1, 1, 1, 4, 6,12,14,12,14,20,22,
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
   1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -1132,6 +1199,33 @@ auto lumiverseGfxExecuteTask(LumiverseGfxMachine& m, u32 pc,
         break;
       }
       case 0x0e: break;  //G_MW_PERSPNORM: precision hint only
+      case 0x0c: {  //G_MW_POINTS: patch one field of a loaded vertex (Cruis'n
+                    //USA). offset = vertex * 40 + field, the microcode's
+                    //internal vertex stride; the RGBA/ST fields carry the
+                    //same payload as G_MODIFYVTX (dry-run admits only those)
+        const u32 vertexIndex = offset / 40;
+        const u32 field = offset % 40;
+        if(vertexIndex < 32) {
+          auto& vertex = m.verts[vertexIndex];
+          if(field == 0x10) {  //G_MWO_POINT_RGBA
+            vertex.r = (cmd1 >> 24) & 0xff;
+            vertex.g = (cmd1 >> 16) & 0xff;
+            vertex.b = (cmd1 >> 8) & 0xff;
+            vertex.a = (cmd1 >> 0) & 0xff;
+          } else if(field == 0x14) {  //G_MWO_POINT_ST: the value lands in the
+                                      //microcode's internal vertex, i.e. it
+                                      //is the already-scaled S10.5 texcoord
+                                      //(validated against LLE: applying the
+                                      //G_TEXTURE scale again picks the wrong
+                                      //half of Cruis'n USA's flipping logo)
+            vertex.u = (f32)(s16)(cmd1 >> 16) / 32.0f;
+            vertex.v = (f32)(s16)(cmd1 & 0xffff) / 32.0f;
+          } else {
+            lumiverseGfxLogUnimplementedOnce(opcode, cmd0, cmd1);
+          }
+        }
+        break;
+      }
       default:
         lumiverseGfxLogUnimplementedOnce(opcode, cmd0, cmd1);
         break;
@@ -1952,8 +2046,20 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
       break;
     case 0xbc:
       if((cmd0 & 0xff) == 0x06) segments[((cmd0 >> 8) & 0xffff) >> 2 & 0xf] = cmd1 & 0x00ffffff;
-      else if((cmd0 & 0xff) == 0x00 || (cmd0 & 0xff) == 0x0c) {  //MW_MATRIX / MW_POINTS
-        lumiverseGfxLogRejectOnce(2, opcode, cmd0, cmd1, "moveword MATRIX/POINTS");
+      else if((cmd0 & 0xff) == 0x0c) {
+        //G_MW_POINTS (Cruis'n USA: 81% of in-game tasks — round 9): the
+        //pre-G_MODIFYVTX way of patching one word of a loaded vertex. The
+        //offset addresses the microcode's 40-byte internal vertex; the
+        //RGBA (0x10) and ST (0x14) fields map onto the G_MODIFYVTX cases the
+        //executor already has; screen XY/Z (0x18/0x1c) stay unsupported
+        const u32 field = ((cmd0 >> 8) & 0xffff) % 40;
+        if(field != 0x10 && field != 0x14) {
+          lumiverseGfxLogRejectOnce(2, opcode, cmd0, cmd1, "moveword POINTS (non RGBA/ST field)");
+          supported = false;
+        }
+      }
+      else if((cmd0 & 0xff) == 0x00) {  //MW_MATRIX
+        lumiverseGfxLogRejectOnce(2, opcode, cmd0, cmd1, "moveword MATRIX");
         supported = false;
       }
       break;
@@ -2128,6 +2234,25 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
 //entry point (declared in lumiverse-hle.cpp)
 //----------------------------------------------------------------------------
 
+//three-letter game code from the cartridge header (bytes 0x3b-0x3d; the
+//fourth byte is the region) — for microcode images shared between games
+//that must be gated differently (Banjo-Tooie vs THPS2)
+auto lumiverseGfxCartridgeCode() -> string {
+  static const string code = [] {
+    string value;
+    if(cartridge.rom.size < 0x40) return value;
+    for(u32 index = 0x3b; index < 0x3e; index++) value.append((char)cartridge.rom.read<Byte>(index));
+    return value;
+  }();
+  return code;
+}
+
+//env knob that defaults ON: only an explicit "0" turns it off
+auto lumiverseGfxEnvDefaultOn(const char* name) -> bool {
+  const char* value = ::getenv(name);
+  return !value || value[0] != '0';
+}
+
 auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
 #if defined(VULKAN)
   u32 dialect;
@@ -2151,12 +2276,49 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   //LUMIVERSE_ARES_N64_BT_GFX_HLE=1 for further work.
   case LumiverseUcodeF3DEX2NoN208: {
     static const bool optIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_BT_GFX_HLE"); return v && v[0] == '1'; }();
-    if(!optIn) return false;
+    //Tony Hawk's Pro Skater 2 (U) ships the same microcode image but never
+    //issues Rare's 0x08/0x20 (round-9 gate: 0 fallbacks over 4000 steps,
+    //menus + skater model checkpoints identical to LLE), so it is told
+    //apart by the cartridge header's game code (NTQ = THPS2) and stays on
+    //by default; LUMIVERSE_ARES_N64_THPS2_GFX_HLE=0 opts out
+    if(!optIn && !(lumiverseGfxCartridgeCode() == "NTQ" && lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_THPS2_GFX_HLE"))) return false;
     dialect = LumiverseDialectGBI2; break;
   }
   case LumiverseUcodeF3DEX2204H:    dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DEX2206:     dialect = LumiverseDialectGBI2; break;
-  //LumiverseUcodeF3DEX2207 (DK64) deliberately absent — see its declaration
+  //Donkey Kong 64 (U) "F3DEX fifo 2.07": RE-WHITELISTED in round 9. The
+  //August "hang at the DK Rap" was two fifo bugs, not the microcode: (1)
+  //Rare's engine holds DPC FREEZE across the task, and every HLE flush used
+  //to restart the fifo at output_buff, dropping all but the last flush of a
+  //frozen frame (the DK Rap tasks exceed the 160 KB fifo); (2) after a
+  //kick that ended inside an RDP command, paraLLEl's render() dropped the
+  //next full-fifo kick outright (queue never compacted) — the frame's
+  //SyncFull vanished and the game waited for the DP interrupt forever.
+  //Gate: 4000 steps through the DK Rap into the title attract, checkpoints
+  //byte-identical to LLE at 1000/2500/4000; LUMIVERSE_ARES_N64_DK64_GFX_HLE=0
+  //opts out.
+  case LumiverseUcodeF3DEX2207: {
+    if(!lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_DK64_GFX_HLE")) return false;
+    dialect = LumiverseDialectGBI2; break;
+  }
+  //Cruis'n World (U) "RSP Gfx ucode F3DEX fifo 2.04" (resident ucode,
+  //ucode_size 0): round-9 gate — 0 fallbacks over 4000 steps into the first
+  //race, menu/race checkpoints content-identical to LLE, host 135 vs 52
+  //steps/s. LUMIVERSE_ARES_N64_CWORLD_GFX_HLE=0 opts out.
+  case 0xfdeacd35544ff754ull: {
+    if(!lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_CWORLD_GFX_HLE")) return false;
+    dialect = LumiverseDialectGBI2; break;
+  }
+  //San Francisco Rush (U): "RSP Gfx ucode F3DLX.NoN 1.21" — the GBI1
+  //command set (the LX line-drawing variant; SF64's F3DEX.NoN 1.21 image is
+  //its second, already-whitelisted ucode). Round-9 gate: 0/1793 fallbacks
+  //over 4000 steps into the first race, race checkpoints content-identical
+  //to LLE (car/timer phase only), host 120 vs 36 steps/s.
+  //LUMIVERSE_ARES_N64_RUSH_GFX_HLE=0 opts out.
+  case 0x2d3bb1207b5332deull: {
+    if(!lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_RUSH_GFX_HLE")) return false;
+    dialect = LumiverseDialectGBI1; break;
+  }
   case LumiverseUcodeF3DEX2NoN208H: dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DEX2208K:    dialect = LumiverseDialectGBI2; break;
   case LumiverseUcodeF3DEX2208:     dialect = LumiverseDialectGBI2; break;
@@ -2176,6 +2338,14 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
     //so it stays ON. LUMIVERSE_ARES_N64_GE_HLE=0 forces the LLE path for A/B.
     const char* optOut = ::getenv("LUMIVERSE_ARES_N64_GE_HLE");
     if(optOut && optOut[0] == '0') return false;
+    dialect = LumiverseDialectGBI0; geBaked = true; break;
+  }
+  //Perfect Dark (U): bannerless Rare microcode (hash b8c3bdd1902f32f7,
+  //round-9 census) — tried as GoldenEye's Fast3D+baked-RDP dialect behind
+  //LUMIVERSE_ARES_N64_PD_GFX_HLE=1 for the census only
+  case 0xb8c3bdd1902f32f7ull: {
+    static const bool optIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_PD_GFX_HLE"); return v && v[0] == '1'; }();
+    if(!optIn) return false;
     dialect = LumiverseDialectGBI0; geBaked = true; break;
   }
   //Conker's Bad Fur Day (U): "RSP Gfx ucode F3DEXBG.NoN fifo 2.08" — a
@@ -2217,6 +2387,9 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   machine.out.fifo = fifoEnd > fifoStart + 8;
   machine.out.fifoStart = fifoStart;
   machine.out.fifoEnd = fifoEnd;
+  machine.out.fifoPos = fifoStart;
+  machine.out.fifoStarted = false;
+  machine.out.pendingQwords = 0;
   if(machine.out.fifo) {
     rdp.writeWord(0x0c, 0x0001, rsp);  //DPC_STATUS: clear xbus -> RDRAM source
   }
@@ -2229,13 +2402,14 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
 
   if(lumiverseGfxLogLevel() >= 1 && ((tasksExecuted + tasksFallback) & 63) == 1) {
     fprintf(stderr,
-      "[rsp-hle-gfx] tasks=%llu fallback=%llu tris=%llu clipped=%llu rejected=%llu rejects(stack/b0/mw/mvtx/baked/bakedcut)=%llu/%llu/%llu/%llu/%llu/%llu\n",
+      "[rsp-hle-gfx] tasks=%llu fallback=%llu tris=%llu clipped=%llu rejected=%llu rejects(stack/b0/mw/mvtx/baked/bakedcut)=%llu/%llu/%llu/%llu/%llu/%llu fifoWrapsFrozen=%llu\n",
       (unsigned long long)tasksExecuted, (unsigned long long)tasksFallback,
       (unsigned long long)machine.trisEmitted, (unsigned long long)machine.trisClipped,
       (unsigned long long)machine.trisRejected,
       (unsigned long long)lumiverseGfxRejectCounts[0], (unsigned long long)lumiverseGfxRejectCounts[1],
       (unsigned long long)lumiverseGfxRejectCounts[2], (unsigned long long)lumiverseGfxRejectCounts[3],
-      (unsigned long long)lumiverseGfxRejectCounts[4], (unsigned long long)lumiverseGfxRejectCounts[5]);
+      (unsigned long long)lumiverseGfxRejectCounts[4], (unsigned long long)lumiverseGfxRejectCounts[5],
+      (unsigned long long)lumiverseGfxFifoWrapsFrozen);
   }
 
   return ok;
