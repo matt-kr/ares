@@ -12,6 +12,29 @@ auto lumiverseRelaxDPCReadSync() -> int {
 }
 }
 
+//Lumiverse diagnostic (LUMIVERSE_ARES_N64_IO_POLL_LOG=1): count CPU reads of
+//the DPC registers (and SP_STATUS in rsp/io.cpp) and print the histogram with
+//the last value seen every 2^16 reads — shows what a stalled game is polling
+auto lumiverseIOPollLog() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_IO_POLL_LOG"); return v && v[0] == '1'; }();
+  return value;
+}
+u64 lumiverseIOPollCounts[16];
+u32 lumiverseIOPollLast[16];
+u64 lumiverseIOPollTotal = 0;
+auto lumiverseIOPollNote(u32 slot, u32 value) -> void {
+  lumiverseIOPollCounts[slot]++;
+  lumiverseIOPollLast[slot] = value;
+  if((++lumiverseIOPollTotal & 0xffff) == 0) {
+    static const char* names[16] = {"DPC_START","DPC_END","DPC_CURRENT","DPC_STATUS","DPC_CLOCK","DPC_BUSY","DPC_PIPE","DPC_TMEM",
+      "SP_STATUS","SP_DMA_FULL","SP_DMA_BUSY","SP_SEMAPHORE","cpu:DMEM","cpu:IMEM","rsp:SP_STATUS","rsp:SP_other/DPC"};
+    fprintf(stderr, "[io-poll] cpu count=%llu:", (unsigned long long)cpu.scc.count);
+    for(u32 i = 0; i < 16; i++) if(lumiverseIOPollCounts[i]) fprintf(stderr, " %s=%llu(last %08x)", names[i], (unsigned long long)lumiverseIOPollCounts[i], lumiverseIOPollLast[i]);
+    fprintf(stderr, "\n");
+    for(auto& c : lumiverseIOPollCounts) c = 0;
+  }
+}
+
 auto RDP::readWord(u32 address, Thread& thread) -> u32 {
   address = (address & 0x1f) >> 2;
   n32 data;
@@ -77,6 +100,7 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
     if(syncOnRead) cpu.forceSynchronize();
   }
 
+  if(lumiverseIOPollLog()) lumiverseIOPollNote(&thread == &cpu ? (address & 7) : 15, data);
   debugger.ioDPC(Read, address, data);
   return data;
 }
@@ -122,6 +146,14 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
 
   if(address == 3) {
     //DPC_STATUS
+    //Lumiverse diagnostic (LUMIVERSE_ARES_N64_RSP_HLE_DPC_LOG=1): who writes
+    //which status bits (the fifo microcode's freeze/xbus handshake)
+    static int dpcStatusLog = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_DPC_LOG"); return v ? ::atoi(v) : 0; }();
+    if(dpcStatusLog >= 1) {
+      static u32 logged = 0;
+      if(logged++ < 96) fprintf(stderr, "[rdp-dpc] STATUS write %08x origin=%s (freeze=%u source=%u start=%06x end=%06x current=%06x)\n",
+        (u32)data, &thread == &cpu ? "cpu" : "rsp", (u32)command.freeze, (u32)command.source, command.start, command.end, command.current);
+    }
     if(data.bit(0)) command.source = 0;
     if(data.bit(1)) command.source = 1;
     if(data.bit(2)) command.freeze = 0, flushCommands();

@@ -15,7 +15,21 @@ namespace ares::Nintendo64 {
 
 RSP rsp;
 #include "decoder.cpp"
+//Lumiverse diagnostic hook (defined in lumiverse-hle-audio.cpp): records the
+//LLE microcode's DMEM->RDRAM DMA writes while an audio-HLE shadow compare is
+//outstanding, so writes the HLE never issues become visible
+namespace {
+  auto lumiverseAudioNoteLLEWrite(u32 dramAddress, u32 length, u32 dmemAddress) -> void;
+  //reverse-shadow mode (LUMIVERSE_ARES_N64_AUDIO_HLE=3): the HLE output drives
+  //the game and the LLE microcode's buffer writes are diverted into a side
+  //image for comparison; returns the side-image pointer for a diverted DMA
+  //(nullptr = write RDRAM normally)
+  auto lumiverseAudioDivertLLEWrite(u32 dramAddress, u32 length) -> u8*;
+}
 #include "dma.cpp"
+//Lumiverse diagnostic hooks defined in rdp/io.cpp (LUMIVERSE_ARES_N64_IO_POLL_LOG)
+auto lumiverseIOPollLog() -> bool;
+auto lumiverseIOPollNote(u32 slot, u32 value) -> void;
 #include "lumiverse-async-audio.cpp"
 #include "lumiverse-hle.cpp"
 #include "lumiverse-hle-gfx.cpp"
@@ -88,6 +102,29 @@ auto RSP::instruction() -> void {
   } else {
     pipeline.dblIssueCount = 0;
     u32 instruction = imem.read<Word>(ipu.pc);
+    //Lumiverse diagnostic (LUMIVERSE_ARES_N64_RSP_DIAG=1): executed-PC
+    //histogram of the interpreted RSP, printed every 2^24 instructions, to
+    //see whether a resident microcode (Conker's engine never halts the RSP)
+    //spends its time working or spinning in a wait loop
+    static const int rspDiag = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_DIAG"); return v ? ::atoi(v) : 0; }();
+    if(rspDiag) {
+      static u32 histogram[1024];
+      static u64 total = 0;
+      histogram[ipu.pc >> 2 & 1023]++;
+      if((++total & 0xffffff) == 0) {
+        u32 top[12] = {};
+        for(u32 n = 0; n < 12; n++) {
+          u32 best = 0;
+          for(u32 i = 0; i < 1024; i++) if(histogram[i] > histogram[best]) best = i;
+          top[n] = best;
+          fprintf(stderr, "%s%03x=%.1f%%", n ? " " : "[rsp-diag] top PCs: ", best << 2, 100.0 * histogram[best] / (f64)0x1000000);
+          histogram[best] = 0;
+        }
+        fprintf(stderr, " (halted cycles so far %llu, exec cycles %llu)\n",
+          (unsigned long long)profile.haltedCycles, (unsigned long long)profile.cycles);
+        for(auto& h : histogram) h = 0;
+      }
+    }
     instructionPrologue(instruction);
     branch.begin();
     pipeline.begin();

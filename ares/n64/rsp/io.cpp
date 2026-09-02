@@ -1,5 +1,7 @@
 auto RSP::readWord(u32 address, Thread& thread) -> u32 {
   if(address <= 0x0403'ffff) {
+    //Lumiverse diagnostic (LUMIVERSE_ARES_N64_IO_POLL_LOG): CPU reads of DMEM/IMEM
+    if(lumiverseIOPollLog() && &thread == &cpu) lumiverseIOPollNote(address & 0x1000 ? 13 : 12, address & 0x1fff);
     //Lumiverse addition: DMEM/IMEM belongs to the async-audio worker while a
     //task is in flight; block until it completes (emulation thread only)
     if(unlikely(lumiverseAsyncInFlight) && !lumiverseOnRSPWorker()) lumiverseAsyncDrain();
@@ -85,6 +87,22 @@ auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
     if(!lumiverseRelaxIOSync() && !lumiverseOnRSPWorker()) cpu.forceSynchronize();
   }
 
+  if(lumiverseIOPollLog() && &thread != &cpu) {
+    //RSP-origin (cop0) reads: 4=SP_STATUS 5=DMA_FULL 6=DMA_BUSY 7=SEMAPHORE -> slot 14 (status) / 15 (other)
+    lumiverseIOPollNote(address == 4 ? 14 : 15, data);
+  }
+  if(lumiverseIOPollLog() && &thread == &cpu) {
+    //slots 8.. (see rdp/io.cpp): 4=SP_STATUS 5=SP_DMA_FULL 6=SP_DMA_BUSY 7=SP_SEMAPHORE
+    const u32 slot = address == 4 ? 8 : address == 5 ? 9 : address == 6 ? 10 : address == 7 ? 11 : 15;
+    lumiverseIOPollNote(slot, data);
+    //while SP_STATUS reports DMA busy on a halted RSP, say which transfer
+    static u32 busyLogs = 0;
+    if(address == 4 && status.halted && dma.busy.any() && busyLogs++ < 6) {
+      fprintf(stderr, "[io-poll]   halted+dma busy: read=%u write=%u pbus=%03x dram=%06x len=%u count=%u dmaClock=%lld full=%u/%u rspClock=%lld\n",
+        (u32)dma.busy.read, (u32)dma.busy.write, (u32)dma.current.pbusAddress, (u32)dma.current.dramAddress,
+        (u32)dma.current.length, (u32)dma.current.count, (long long)dma.clock, (u32)dma.full.read, (u32)dma.full.write, (long long)Thread::clock);
+    }
+  }
   debugger.ioSCC(Read, address, data);
   return data;
 }

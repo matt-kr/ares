@@ -46,10 +46,20 @@ auto RSP::dmaTransferStep() -> void {
     }
   }
   if(dma.busy.write) {
+    u8* divert = nullptr;
+    if(!dma.current.pbusRegion) {
+      lumiverseAudioNoteLLEWrite(dma.current.dramAddress, dma.current.length + 8, dma.current.pbusAddress);
+      divert = lumiverseAudioDivertLLEWrite(dma.current.dramAddress, dma.current.length + 8);
+    }
     for(u32 i = 0; i <= dma.current.length; i += 8) {
       if(dma.current.pbusRegion) {
         u64 data = imem.read<Dual>(dma.current.pbusAddress);
         rdram.ram.write<Dual>(dma.current.dramAddress, data, RBusDevice::SP_DMA);
+      } else if(divert) {
+        //Lumiverse reverse-shadow: keep the microcode's buffer output out of
+        //RDRAM (the HLE's output is what the game plays); the bytes land in
+        //the side image at the same offsets for the comparison
+        for(u32 b = 0; b < 8; b++) divert[((dma.current.dramAddress + b) & 0x007fffff)] = dmem.read<Byte>(dma.current.pbusAddress + b);
       } else {
         u32 dataLo = dmem.read<Word>(dma.current.pbusAddress + 0);
         u32 dataHi = dmem.read<Word>(dma.current.pbusAddress + 4);
