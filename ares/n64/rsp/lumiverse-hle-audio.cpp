@@ -162,6 +162,19 @@ constexpr u64 LumiverseAudioUcodeSnapU     = 0x7123e4d5f82ae6a5ull;  //Pokemon S
 constexpr u64 LumiverseAudioUcodeDoom64    = 0xd74cbe704463fdd3ull;  //Doom 64 (U)
 constexpr u64 LumiverseAudioUcodeCruisnUSA = 0xecd40fd97f420e51ull;  //Cruis'n USA (U)
 constexpr u64 LumiverseAudioUcodeSmashU    = 0xbbca23e37b0bc136ull;  //Super Smash Bros. (U) + Kirby 64
+//round 11: Yoshi's Story's audio ucode is an ABI2 revision (its alist uses
+//exactly the Zelda command set minus FILTER/DUPLICATE: 01 02 05 08 0a 0b 0c
+//0d 0f 11 12 13 14 15 16). Truncated-task DMEM oracles on our own LLE show
+//ADPCM, DECIMATE, INTERLEAVE, ENVMIX and the buffer moves sample-exact;
+//RESAMPLE differs by the known interpolator approximation (~300 LSB). Shadow
+//over 2049 title/menu tasks: 0 fallbacks, level 1.005, dratio 1.026, every
+//output write corr >= 0.999; WAV vs LLE through world map + level 1-1:
+//envCorr 0.993, level 1.005, dropouts equal. Click counts sit 25% above
+//LLE's, but all of the excess is one noise burst (the level-entry whoosh):
+//the |delta| distribution there is LLE's scaled by 1.2-1.3 at every
+//threshold with the same onset and decay — the resampler's HF excess on a
+//downsampled noise voice (round 8's class), not discontinuities.
+constexpr u64 LumiverseAudioUcodeYoshi     = 0x2b5c40620a4cec16ull;  //Yoshi's Story (U)
 //Rare's engines (round 8 census): Banjo-Kazooie's and Banjo-Tooie's audio
 //ucodes issue the same fixed-0x170-chunk command set as naudio (04/06
 //LOADBUFF/SAVEBUFF with count in cmd0 bits 12-23, 0c MIXER, 03 ENVMIX with
@@ -198,6 +211,7 @@ auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
   if(hash == LumiverseAudioUcodeZeldaMQ)   return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeZeldaOoTU) return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeMajoraU)   return LumiverseAudioDialectABI2;
+  if(hash == LumiverseAudioUcodeYoshi)     return LumiverseAudioDialectABI2;
   if(hash == LumiverseAudioUcodeSM64WR)    return LumiverseAudioDialectABI1;
   if(hash == LumiverseAudioUcodeSnapU)     return LumiverseAudioDialectABI1;
   if(hash == LumiverseAudioUcodeDoom64)    return LumiverseAudioDialectABI1;
