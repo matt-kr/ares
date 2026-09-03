@@ -125,8 +125,12 @@ enum : u32 { LumiverseDialectGBI1 = 0, LumiverseDialectGBI2 = 1, LumiverseDialec
 //graphics task of the game (round-9 census: 2557 of 2557)
 constexpr u64 LumiverseUcodeS2DEX106 = 0x0de2cc6b5e6b2759ull;
 
-//GBI0 G_VTX encoding variants (n64js gbi0.js subclasses)
-enum : u32 { LumiverseGBI0VertexStandard = 0, LumiverseGBI0VertexWaveRace = 1, LumiverseGBI0VertexSOTE = 2 };
+//GBI0 G_VTX encoding variants (n64js gbi0.js subclasses). PD (round 12):
+//Perfect Dark's bannerless Rare microcode — the standard G_VTX word, but a
+//12-byte vertex (x y z s16, pad, colour index byte, s t 11.5) whose colour
+//(or packed normal + alpha under lighting) is fetched from a colour table
+//set by the custom op 0x07 (n64js gbi0.js GBI0PD: SetVertexColorIndex)
+enum : u32 { LumiverseGBI0VertexStandard = 0, LumiverseGBI0VertexWaveRace = 1, LumiverseGBI0VertexSOTE = 2, LumiverseGBI0VertexPD = 3 };
 
 //clip codes (internal convention; only used self-consistently)
 constexpr u8 LumiverseClipNX   = 0x01;  //x < -w
@@ -371,6 +375,7 @@ struct LumiverseGfxMachine {
   //GBI1 = 2, GBI0 standard/GE = 10, GBI0 WaveRace/SOTE = 5
   u32 triStride = 2;
   u32 gbi0Vertex = LumiverseGBI0VertexStandard;  //G_VTX encoding variant
+  u32 pdColorAddr = 0;  //PD op 0x07: RDRAM colour table for the 12-byte vertices
 
   //output
   LumiverseGfxOut out;
@@ -421,7 +426,7 @@ auto lumiverseGfxSetDialect(LumiverseGfxMachine& m, u32 dialect) -> void {
     m.cullBackMask = LumiverseGeom1CullBack;
     m.shadeMask = LumiverseGeomShade;
     if(dialect == LumiverseDialectGBI0) {
-      m.triStride = m.gbi0Vertex == LumiverseGBI0VertexStandard ? 10 : 5;
+      m.triStride = (m.gbi0Vertex == LumiverseGBI0VertexStandard || m.gbi0Vertex == LumiverseGBI0VertexPD) ? 10 : 5;
     } else {
       m.triStride = 2;
     }
@@ -935,9 +940,13 @@ auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address
   const f32 scaleS = m.texScaleS / 32.0f;
   const f32 scaleT = m.texScaleT / 32.0f;
 
+  const bool pd = m.gbi0Vertex == LumiverseGBI0VertexPD;
   for(u32 index = 0; index < n; index++) {
-    const u32 base = address + index * 16;
+    const u32 base = address + index * (pd ? 12 : 16);
     auto& vertex = m.verts[v0 + index];
+    //colour/normal bytes: inline at +12 (standard), or in the op-07 colour
+    //table at the vertex's index byte (+7) for Perfect Dark
+    const u32 colorBase = pd ? m.pdColorAddr + lumiverseGfxByte(base + 7) : base + 12;
 
     const f32 x = lumiverseGfxShort(base + 0);
     const f32 y = lumiverseGfxShort(base + 2);
@@ -952,9 +961,9 @@ auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address
     vertex.clip = lumiverseGfxCalcClipFlags(vertex.x, vertex.y, vertex.z, vertex.w);
 
     if(lighting) {
-      const f32 nxRaw = lumiverseGfxSByte(base + 12);
-      const f32 nyRaw = lumiverseGfxSByte(base + 13);
-      const f32 nzRaw = lumiverseGfxSByte(base + 14);
+      const f32 nxRaw = lumiverseGfxSByte(colorBase + 0);
+      const f32 nyRaw = lumiverseGfxSByte(colorBase + 1);
+      const f32 nzRaw = lumiverseGfxSByte(colorBase + 2);
       //transform normal by modelview 3x3 (row-vector), then normalize
       f32 nx = nxRaw * mv[0] + nyRaw * mv[4] + nzRaw * mv[8];
       f32 ny = nxRaw * mv[1] + nyRaw * mv[5] + nzRaw * mv[9];
@@ -965,7 +974,7 @@ auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address
         nx *= invLength; ny *= invLength; nz *= invLength;
       }
       lumiverseGfxCalculateLighting(m, nx, ny, nz, &vertex.r, &vertex.g, &vertex.b);
-      vertex.a = lumiverseGfxByte(base + 15);
+      vertex.a = lumiverseGfxByte(colorBase + 3);
       if(texgen) {
         //n64js projected_vertex.js texgen approximations, scaled to the
         //render tile's size (SetTileSize tracked per tile)
@@ -984,10 +993,10 @@ auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address
         vertex.v = v01 * height;
       }
     } else {
-      vertex.r = lumiverseGfxByte(base + 12);
-      vertex.g = lumiverseGfxByte(base + 13);
-      vertex.b = lumiverseGfxByte(base + 14);
-      vertex.a = lumiverseGfxByte(base + 15);
+      vertex.r = lumiverseGfxByte(colorBase + 0);
+      vertex.g = lumiverseGfxByte(colorBase + 1);
+      vertex.b = lumiverseGfxByte(colorBase + 2);
+      vertex.a = lumiverseGfxByte(colorBase + 3);
     }
   }
 }
@@ -1901,6 +1910,15 @@ auto lumiverseGfxExecuteTask(LumiverseGfxMachine& m, u32 pc,
       lumiverseGfxLoadUcode(m, cmd1);
       break;
 
+    case 0x07:  //Perfect Dark: colour table for the following G_VTX (n64js
+                //GBI0PD SetVertexColorIndex); cmd0's fields are ignored
+      if(m.dialect == LumiverseDialectGBI0 && m.gbi0Vertex == LumiverseGBI0VertexPD) {
+        m.pdColorAddr = lumiverseGfxSegmentAddress(m, cmd1);
+      } else {
+        lumiverseGfxLogUnimplementedOnce(opcode, cmd0, cmd1);
+      }
+      break;
+
     case 0x01: {  //G_MTX
       const u32 flags = (cmd0 >> 16) & 0xff;
       const u32 address = lumiverseGfxSegmentAddress(m, cmd1);
@@ -2781,7 +2799,7 @@ auto lumiverseGfxS2DEXAdmit(u8 opcode, u32 cmd0, u32 cmd1, bool gbi2, u32 struct
 
 //dry-run walker shared by GBI1 and GBI0 (Fast3D): flow control + segment
 //table only; any unsupported opcode fails the whole task over to LLE
-auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = LumiverseDialectGBI1, bool bakedRDP = false) -> bool {
+auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = LumiverseDialectGBI1, bool bakedRDP = false, u32 gbi0Vertex = LumiverseGBI0VertexStandard) -> bool {
   u32 segments[16] = {};
   u32 stack[32];
   u32 stackDepth = 0;
@@ -2866,6 +2884,9 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
         supported = false;
         break;
       }
+    } else
+    if(opcode == 0x07 && dialect == LumiverseDialectGBI0 && gbi0Vertex == LumiverseGBI0VertexPD) {
+      continue;  //PD colour-table pointer (no flow-control effect)
     } else
     if(!lumiverseGfxOpcodeSupported(opcode)) {
       static bool logged[256];
@@ -3404,12 +3425,18 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
     dialect = LumiverseDialectGBI0; geBaked = true; break;
   }
   //Perfect Dark (U): bannerless Rare microcode (hash b8c3bdd1902f32f7,
-  //round-9 census) — tried as GoldenEye's Fast3D+baked-RDP dialect behind
-  //LUMIVERSE_ARES_N64_PD_GFX_HLE=1 for the census only
+  //round-9 census). Round 12: GoldenEye's Fast3D dialect (TRI4, baked-RDP
+  //runs admitted) plus the PD vertex variant — custom op 0x07 = colour
+  //table pointer, 12-byte vertices indexing it (our DL dumps: every VTX is
+  //preceded by an 07 whose cmd1 sits 0x150 past the vertex block, VTX
+  //lengths are n*12; n64js gbi0.js GBI0PD documents the same layout).
+  //Gate: 0 fallbacks over 4225 tasks (7000 steps: logos, intro cutscene,
+  //agent menus, Carrington Institute walk-through); checkpoints identical
+  //or camera/menu-animation phase against the LLE frames. Host 152-160
+  //steps/s vs 91-94 with the LLE RSP. LUMIVERSE_ARES_N64_PD_GFX_HLE=0 opts out.
   case 0xb8c3bdd1902f32f7ull: {
-    static const bool optIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_PD_GFX_HLE"); return v && v[0] == '1'; }();
-    if(!optIn) return false;
-    dialect = LumiverseDialectGBI0; geBaked = true; break;
+    if(!lumiverseGfxEnvDefaultOn("LUMIVERSE_ARES_N64_PD_GFX_HLE")) return false;
+    dialect = LumiverseDialectGBI0; gbi0Vertex = LumiverseGBI0VertexPD; geBaked = true; break;
   }
   //Conker's Bad Fur Day (U): "RSP Gfx ucode F3DEXBG.NoN fifo 2.08" — a
   //custom F3DEX2 build (round 8 census; the engine keeps the ucode resident
@@ -3434,7 +3461,7 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
 
   const bool walkable = dialect == LumiverseDialectGBI2
     ? lumiverseGfxDryRunGBI2(dataPtr, census)
-    : lumiverseGfxDryRun(dataPtr, census, dialect, geBaked);
+    : lumiverseGfxDryRun(dataPtr, census, dialect, geBaked, gbi0Vertex);
   if(!walkable) {
     tasksFallback++;
     return false;
