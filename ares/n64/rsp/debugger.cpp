@@ -22,6 +22,10 @@ auto RSP::Debugger::load(Node::Object parent) -> void {
   tracer.instruction = parent->append<Node::Debugger::Tracer::Instruction>("Instruction", "RSP");
   tracer.instruction->setAddressBits(12, 2);
   tracer.instruction->setDepth(0);
+  //Lumiverse addition (round 12): RSP_FAST_NOTRACE bookkeeping (rsp.hpp)
+  tracer.instruction->setToggle([&] {
+    rsp.lumiverseFast.traceArmed = tracer.instruction->enabled() || tracer.instructionCountdown != 0;
+  });
 
   tracer.emux = parent->append<Node::Debugger::Tracer::Notification>("EMUX", "RSP");
   tracer.emux->setAutoLineBreak(false);

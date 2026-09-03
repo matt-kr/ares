@@ -260,6 +260,34 @@ struct RSP : Thread, Memory::RCP<RSP> {
     }
   } pipeline;
 
+  //Lumiverse addition (round 12): LUMIVERSE_ARES_N64_RSP_FAST=1 (default off)
+  //enables interpreter-path speedups for the LLE RSP (every title whose
+  //graphics or audio microcode is not HLE'd pays these per instruction).
+  //Configuration is read once in power() (lumiverseLoadFastConfig). Sub-knobs,
+  //honored only while RSP_FAST=1:
+  //  LUMIVERSE_ARES_N64_RSP_FAST_NOTRACE (default 1, 0 = off): skip the
+  //    per-instruction debugger.instruction() call (tracer enabled() through
+  //    the node shared_ptr + EMUX countdown) unless the instruction tracer is
+  //    armed; the tracer's toggle hook (debugger.cpp) and XTRACESTART
+  //    (emux.cpp) keep traceArmed current, so tracer-on behavior is identical.
+  //  LUMIVERSE_ARES_N64_RSP_FAST_DECODE (default 1, 0 = off): cache the
+  //    OpInfo decode per IMEM word (decoderEXECUTE is a pure function of the
+  //    instruction word; the entry is re-decoded whenever the word at that
+  //    IMEM address changed, so IMEM DMA/CPU writes need no invalidation).
+  struct LumiverseFast {
+    bool enabled = false;
+    bool noTrace = false;
+    bool decodeCache = false;
+    bool traceArmed = false;
+    struct Entry { u32 word; OpInfo info; } decode[1024];
+  } lumiverseFast;
+  auto lumiverseLoadFastConfig() -> void;
+  auto lumiverseDecode(u32 pc, u32 word) -> const OpInfo& {
+    auto& e = lumiverseFast.decode[pc >> 2 & 1023];
+    if(e.word != word) { e.word = word; e.info = decoderEXECUTE(word); }
+    return e.info;
+  }
+
   //dma.cpp
   auto dmaQueue(u32 clocks, Thread& thread) -> void;
   auto dmaStep(u32 clocks) -> void;

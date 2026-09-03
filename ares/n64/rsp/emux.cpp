@@ -44,6 +44,7 @@ auto RSP::XTRACESTART(u32 code) -> void {
   if(!debugger.tracer.instruction->enabled()) debugger.tracer.instruction->setEnabled(true);
   debugger.tracer.instructionCountdown = code;
   debugger.tracer.traceStartCycle = pipeline.clocksTotal / 3;
+  lumiverseFast.traceArmed = true;  //Lumiverse (round 12): RSP_FAST_NOTRACE
 }
 
 auto RSP::XTRACESTOP() -> void {

@@ -35,6 +35,17 @@ auto CPU::unload() -> void {
 }
 
 auto CPU::main() -> void {
+  //Lumiverse addition (round 12, under CPU_FAST_NOTRACE): GDB::server.reportPC
+  //is a non-inlined per-instruction call that returns true immediately while
+  //no client is attached (2% of the emulation thread in the Perfect Dark
+  //profile); the inline hasClient() test keeps its behavior once a client
+  //connects (every reportPC of the stock loop is still made then).
+  if(lumiverseFast.noTrace) {
+    while(!vi.refreshed) {
+      if(unlikely(GDB::server.hasClient()) && !GDB::server.reportPC(ipu.pc & 0xFFFFFFFF)) break;
+      if(instruction()) synchronize();
+    }
+  } else
   while(!vi.refreshed && GDB::server.reportPC(ipu.pc & 0xFFFFFFFF)) {
     if(instruction()) synchronize();
   }

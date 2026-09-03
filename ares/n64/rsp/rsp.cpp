@@ -129,13 +129,17 @@ auto RSP::instruction() -> void {
     instructionPrologue(instruction);
     branch.begin();
     pipeline.begin();
-    OpInfo op0 = decoderEXECUTE(instruction);
+    //Lumiverse addition (round 12): RSP_FAST_DECODE — OpInfo from the
+    //per-IMEM-word cache instead of re-decoding every execution (the decode
+    //was ~23% of the interpreted RSP's time in the round-10/12 profiles)
+    const bool decodeCache = lumiverseFast.decodeCache;
+    OpInfo op0 = decodeCache ? lumiverseDecode(ipu.pc, instruction) : decoderEXECUTE(instruction);
     pipeline.issue(op0);
     interpreterEXECUTE();
 
     if(!pipeline.singleIssue && !op0.branch()) {
       u32 instruction = imem.read<Word>(ipu.pc + 4);
-      OpInfo op1 = decoderEXECUTE(instruction);
+      OpInfo op1 = decodeCache ? lumiverseDecode(ipu.pc + 4, instruction) : decoderEXECUTE(instruction);
 
       if(canDualIssue(op0, op1)) {
         pipeline.dblIssueCount = 1;
@@ -161,7 +165,28 @@ auto RSP::instruction() -> void {
 auto RSP::instructionPrologue(u32 instruction) -> void {
   pipeline.address = ipu.pc;
   pipeline.instruction = instruction;
-  debugger.instruction();
+  //Lumiverse addition (round 12): RSP_FAST_NOTRACE — the tracer call only
+  //when armed (traceArmed is kept by the tracer toggle hook and XTRACESTART)
+  if(!lumiverseFast.noTrace || unlikely(lumiverseFast.traceArmed)) debugger.instruction();
+}
+
+//Lumiverse addition (round 12): read the RSP_FAST configuration (see rsp.hpp).
+//Called from power(); the app sets its env knobs before the core is created.
+auto RSP::lumiverseLoadFastConfig() -> void {
+  auto& f = lumiverseFast;
+  const bool traceArmed = f.traceArmed;
+  f = {};
+  f.traceArmed = traceArmed;
+  const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_FAST");
+  f.enabled = v && *v == '1';
+  if(f.enabled) {
+    const char* t = ::getenv("LUMIVERSE_ARES_N64_RSP_FAST_NOTRACE");
+    f.noTrace = !t || *t != '0';
+    const char* d = ::getenv("LUMIVERSE_ARES_N64_RSP_FAST_DECODE");
+    f.decodeCache = !d || *d != '0';
+  }
+  //keep the invariant info == decoderEXECUTE(word) for every entry
+  for(auto& e : f.decode) { e.word = 0; e.info = decoderEXECUTE(0); }
 }
 
 auto RSP::instructionBranchEpilogue() -> s32 {
@@ -202,6 +227,7 @@ auto RSP::power(bool reset) -> void {
   pipeline = {};
   profile = {};
   dma = {};
+  lumiverseLoadFastConfig();
   status.semaphore = 0;
   status.halted = 1;
   status.broken = 0;
