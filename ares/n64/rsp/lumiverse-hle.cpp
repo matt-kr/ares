@@ -121,6 +121,13 @@ auto lumiverseHashRDRAM(u32 address, u32 length) -> u64 {
   return hash;
 }
 
+//self-modifying audio ucodes (round 11 census over 31 images each, own
+//emulator, LUMIVERSE_ARES_N64_RSP_HLE_UCODE_DUMP): the words that change
+//between dispatches all sit past 0xc6b of the 4 KiB text (Paper Mario
+//0xc6b, MK64 0xd5d, Pilotwings 0xe23, GoldenEye 0xe33, Cruis'n World 0xe43,
+//SOTE 0xea6), so the first 3 KiB identify the family across every image
+constexpr u32 LumiverseAudioUcodePrefixLength = 0xc00;
+
 //scans the ucode data segment for the embedded ASCII banner, e.g.
 //"RSP Gfx ucode F3DEX.NoN fifo 1.22" / "RSP SW Version ..."
 auto lumiverseFindBanner(u32 dataAddress, u32 scanLength, char* out, u32 outSize) -> bool {
@@ -244,10 +251,29 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
       if(scan[0] == 'G' && scan[1] == 'f' && scan[2] == 'x') { signature->bannerIsGfx = true; break; }
     }
     signature->asyncExcluded = lumiverseAsyncAudioHashExcluded(ucodeHash);
+    const u64 prefixHash = taskType == 2 && hashLength >= LumiverseAudioUcodePrefixLength
+      ? lumiverseHashRDRAM(ucode, LumiverseAudioUcodePrefixLength) : 0;
     fprintf(stderr,
-      "[rsp-hle] new task: type=%u hash=%016llx ucode=%06x/%u data=%06x/%u dl=%06x/%u banner=\"%s\"%s\n",
-      taskType, (unsigned long long)ucodeHash, ucode, ucodeSize, ucodeData, ucodeDataSize,
+      "[rsp-hle] new task: type=%u hash=%016llx prefix=%016llx ucode=%06x/%u data=%06x/%u dl=%06x/%u banner=\"%s\"%s\n",
+      taskType, (unsigned long long)ucodeHash, (unsigned long long)prefixHash, ucode, ucodeSize, ucodeData, ucodeDataSize,
       dataPtr, dataSize, banner, signature->asyncExcluded ? " [async-audio excluded]" : "");
+    //LUMIVERSE_ARES_N64_RSP_HLE_UCODE_DUMP=<path>: the ucode text of every
+    //new signature as hex (round 11: locating the patched words of the
+    //self-modifying audio ucodes — MK64, Paper Mario, GoldenEye, Pilotwings,
+    //SOTE, Cruis'n World — so a stable prefix can identify the family)
+    static FILE* ucodeDump = [] () -> FILE* {
+      const char* path = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_UCODE_DUMP");
+      return path && path[0] ? fopen(path, "w") : nullptr;
+    }();
+    if(ucodeDump) {
+      fprintf(ucodeDump, "ucode type=%u hash=%016llx at=%06x size=%u\n", taskType, (unsigned long long)ucodeHash, ucode, hashLength);
+      for(u32 offset = 0; offset < hashLength; offset += 16) {
+        fprintf(ucodeDump, "%04x:", offset);
+        for(u32 b = 0; b < 16 && offset + b < hashLength; b++) fprintf(ucodeDump, " %02x", lumiverseRDRAMByte(ucode + offset + b));
+        fprintf(ucodeDump, "\n");
+      }
+      fflush(ucodeDump);
+    }
   }
   if(signature) signature->dispatchCount++;
 

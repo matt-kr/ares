@@ -222,6 +222,46 @@ auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
   return -1;
 }
 
+//self-modifying audio ucodes (round 11): the full-image hash changes every
+//dispatch (27-31 images per run), so these families are identified by the
+//FNV-1a hash of the first LumiverseAudioUcodePrefixLength bytes instead —
+//see the census note in lumiverse-hle.cpp. Consulted only when the full
+//hash is not whitelisted. LUMIVERSE_ARES_N64_AUDIO_HLE_TRY matches either.
+//round-11 census (31 images each -> one prefix hash each):
+//  Mario Kart 64      9cf990efdedb3b1e  ABI2 shape (Zelda's command set with
+//                     the ABI1-style SEGMENT(0) opener); shadow 2049 tasks /
+//                     0 fallbacks, level 1.003, dratio 1.002; WAV vs LLE
+//                     (title -> menus -> race): clicks 0/0, dropouts 3/3,
+//                     envCorr 0.92/0.93, level 1.003 -> SHIPPED
+//  Pilotwings 64 / Shadows of the Empire / Cruis'n World share
+//                     1d095e498bf7f786  ABI1 (Cruis'n USA's executor); shadow
+//                     PW 2049/0 level 1.003 dratio 1.020, CW 2049/0 level
+//                     1.010 dratio 1.108, SOTE 1 task (its title has no
+//                     audio tasks); WAV: CW clicks 0/0 envCorr 0.98 level
+//                     0.99; PW clicks 0/0 level 1.003 but envCorr 0.86 —
+//                     its intro flight diverges between the runs (frames 12%
+//                     px apart from step 500), aligned windows correlate
+//                     0.93-0.97 -> SHIPPED as a family
+//  GoldenEye          ea212b6bce94100c  ABI1; shadow 1025/0 level 0.997
+//                     dratio 1.03, but WAV clicks 217/254 vs 70/98 with a
+//                     1.5-1.8x >8 kHz excess in the theme's loud bars ->
+//                     NOT shipped (opt-in LUMIVERSE_ARES_N64_AUDIO_HLE_GE=1)
+//  Paper Mario        4ea075cb3bd248f6  a different ABI1 variant: alist at
+//                     DMEM 0x2c0, buffers addressed from a base, MIXER
+//                     count implicit -> not attempted
+constexpr u64 LumiverseAudioPrefixMK64   = 0x9cf990efdedb3b1eull;
+constexpr u64 LumiverseAudioPrefixPWSOTE = 0x1d095e498bf7f786ull;
+constexpr u64 LumiverseAudioPrefixGE     = 0xea212b6bce94100cull;
+
+auto lumiverseAudioDialectForPrefixHash(u64 prefixHash) -> s32 {
+  if(const s32 tried = lumiverseAudioTryDialect(prefixHash); tried >= 0) return tried;
+  if(prefixHash == LumiverseAudioPrefixMK64)   return LumiverseAudioDialectABI2;
+  if(prefixHash == LumiverseAudioPrefixPWSOTE) return LumiverseAudioDialectABI1;
+  static const bool geOptIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_GE"); return v && v[0] == '1'; }();
+  if(prefixHash == LumiverseAudioPrefixGE && geOptIn) return LumiverseAudioDialectABI1;
+  return -1;
+}
+
 //----------------------------------------------------------------------------
 //RDRAM write redirection (shadow mode buffers writes instead of applying)
 //----------------------------------------------------------------------------
@@ -514,6 +554,10 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
     }
     case 0x07: {  //ABI1: SEGMENT; ABI2 Zeldas: FILTER
       if(abi1) break;
+      //Mario Kart 64's ABI2 revision (round 11): every task opens with
+      //`07000000 00000000` — the ABI1-style SEGMENT(0) with nothing to set;
+      //no DMEM or RDRAM effect (truncated-task oracle). Accept as a no-op.
+      if((w0 & 0x00ffffff) == 0 && w1 == 0) break;
       if(flags == 2) {
         const u32 count = w0 & 0xffff;
         if(!count || (count & 1) || count > 0x1000) return reject(offset, w0, w1, "filter set count");
@@ -1343,6 +1387,7 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
         m.segments[w1 >> 24 & 0xf] = w1 & 0x00ffffff;
         break;
       }
+      if((w0 & 0x00ffffff) == 0 && w1 == 0) break;  //MK64: SEGMENT(0) no-op
       if(flags == 2) {
         m.filterLength = w0 & 0xffff;
         m.filterCoefAddr = address;
@@ -1972,7 +2017,15 @@ auto lumiverseAudioShadowSettle() -> void {
 auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   const int level = lumiverseAudioHLELevel();
   if(level < 1) return false;
-  const s32 dialect = lumiverseAudioDialectForHash(ucodeHash);
+  s32 dialect = lumiverseAudioDialectForHash(ucodeHash);
+  if(dialect < 0) {
+    //self-modifying ucode? identify the family by its stable prefix
+    const u32 ucode = task[4] & 0x00ffffff;
+    const u32 ucodeSize = task[5];
+    if(ucode && (ucodeSize == 0 || ucodeSize >= LumiverseAudioUcodePrefixLength)) {
+      dialect = lumiverseAudioDialectForPrefixHash(lumiverseHashRDRAM(ucode, LumiverseAudioUcodePrefixLength));
+    }
+  }
   if(dialect < 0) return false;
 
   const u32 dataPtr = task[12] & 0x00ffffff;
