@@ -150,6 +150,11 @@ struct LumiverseGfxOut {
   u32 words[Capacity];
   u32 count = 0;
   bool failed = false;
+  //last SETSCISSOR that went through (10.2, xl/yl exclusive): RDP state that
+  //persists across tasks; S2DEX clips its backgrounds against it (round 11,
+  //Kirby 64's BG_COPY HUD: frame x 7..327 drawn as 10..309.75 with S = 3
+  //under a (10,10)-(310,230) scissor)
+  u32 scissorXH = 0, scissorYH = 0, scissorXL = 0xfff, scissorYL = 0xfff;
   //fifo mode: instead of queueHLECommands, write the stream into the game's
   //fifo buffer in RDRAM and kick the DPC registers exactly like the fifo
   //microcode does. Some games (Banjo-Tooie) poll DPC progress rather than
@@ -264,6 +269,10 @@ auto lumiverseGfxEmit(LumiverseGfxOut& out, u32 word) -> void {
 }
 
 auto lumiverseGfxEmit2(LumiverseGfxOut& out, u32 hi, u32 lo) -> void {
+  if((hi >> 24 & 0x3f) == 0x2d) {  //SETSCISSOR: track for S2DEX background clipping
+    out.scissorXH = hi >> 12 & 0xfff; out.scissorYH = hi & 0xfff;
+    out.scissorXL = lo >> 12 & 0xfff; out.scissorYL = lo & 0xfff;
+  }
   if(out.pendingQwords == 0) out.pendingQwords = lumiverseGfxRDPCommandQwords[hi >> 24 & 0x3f];
   lumiverseGfxEmit(out, hi);
   lumiverseGfxEmit(out, lo);
@@ -1512,6 +1521,204 @@ auto lumiverseGfxS2DEXDrawBackground(LumiverseGfxMachine& m, u32 at) -> void {
   }
 }
 
+//4-bit BG_1CYC (I4 / CI4), derived from Kirby 64's LLE streams (round 11:
+//I4 208x32 and 208x16 title/pause plates, CI4 64x77 file-select panel,
+//CI4 32x20 / 32x32 HUD icons). The microcode treats the row as RGBA16
+//texel pairs and loads ONE EXTRA texel per row (LOADTILE lrs = width<<2, not
+//(width-1)<<2) with the tile line one qword wider than the row; strips draw
+//`count` rows from `count+1` loaded lines; the last strip draws one row
+//fewer than remains (the frame's last row and column are never drawn:
+//TEXRECT xl = frameX+frameW-1, yl = frameY+frameH-1) and, before its main
+//load, loads the wrapped image row 0 as the guard line at TMEM row count+1
+//— as one line when that TMEM address (qwords) is even, otherwise as two
+//lines from image row -1 one TMEM row earlier (LLE: CI4 77 rows = strips of
+//50 + 26 with the guard pair at tmem 0x82; I4 32 rows = one strip of 31
+//with the guard line at 0x1c0). Unscrolled, unflipped, unscaled only.
+auto lumiverseGfxS2DEXBackground4BitSupported(u32 at) -> bool {
+  const u32 imageX = lumiverseGfxHalf(at + 0), imageY = lumiverseGfxHalf(at + 8);
+  const u32 imageW = lumiverseGfxHalf(at + 2) >> 2, imageH = lumiverseGfxHalf(at + 10) >> 2;
+  const u32 frameW = lumiverseGfxHalf(at + 6) >> 2, frameH = lumiverseGfxHalf(at + 14) >> 2;
+  const u32 imageLoad = lumiverseGfxHalf(at + 20);
+  const u32 imageFmt = lumiverseGfxByte(at + 22) & 7;
+  const u32 imageSiz = lumiverseGfxByte(at + 23) & 3;
+  const u32 imageFlip = lumiverseGfxHalf(at + 26);
+  const u32 scaleW = lumiverseGfxHalf(at + 28), scaleH = lumiverseGfxHalf(at + 30);
+  //4-bit images always; 8/16-bit ones only when the frame is narrower than
+  //the image (Kirby's 300-wide window on a 304-wide CI8 panel: LLE uses the
+  //same +1-texel / line+1 / wrapped-guard form there, while a frame that
+  //spans the whole image width keeps the round-10 form — validated
+  //byte-identical on Kirby's 320x240 boot backgrounds)
+  if(imageSiz == 0) { if(imageFmt != 2 && imageFmt != 4) return false; }
+  else if(imageSiz == 1 || imageSiz == 2) { if(frameW >= imageW) return false; if(imageFmt != 2 && imageFmt != 0 && imageFmt != 4) return false; }
+  else return false;
+  if(imageX || imageY || imageFlip) return false;
+  if(scaleW != 0x400 || scaleH != 0x400) return false;
+  if(imageLoad != 0xfff4) return false;
+  if(!imageW || !imageH || !frameW || !frameH || (imageSiz == 0 && (imageW & 1))) return false;
+  if(frameW > imageW || frameH > imageH || imageH < 2) return false;
+  const u32 rowBytes = imageSiz == 0 ? imageW / 2 : imageSiz == 1 ? imageW : imageW * 2;
+  const u32 line = (rowBytes + 7) / 8 + 1;
+  if(line * 2 + 1 > (imageFmt == 2 ? 256u : 512u)) return false;
+  return true;
+}
+
+auto lumiverseGfxS2DEXDrawBackground4Bit(LumiverseGfxMachine& m, u32 at) -> void {
+  const u32 imageW = lumiverseGfxHalf(at + 2) >> 2;
+  const s32 frameX = (s32)lumiverseGfxShort(at + 4) & ~3;
+  const u32 frameW = lumiverseGfxHalf(at + 6) >> 2;
+  const u32 imageH = lumiverseGfxHalf(at + 10) >> 2;
+  const s32 frameY = (s32)lumiverseGfxShort(at + 12) & ~3;
+  const u32 frameH = lumiverseGfxHalf(at + 14) >> 2;
+  const u32 imagePtr = lumiverseGfxSegmentAddress(m, lumiverseGfxWord(at + 16));
+  const u32 imageFmt = lumiverseGfxByte(at + 22) & 7;
+  const u32 imageSiz = lumiverseGfxByte(at + 23) & 3;
+  const u32 imagePal = lumiverseGfxHalf(at + 24) & 0xf;
+
+  u32 otherModeH = m.otherModeH;
+  if(imageFmt == 2) { if((otherModeH & 0xc000) == 0) otherModeH |= 0x8000; }
+  else otherModeH &= ~0xc000u;
+  if(otherModeH != m.otherModeH) { m.otherModeH = otherModeH; m.otherModeDirty = true; }
+  lumiverseGfxEmitOtherMode(m);
+
+  const u32 rowBytes = imageSiz == 0 ? imageW / 2 : imageSiz == 1 ? imageW : imageW * 2;
+  const u32 qwords = (rowBytes + 7) / 8;
+  const u32 line = qwords + 1;
+  const u32 loadWidth = qwords * 4;                 //RGBA16 texels per row
+  const u32 rowsPerStrip = (imageFmt == 2 ? 256 : 512) / line - 1;
+  const u32 loadTile = 0xf5000000 | 0x10 << 16 | (line & 0x1ff) << 9;
+  const u32 drawTile = 0xf5000000 | (imageFmt << 5 | imageSiz << 3) << 16 | (line & 0x1ff) << 9;
+  const u32 timg = 0xfd000000 | 0x10 << 16 | ((loadWidth - 1) & 0xfff);
+  lumiverseGfxEmit2(m.out, loadTile, 0x07000000);
+  lumiverseGfxEmit2(m.out, drawTile, imagePal << 20 | 0x0007c1f0);
+  lumiverseGfxEmit2(m.out, 0xf2000000, 0);
+  //the image's own last column and row are never drawn (LLE: 208-wide
+  //frame of a 208-wide image ends at x+207; a 20-wide frame of a 32-wide
+  //image at x+20), so the drawn extent is the frame clipped to imageW-1 /
+  //imageH-1
+  const u32 drawW = frameW < imageW - 1 ? frameW : imageW - 1;
+  const u32 xh = (u32)frameX & 0xfff, xl = (u32)(frameX + (s32)drawW * 4) & 0xfff;
+  const u32 lrs = (loadWidth << 2) & 0xfff;
+  u32 remaining = frameH < imageH - 1 ? frameH : imageH - 1, row = 0;
+  s32 y = frameY;
+  while(remaining > 0) {
+    const u32 count = remaining < rowsPerStrip ? remaining : rowsPerStrip;
+    //the strip loads count+1 lines; when that reaches the image's end the
+    //microcode first loads the wrapped row 0 as the line after them
+    if(row + count + 1 >= imageH) {
+      //wrapped guard line (image row 0) at TMEM row count+1
+      const u32 guardRow = count + 1;
+      if(((guardRow * line) & 1) == 0) {
+        lumiverseGfxEmit2(m.out, loadTile | ((guardRow * line) & 0x1ff), 0x07000000);
+        lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+        lumiverseGfxEmit2(m.out, timg, imagePtr);
+        lumiverseGfxEmit2(m.out, 0xf4000000, 0x07000000 | lrs << 12 | 3);
+      } else {
+        lumiverseGfxEmit2(m.out, loadTile | (((guardRow - 1) * line) & 0x1ff), 0x07000000);
+        lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+        lumiverseGfxEmit2(m.out, timg, imagePtr - rowBytes);
+        lumiverseGfxEmit2(m.out, 0xf4000000, 0x07000000 | lrs << 12 | 7);
+      }
+      lumiverseGfxEmit2(m.out, loadTile, 0x07000000);
+    }
+    lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+    lumiverseGfxEmit2(m.out, timg, imagePtr + row * rowBytes);
+    lumiverseGfxEmit2(m.out, 0xf4000000, 0x07000000 | lrs << 12 | ((count << 2) | 3));
+    lumiverseGfxEmit2(m.out, 0xe7000000, 0);
+    const u32 yh = (u32)y & 0xfff, yl = (u32)(y + (s32)count * 4) & 0xfff;
+    lumiverseGfxEmit2(m.out, 0xe4000000 | xl << 12 | yl, xh << 12 | yh);
+    lumiverseGfxEmit2(m.out, 0, 0x04000400);
+    row += count; y += (s32)count * 4; remaining -= count;
+  }
+}
+
+//gSPBgRectCopy (BG_COPY): the copy-mode background. Derived from Kirby 64's
+//gameplay HUD (RGBA16 320x48 at (7,182) under a (10,10)-(310,230)
+//scissor, LLE RDP stream, round 11): the frame is clipped to the scissor
+//(x 10..309.75, S starts at 3), the load/render tiles use the CPU-computed
+//uObjBg tail fields (tmemW = tile line in qwords, tmemH = rows per strip,
+//tmemLoadTH = LOADTILE lrt), each strip is one LOADTILE of `rows` lines
+//and one inclusive copy-mode TEXRECT (dsdx 4.0), the strips leave exactly
+//one row for a tail that LOADBLOCKs that row and the wrapped next row
+//(tile 6 / tile 7) and draws it as a one-line TEXRECT. Validated only for
+//unscrolled, unflipped, 16-bit images.
+auto lumiverseGfxS2DEXBackgroundCopySupported(u32 at) -> bool {
+  const u32 imageX = lumiverseGfxHalf(at + 0), imageY = lumiverseGfxHalf(at + 8);
+  const u32 imageW = lumiverseGfxHalf(at + 2) >> 2, imageH = lumiverseGfxHalf(at + 10) >> 2;
+  const u32 frameW = lumiverseGfxHalf(at + 6) >> 2, frameH = lumiverseGfxHalf(at + 14) >> 2;
+  const u32 imageLoad = lumiverseGfxHalf(at + 20);
+  const u32 imageSiz = lumiverseGfxByte(at + 23) & 3;
+  const u32 imageFlip = lumiverseGfxHalf(at + 26);
+  const u32 tmemW = lumiverseGfxHalf(at + 28), tmemH = lumiverseGfxHalf(at + 30) >> 2;
+  if(imageX || imageY || imageFlip) return false;
+  if(imageLoad != 0xfff4) return false;
+  if(imageSiz != 2) return false;
+  if(!imageW || !imageH || !frameW || !frameH || !tmemW || !tmemH) return false;
+  if(frameW > imageW || frameH > imageH) return false;
+  if(tmemW > 0x1ff || (imageW * 2) / 8 > tmemW) return false;
+  return true;
+}
+
+auto lumiverseGfxS2DEXDrawBackgroundCopy(LumiverseGfxMachine& m, u32 at) -> void {
+  const u32 imageW = lumiverseGfxHalf(at + 2) >> 2;
+  const s32 frameX = (s32)lumiverseGfxShort(at + 4), frameW = (s32)(lumiverseGfxHalf(at + 6) & ~3u);  //10.2
+  const u32 imageH = lumiverseGfxHalf(at + 10) >> 2;
+  const s32 frameY = (s32)lumiverseGfxShort(at + 12), frameH = (s32)(lumiverseGfxHalf(at + 14) & ~3u);
+  const u32 imagePtr = lumiverseGfxSegmentAddress(m, lumiverseGfxWord(at + 16));
+  const u32 imageFmt = lumiverseGfxByte(at + 22) & 7;
+  const u32 imageSiz = lumiverseGfxByte(at + 23) & 3;
+  const u32 imagePal = lumiverseGfxHalf(at + 24) & 0xf;
+  const u32 tmemW = lumiverseGfxHalf(at + 28);
+  const u32 tmemH = lumiverseGfxHalf(at + 30) >> 2;
+  const u32 rowBytes = imageW * 2;
+
+  //clip the frame to the scissor (all 10.2; scissor xl/yl exclusive)
+  const s32 x0 = frameX > (s32)m.out.scissorXH ? frameX : (s32)m.out.scissorXH;
+  const s32 x1 = frameX + frameW < (s32)m.out.scissorXL ? frameX + frameW : (s32)m.out.scissorXL;
+  const s32 y0 = frameY > (s32)m.out.scissorYH ? frameY : (s32)m.out.scissorYH;
+  const s32 y1 = frameY + frameH < (s32)m.out.scissorYL ? frameY + frameH : (s32)m.out.scissorYL;
+  if(x1 <= x0 || y1 <= y0) return;
+  const u32 sStart = (u32)(x0 - frameX) >> 2;         //texels skipped on the left
+  u32 row = (u32)(y0 - frameY) >> 2;                  //first image row
+  u32 remaining = (u32)(y1 - y0) >> 2;
+  const u32 xl = (u32)(x1 - 1) & 0xfff, xh = (u32)x0 & 0xfff;
+  const u32 lrs = (xl - xh + (sStart << 2)) & 0xfff;
+
+  lumiverseGfxEmitOtherMode(m);
+  const u32 fmtSiz = imageFmt << 5 | imageSiz << 3;
+  const u32 tileWord = 0xf5000000 | fmtSiz << 16 | (tmemW & 0x1ff) << 9;
+  lumiverseGfxEmit2(m.out, tileWord, 0x07000000);
+  lumiverseGfxEmit2(m.out, 0xf2000000, 0x00000000);
+  lumiverseGfxEmit2(m.out, tileWord, imagePal << 20 | 0x0007c1f0);
+  const u32 timg = 0xfd000000 | fmtSiz << 16 | ((imageW - 1) & 0xfff);
+  u32 y = (u32)y0;
+  while(remaining > 1) {
+    u32 count = remaining - 1 < tmemH ? remaining - 1 : tmemH;
+    lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+    lumiverseGfxEmit2(m.out, timg, imagePtr + row * rowBytes);
+    lumiverseGfxEmit2(m.out, 0xf4000000, 0x07000000 | lrs << 12 | (((count - 1) << 2) | 3));
+    lumiverseGfxEmit2(m.out, 0xe7000000, 0);
+    lumiverseGfxEmit2(m.out, 0xe4000000 | xl << 12 | ((y + count * 4 - 1) & 0xfff), xh << 12 | (y & 0xfff));
+    lumiverseGfxEmit2(m.out, (sStart << 5) << 16, 0x10000400);
+    row += count; y += count * 4; remaining -= count;
+  }
+  if(remaining == 1) {
+    //tail: this row via LOADBLOCK into tile 6, the wrapped next row after it
+    //(tile 6 tmem = one row, LOADBLOCK on tile 7 with lrs 0xfff — the
+    //microcode's own words), then one copy-mode line from tile 0
+    lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+    lumiverseGfxEmit2(m.out, timg, imagePtr + row * rowBytes);
+    lumiverseGfxEmit2(m.out, 0xf5000000 | fmtSiz << 16, 0x06000000);
+    lumiverseGfxEmit2(m.out, 0xf3000000, 0x06000000 | ((imageW - 1) & 0xfff) << 12);
+    lumiverseGfxEmit2(m.out, 0xe6000000, 0);
+    lumiverseGfxEmit2(m.out, timg, imagePtr + ((row + 1) % imageH) * rowBytes);
+    lumiverseGfxEmit2(m.out, 0xf5000000 | fmtSiz << 16 | ((rowBytes / 8) & 0x1ff), 0x06000000);
+    lumiverseGfxEmit2(m.out, 0xf3000000, 0x07fff000);
+    lumiverseGfxEmit2(m.out, 0xe7000000, 0);
+    lumiverseGfxEmit2(m.out, 0xe4000000 | xl << 12 | (y & 0xfff), xh << 12 | (y & 0xfff));
+    lumiverseGfxEmit2(m.out, (sStart << 5) << 16, 0x10000400);
+  }
+}
+
 auto lumiverseGfxS2DEXLoadMatrix(LumiverseGfxMachine& m, u32 at, bool full) -> void {
   if(full) {
     m.objA = (f32)(s32)lumiverseGfxWord(at + 0) / 65536.0f;
@@ -1546,7 +1753,11 @@ auto lumiverseGfxExecuteS2DEX(LumiverseGfxMachine& m, u8 opcode, u32 cmd0, u32 c
   if(!gbi2) {
     switch(opcode) {
     case 0x01:  //G_BG_1CYC
-      lumiverseGfxS2DEXDrawBackground(m, at);
+      if(lumiverseGfxS2DEXBackground4BitSupported(at)) lumiverseGfxS2DEXDrawBackground4Bit(m, at);
+      else lumiverseGfxS2DEXDrawBackground(m, at);
+      return true;
+    case 0x02:  //G_BG_COPY
+      lumiverseGfxS2DEXDrawBackgroundCopy(m, at);
       return true;
     case 0x03:  //G_OBJ_RECTANGLE
       lumiverseGfxS2DEXDrawRect(m, at, false);
@@ -1601,7 +1812,11 @@ auto lumiverseGfxExecuteS2DEX(LumiverseGfxMachine& m, u8 opcode, u32 cmd0, u32 c
     lumiverseGfxS2DEXDrawRect(m, at + 24, true);
     return true;
   case 0x09:  //G_BG_1CYC
-    lumiverseGfxS2DEXDrawBackground(m, at);
+    if(lumiverseGfxS2DEXBackground4BitSupported(at)) lumiverseGfxS2DEXDrawBackground4Bit(m, at);
+    else lumiverseGfxS2DEXDrawBackground(m, at);
+    return true;
+  case 0x0a:  //G_BG_COPY
+    lumiverseGfxS2DEXDrawBackgroundCopy(m, at);
     return true;
   case 0x02:  //G_OBJ_SPRITE
     lumiverseGfxS2DEXDrawSprite(m, at);
@@ -2875,8 +3090,8 @@ auto lumiverseGfxS2DEXAdmit(u8 opcode, u32 cmd0, u32 cmd1, bool gbi2, u32 struct
     case 0x05: { const u32 index = cmd0 & 0xffff; if(index == 0 || index == 2) return true; why = "s2dex movemem index"; return false; }
     case 0xc1: case 0xc2: case 0xc3: case 0xc4: return textureOk(structAt);
     case 0x03: case 0xb2: return true;
-    case 0x01: if(lumiverseGfxS2DEXBackgroundSupported(structAt)) return true; why = "s2dex BG_1CYC (scrolled/scaled/flipped)"; return false;
-    case 0x02: why = "s2dex BG_COPY"; return false;
+    case 0x01: if(lumiverseGfxS2DEXBackground4BitSupported(structAt) || lumiverseGfxS2DEXBackgroundSupported(structAt)) return true; why = "s2dex BG_1CYC (scrolled/scaled/flipped)"; return false;
+    case 0x02: if(lumiverseGfxS2DEXBackgroundCopySupported(structAt)) return true; why = "s2dex BG_COPY (scrolled/flipped/non-16-bit)"; return false;
     case 0xb0: why = "s2dex SELECT_DL"; return false;
     default: return true;  //base GBI1 command
     }
@@ -2887,8 +3102,8 @@ auto lumiverseGfxS2DEXAdmit(u8 opcode, u32 cmd0, u32 cmd1, bool gbi2, u32 struct
   case 0xdc: return true;  //types 0/2 are the object matrices; others: base GBI2 rules
   case 0x01: case 0xda: return true;
   case 0x04: why = "s2dex2 SELECT_DL"; return false;
-  case 0x09: if(lumiverseGfxS2DEXBackgroundSupported(structAt)) return true; why = "s2dex2 BG_1CYC (scrolled/scaled/flipped)"; return false;
-  case 0x0a: why = "s2dex2 BG_COPY"; return false;
+  case 0x09: if(lumiverseGfxS2DEXBackground4BitSupported(structAt) || lumiverseGfxS2DEXBackgroundSupported(structAt)) return true; why = "s2dex2 BG_1CYC (scrolled/scaled/flipped)"; return false;
+  case 0x0a: if(lumiverseGfxS2DEXBackgroundCopySupported(structAt)) return true; why = "s2dex2 BG_COPY (scrolled/flipped/non-16-bit)"; return false;
   case 0xd5: why = "s2dex2 DL_COUNT"; return false;
   default: return true;  //base GBI2 command
   }
