@@ -313,6 +313,13 @@ struct LumiverseGfxMachine {
   bool otherModeDirty = true;
   f32 vpScaleX = 160, vpScaleY = 120, vpScaleZ = 511;
   f32 vpTransX = 160, vpTransY = 120, vpTransZ = 511;
+  //guard-band clip ratio (gSPClipRatio / G_MW_CLIP): the microcode clips
+  //x/y against +-ratio*w, not the viewport, and lets the RDP scissor the
+  //rest, so an edge-crossing triangle keeps its original vertices and
+  //attribute starts (round 11). Games send FRUSTRATIO_2 (Yoshi's Story
+  //every task); 2 is the microcode's own DATA default (SF64/OoT never send
+  //it and their edge triangles match LLE at 2)
+  f32 clipRatio = 2.0f;
   LumiverseGfxLight lights[8];
   u32 numLights = 0;
   f32 fogMul = 0, fogOff = 0;
@@ -504,6 +511,7 @@ auto lumiverseGfxReset(LumiverseGfxMachine& m, u32 pc, u32 dialect, u32 gbi0Vert
   m.otherModeDirty = true;
   m.vpScaleX = 160; m.vpScaleY = 120; m.vpScaleZ = 511;
   m.vpTransX = 160; m.vpTransY = 120; m.vpTransZ = 511;
+  m.clipRatio = 2.0f;
   for(auto& light : m.lights) light = {};
   m.numLights = 0;
   m.fogMul = 0; m.fogOff = 0;
@@ -998,21 +1006,45 @@ auto lumiverseGfxLerpVertex(const LumiverseClipVertex& a, const LumiverseClipVer
   out.a = a.a + (b.a - a.a) * t;
 }
 
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_CLIP_RATIO: 0 = clip x/y at the exact
+//viewport (rounds 1-10); unset/1 = clip at the microcode's guard-band ratio
+//(G_MW_CLIP, default 2) and let the RDP scissor, which keeps the original
+//vertices — and therefore the edge and attribute starts — of every triangle
+//that merely crosses a screen edge (round 11; validated against LLE RDP
+//streams: Yoshi's Story title flag strips start at y=-1.75 unclipped)
+auto lumiverseGfxClipRatioEnabled() -> bool {
+  static const bool value = [] {
+    const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_CLIP_RATIO");
+    return !v || v[0] != '0';
+  }();
+  return value;
+}
+
+//G_MW_CLIP word: the ratio as a signed 16-bit magnitude (+r for the RNX/RNY
+//words, -r for RPX/RPY — Yoshi's Story: 00000002 / 0000fffe). The
+//microcode's own DATA default is 2; anything outside 1..7 is ignored.
+auto lumiverseGfxSetClipRatio(LumiverseGfxMachine& m, u32 cmd1) -> void {
+  s32 ratio = (s32)(s16)(cmd1 & 0xffff);
+  if(ratio < 0) ratio = -ratio;
+  if(ratio >= 1 && ratio <= 7) m.clipRatio = (f32)ratio;
+}
+
 //Sutherland-Hodgman against one plane; dot(v) >= 0 keeps the vertex.
-//planeSelect: 0:w>=eps 1:x<=w 2:x>=-w 3:y<=w 4:y>=-w 5:z<=w (far)
-auto lumiverseGfxPlaneDot(const LumiverseClipVertex& v, u32 planeSelect) -> f32 {
+//planeSelect: 0:w>=eps 1:x<=r*w 2:x>=-r*w 3:y<=r*w 4:y>=-r*w 5:z<=w (far)
+//(r = guard-band ratio, 1 = the exact viewport)
+auto lumiverseGfxPlaneDot(const LumiverseClipVertex& v, u32 planeSelect, f32 ratio) -> f32 {
   switch(planeSelect) {
   case 0: return v.w - LumiverseWEpsilon;
-  case 1: return v.w - v.x;
-  case 2: return v.w + v.x;
-  case 3: return v.w - v.y;
-  case 4: return v.w + v.y;
+  case 1: return ratio * v.w - v.x;
+  case 2: return ratio * v.w + v.x;
+  case 3: return ratio * v.w - v.y;
+  case 4: return ratio * v.w + v.y;
   case 5: return v.w - v.z;
   }
   return 0;
 }
 
-auto lumiverseGfxClipPolygon(LumiverseClipVertex* verts, u32 count) -> u32 {
+auto lumiverseGfxClipPolygon(LumiverseClipVertex* verts, u32 count, f32 ratio) -> u32 {
   LumiverseClipVertex scratch[16];
   for(u32 plane = 0; plane < 6; plane++) {
     if(count < 3) return 0;
@@ -1020,8 +1052,8 @@ auto lumiverseGfxClipPolygon(LumiverseClipVertex* verts, u32 count) -> u32 {
     for(u32 index = 0; index < count; index++) {
       const auto& current = verts[index];
       const auto& next = verts[(index + 1) % count];
-      const f32 dc = lumiverseGfxPlaneDot(current, plane);
-      const f32 dn = lumiverseGfxPlaneDot(next, plane);
+      const f32 dc = lumiverseGfxPlaneDot(current, plane, ratio);
+      const f32 dn = lumiverseGfxPlaneDot(next, plane, ratio);
       if(dc >= 0) {
         if(outCount < 16) scratch[outCount++] = current;
       }
@@ -1096,8 +1128,24 @@ auto lumiverseGfxDrawTriangle(LumiverseGfxMachine& m, u32 index0, u32 index1, u3
 
   u32 count = 3;
   const u8 combinedFlags = a.clip | b.clip | c.clip;
-  if(combinedFlags || a.w < LumiverseWEpsilon || b.w < LumiverseWEpsilon || c.w < LumiverseWEpsilon) {
-    count = lumiverseGfxClipPolygon(poly, 3);
+  //clip only when a vertex leaves the guard band (|x|,|y| > ratio*w), the far
+  //plane or the w epsilon; inside the band the RDP scissor does the work on
+  //the ORIGINAL triangle, as the microcode does. The exact-viewport clip
+  //flags stay in use for the trivial reject above and G_CULLDL.
+  const f32 ratio = lumiverseGfxClipRatioEnabled() ? m.clipRatio : 1.0f;
+  bool needsClip = a.w < LumiverseWEpsilon || b.w < LumiverseWEpsilon || c.w < LumiverseWEpsilon;
+  if(!needsClip) {
+    if(ratio <= 1.0f) needsClip = combinedFlags != 0;
+    else if(combinedFlags) {
+      for(u32 index = 0; index < 3 && !needsClip; index++) {
+        const auto& v = *source[index];
+        const f32 limit = ratio * v.w;
+        needsClip = v.x < -limit || v.x > limit || v.y < -limit || v.y > limit || v.z > v.w;
+      }
+    }
+  }
+  if(needsClip) {
+    count = lumiverseGfxClipPolygon(poly, 3, ratio);
     if(count < 3) { m.trisRejected++; return; }
     m.trisClipped++;
   }
@@ -1718,7 +1766,10 @@ auto lumiverseGfxExecuteTask(LumiverseGfxMachine& m, u32 pc,
       case 0x02:  //G_MW_NUMLIGHT
         m.numLights = (((cmd1 - 0x80000000u) >> 5) - 1) & 7;
         break;
-      case 0x04: break;  //G_MW_CLIP: RDP scissor handles it
+      case 0x04:  //G_MW_CLIP: guard-band ratio (four words, offsets 0x04/0x0c
+                  //= +r, 0x14/0x1c = -r as s16; Yoshi's Story sends 2/-2)
+        lumiverseGfxSetClipRatio(m, cmd1);
+        break;
       case 0x06:  //G_MW_SEGMENT
         m.segments[(offset >> 2) & 0xf] = cmd1 & 0x00ffffff;
         break;
@@ -2291,7 +2342,9 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       case 0x02:  //G_MW_NUMLIGHT: value = numLights * 24
         m.numLights = (cmd1 / 24) & 7;
         break;
-      case 0x04: break;  //G_MW_CLIP
+      case 0x04:  //G_MW_CLIP: guard-band ratio
+        lumiverseGfxSetClipRatio(m, cmd1);
+        break;
       case 0x06:  //G_MW_SEGMENT
         m.segments[(offset >> 2) & 0xf] = cmd1 & 0x00ffffff;
         break;
