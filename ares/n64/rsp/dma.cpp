@@ -49,7 +49,7 @@ auto RSP::dmaTransferStep() -> void {
     u8* divert = nullptr;
     if(!dma.current.pbusRegion) {
       lumiverseAudioNoteLLEWrite(dma.current.dramAddress, dma.current.length + 8, dma.current.pbusAddress);
-      divert = lumiverseAudioDivertLLEWrite(dma.current.dramAddress, dma.current.length + 8);
+      divert = lumiverseAudioDivertLLEWrite(dma.current.dramAddress, dma.current.length + 8, dma.current.pbusAddress);
     }
     for(u32 i = 0; i <= dma.current.length; i += 8) {
       if(dma.current.pbusRegion) {

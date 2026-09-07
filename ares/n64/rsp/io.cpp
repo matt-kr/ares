@@ -23,6 +23,9 @@ auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
     u32 shadow = 0;
     if(lumiverseAsyncIOReadShadow(address, shadow)) {
       debugger.ioSCC(Read, address, shadow);
+      //Lumiverse addition (round 14): a CPU spinning on the snapshot while
+      //the async audio task runs is a poll loop too (cpu.cpp)
+      if(address >= 4 && address <= 6 && &thread == &cpu) cpu.lumiversePollStatus(address, shadow);
       return shadow;
     }
     lumiverseAsyncDrain();
@@ -87,6 +90,9 @@ auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
     if(!lumiverseRelaxIOSync() && !lumiverseOnRSPWorker()) cpu.forceSynchronize();
   }
 
+  //Lumiverse addition (round 14): SP status poll-loop warp (CPU_FAST_POLL,
+  //cpu.cpp) — CPU reads of SP_STATUS / SP_DMA_FULL / SP_DMA_BUSY
+  if(address >= 4 && address <= 6 && &thread == &cpu) cpu.lumiversePollStatus(address, data);
   if(lumiverseIOPollLog() && &thread != &cpu) {
     //RSP-origin (cop0) reads: 4=SP_STATUS 5=DMA_FULL 6=DMA_BUSY 7=SEMAPHORE -> slot 14 (status) / 15 (other)
     lumiverseIOPollNote(address == 4 ? 14 : 15, data);
@@ -128,6 +134,9 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
   //SP_STATUS writes). Worker-context writes (the microcode's own MTC0s)
   //pass through untouched.
   if(unlikely(lumiverseAsyncInFlight) && !lumiverseOnRSPWorker()) lumiverseAsyncDrain();
+  //Lumiverse addition (round 14): any CPU write to an SP register ends a
+  //poll-loop warp candidate (cpu.cpp lumiversePollStatus)
+  if(&thread == &cpu) cpu.lumiversePollNoteWrite();
 
   if(address == 0) {
     //SP_PBUS_ADDRESS
@@ -212,6 +221,7 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
         lumiverseHLEPendingCycles = lumiverseHLERequestedCompletionCycles;
       } else {
         //mirror BREAK semantics + the microcode's task-done signal (SIG2)
+        lumiverseAudioFlushDeferredWrites();  //round 14: instant completion — the output lands now
         status.broken = 1;
         status.signal[2] = 1;
         if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);

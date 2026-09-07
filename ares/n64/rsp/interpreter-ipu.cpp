@@ -52,6 +52,10 @@ auto RSP::BNE(cr32& rs, cr32& rt, s16 imm) -> void {
 }
 
 auto RSP::BREAK() -> void {
+  //Lumiverse addition (round 14): in audio reverse-shadow mode the HLE's
+  //deferred RDRAM output lands when the microcode itself completes
+  lumiverseAudioNoteTaskEnd(profile.cycles);
+  lumiverseAudioFlushDeferredWrites();
   status.halted = 1;
   status.broken = 1;
   if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);

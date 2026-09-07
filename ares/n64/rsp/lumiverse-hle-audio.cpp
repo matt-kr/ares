@@ -131,6 +131,12 @@ auto lumiverseAudioHLELevel() -> int {
   return level;
 }
 
+//DEBUG>=3 env-line quota (round 14: LUMIVERSE_ARES_N64_AUDIO_HLE_ENV_LINES, default 4000)
+static auto lumiverseAudioEnvLineCap() -> u32 {
+  static const u32 cap = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_ENV_LINES"); return v ? (u32)::atoi(v) : 4000u; }();
+  return cap;
+}
+
 auto lumiverseAudioHLEDebug() -> int {
   static int debug = [] {
     const char* value = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_DEBUG");
@@ -253,7 +259,12 @@ auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
   //level 1.004, clicks 0/0 vs 1/1) — whitelisted; LUMIVERSE_ARES_N64_AUDIO_HLE_RARE=0
   //keeps the Rare family (incl. PD) on LLE
   if(hash == LumiverseAudioUcodePD     && !lumiverseAudioRareOptOut()) return LumiverseAudioDialectNaudio;
-  if(hash == LumiverseAudioUcodeDK64   && lumiverseAudioRareOptIn()) return LumiverseAudioDialectNaudio;
+  //round 14: DK64 under the global gate (fair gate 0.999 with frames and
+  //alists identical, real gate 0.999 with the cost-modelled completion);
+  //Banjo-Tooie's fair gate is identical too but its real gate stays at
+  //0.59 (its voice manager is sensitive to the completion time beyond the
+  //1.2% cost model), so it and Conker (07/08 echo ring) stay opt-in
+  if(hash == LumiverseAudioUcodeDK64   && !lumiverseAudioRareOptOut()) return LumiverseAudioDialectNaudio;
   return -1;
 }
 
@@ -293,8 +304,12 @@ auto lumiverseAudioDialectForPrefixHash(u64 prefixHash) -> s32 {
   if(const s32 tried = lumiverseAudioTryDialect(prefixHash); tried >= 0) return tried;
   if(prefixHash == LumiverseAudioPrefixMK64)   return LumiverseAudioDialectABI2;
   if(prefixHash == LumiverseAudioPrefixPWSOTE) return LumiverseAudioDialectABI1;
-  static const bool geOptIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_GE"); return v && v[0] == '1'; }();
-  if(prefixHash == LumiverseAudioPrefixGE && geOptIn) return LumiverseAudioDialectABI1;
+  //round 14: GoldenEye whitelisted — with the measured resampler kernel on
+  //the ABI1 path (ABI_KERNEL) its Dam clicks went 221/254 -> 58/90 against
+  //LLE's 69/91, fair gate 0.994/0.991; LUMIVERSE_ARES_N64_AUDIO_HLE_GE=0
+  //opts out
+  static const bool geOptOut = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_GE"); return v && v[0] == '0'; }();
+  if(prefixHash == LumiverseAudioPrefixGE && !geOptOut) return LumiverseAudioDialectABI1;
   //round 13: Paper Mario on the naudio executor with the Rare-engine reverb
   //model (state-blob tap + one-pole 0e): title + intro + Peach's castle
   //(14000 steps) HLE vs LLE audio envCorr 0.948 (0.979 on the shared
@@ -329,9 +344,130 @@ auto lumiverseAudioRDRAMReadByte(u32 address) -> u8 {
   return rdram.ram.Memory::Writable::read<Byte>(address & 0x00ffffff);
 }
 
+auto lumiverseAudioStateBytes() -> u32 {
+  static const u32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_STATE_BYTES"); return v ? (u32)::atoi(v) : 32u; }();
+  return value;
+}
+
+auto lumiverseAudioOwnDmem() -> s32;
+auto lumiverseAudioNaStateWrites() -> bool;
+extern u16 lumiverseAudioNaLastBlockLanes[3];
+//round 14: LUMIVERSE_ARES_N64_AUDIO_HLE_DEFER_WRITES (default 1): the
+//executor's RDRAM writes are held back and applied when the task COMPLETES
+//(the HLE completion point, or — in reverse-shadow mode — the microcode's
+//BREAK) instead of at dispatch. The Rare engines read the ENVMIX parameter
+//blocks back on the CPU while the RSP is still working on the task: with
+//the blocks written at dispatch the CPU saw the NEW volumes a task early,
+//and Banjo-Tooie's / DK64's game path diverged (reverse-shadow frames
+//differed from ~step 4000 with bit-exact blocks; identical with the blocks
+//LLE-owned). 0 = write at dispatch (rounds 4-13).
+auto lumiverseAudioDeferWrites() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_DEFER_WRITES"); return !v || v[0] != '0'; }();
+  return value;
+}
+struct LumiverseAudioDeferredWrite { u32 addr, length, offset, command; bool landed; };
+static LumiverseAudioDeferredWrite lumiverseAudioDeferred[4096];
+static u32 lumiverseAudioDeferredCount = 0;
+static u8 lumiverseAudioDeferredData[1 << 20];
+static u32 lumiverseAudioDeferredBytes = 0;
+static u32 lumiverseAudioDeferredCommands = 1;   //command count of the task the entries belong to
+static auto lumiverseAudioLandDeferred(LumiverseAudioDeferredWrite& d) -> void {
+  if(d.landed) return;
+  for(u32 index = 0; index < d.length; index++) {
+    rdram.ram.Memory::Writable::write<Byte>((d.addr + index) & 0x00ffffff, lumiverseAudioDeferredData[d.offset + index]);
+  }
+  d.landed = true;
+}
+auto lumiverseAudioFlushDeferredWrites() -> void {
+  for(u32 w = 0; w < lumiverseAudioDeferredCount; w++) lumiverseAudioLandDeferred(lumiverseAudioDeferred[w]);
+  lumiverseAudioDeferredCount = 0;
+  lumiverseAudioDeferredBytes = 0;
+}
+//reverse-shadow timing parity: when the microcode DMAs a range out, the
+//EARLIEST of our still-pending writes to that range lands at that moment
+//(one per microcode DMA — the Rare engines write a voice's ENVMIX block
+//after every chunk, four times per task, and the CPU reads it in between;
+//landing all four at the first DMA showed the CPU the last chunk's volume
+//three chunks early). Whatever is left lands at BREAK.
+auto lumiverseAudioReleaseDeferredWrites(u32 address, u32 length) -> void {
+  for(u32 w = 0; w < lumiverseAudioDeferredCount; w++) {
+    auto& d = lumiverseAudioDeferred[w];
+    if(d.landed || d.addr + d.length <= address || d.addr >= address + length) continue;
+    lumiverseAudioLandDeferred(d);
+    return;
+  }
+}
+//real HLE with a modelled task duration (rsp.cpp, LUMIVERSE_ARES_N64_RSP_HLE_
+//AUDIO_CYCLES_PER_CMD): writes land progressively — entry k (from command
+//c of N) lands once the elapsed fraction of the modelled duration reaches
+//c / N, approximating the microcode's in-order DMA schedule
+//round 14: modelled microcode schedule — the cumulative cost (RSP cycles)
+//of the alist up to and including each command, from a per-opcode cost
+//table fitted on 4303 Banjo-Tooie / DK64 / Banjo-Kazooie LLE tasks (rms
+//error 1.2% of the task duration; a flat per-command cost was 14-18%).
+//A deferred write from command c lands once the modelled elapsed time
+//reaches the cost prefix at c. Empty (no model) = land by command fraction.
+static u32 lumiverseAudioCmdCostPrefix[8192];
+static u32 lumiverseAudioCmdCostCount = 0;
+auto lumiverseAudioProgressDeferredWrites(s64 elapsed, s64 total) -> void {
+  if(total <= 0) return;
+  for(u32 w = 0; w < lumiverseAudioDeferredCount; w++) {
+    auto& d = lumiverseAudioDeferred[w];
+    if(d.landed) continue;
+    if(lumiverseAudioCmdCostCount) {
+      const u32 c = d.command < lumiverseAudioCmdCostCount ? d.command : lumiverseAudioCmdCostCount - 1;
+      if((s64)lumiverseAudioCmdCostPrefix[c] <= elapsed) lumiverseAudioLandDeferred(d);
+    } else if((s64)d.command * total <= elapsed * (s64)lumiverseAudioDeferredCommands) lumiverseAudioLandDeferred(d);
+  }
+}
+auto lumiverseAudioSetDeferredCommands(u32 commands) -> void { lumiverseAudioDeferredCommands = commands ? commands : 1; }
+//LUMIVERSE_ARES_N64_RSP_HLE_AUDIO_COST_MODEL (default 1): the Rare engines
+//(Banjo-Kazooie/Tooie, DK64, Conker) complete after the modelled duration
+//with their output landing on the modelled schedule; 0 = instant completion
+//(rounds 4-13). Perfect Dark's engine fits a different table and stays
+//instant (shipped so in round 13). Costs in RSP cycles per command.
+auto lumiverseAudioCostModel() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_AUDIO_COST_MODEL"); return !v || v[0] != '0'; }();
+  return value;
+}
+static const u16 lumiverseAudioRareCost[32] = {
+  0, 1630, 265, 2999, 97, 3055, 186, 0,  0, 171, 910, 220, 1111, 0, 0, 855,
+  0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0 };
+constexpr u32 lumiverseAudioRareCostConstant = 2460;
+//round 14 diagnostic: LLE audio task duration (RSP cycles from dispatch to
+//BREAK) in shadow modes, printed with the executed= summary
+u64 lumiverseAudioTaskStartCycles = 0; u64 lumiverseAudioTaskCycleSum = 0; u64 lumiverseAudioTaskCycleCount = 0; u64 lumiverseAudioTaskCycleMax = 0;
+u32 lumiverseAudioTaskOps[32] = {};
+auto lumiverseAudioNoteTaskEnd(u64 cycles) -> void {
+  if(!lumiverseAudioTaskStartCycles) return;
+  const u64 d = cycles - lumiverseAudioTaskStartCycles;
+  lumiverseAudioTaskStartCycles = 0;
+  //DEBUG>=2: per-task LLE cost next to the task's opcode histogram (for the
+  //per-opcode cost fit behind the modelled task duration)
+  if(lumiverseAudioHLEDebug() >= 2) {
+    static u32 lines = 0;
+    if(lines++ < 20000) {
+      fprintf(stderr, "[rsp-hle-audio-cost] cycles=%llu ops", (unsigned long long)d);
+      for(u32 op = 0; op < 32; op++) if(lumiverseAudioTaskOps[op]) fprintf(stderr, " %02x:%u", op, lumiverseAudioTaskOps[op]);
+      fprintf(stderr, "\n");
+    }
+  }
+  lumiverseAudioTaskCycleSum += d; lumiverseAudioTaskCycleCount++;
+  if(d > lumiverseAudioTaskCycleMax) lumiverseAudioTaskCycleMax = d;
+}
 auto lumiverseAudioReadRDRAM(LumiverseAudioShadow& shadow, u32 address, u8* out, u32 length) -> void {
   address &= 0x00ffffff;
   for(u32 index = 0; index < length; index++) out[index] = lumiverseAudioRDRAMReadByte(address + index);
+  //round 14: this task's deferred (not yet landed) writes are what the
+  //microcode would have put in RDRAM by now — save-then-reload sequences
+  //inside a task must see them (real HLE has no shadow copy to serve them)
+  for(u32 w = 0; w < lumiverseAudioDeferredCount; w++) {
+    const auto& d = lumiverseAudioDeferred[w];
+    if(d.landed) continue;
+    const u32 begin = d.addr > address ? d.addr : address;
+    const u32 end = (d.addr + d.length) < (address + length) ? (d.addr + d.length) : (address + length);
+    for(u32 a = begin; a < end; a++) out[a - address] = lumiverseAudioDeferredData[d.offset + (a - d.addr)];
+  }
   if(!shadow.active) return;
   //shadow mode: overlay this task's own pending writes (last-write-wins) so
   //save-then-reload sequences within a task see their own data
@@ -343,16 +479,18 @@ auto lumiverseAudioReadRDRAM(LumiverseAudioShadow& shadow, u32 address, u8* out,
   }
 }
 
-auto lumiverseAudioStateBytes() -> u32 {
-  static const u32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_STATE_BYTES"); return v ? (u32)::atoi(v) : 32u; }();
-  return value;
-}
-
-auto lumiverseAudioWriteRDRAM(LumiverseAudioShadow& shadow, u32 address, const u8* src, u32 length) -> void {
+auto lumiverseAudioWriteRDRAM(LumiverseAudioShadow& shadow, u32 address, const u8* src, u32 length, bool forceOwn = false) -> void {
   address &= 0x00ffffff;
-  if(!shadow.active || (lumiverseAudioHLELevel() == 3 && length > lumiverseAudioStateBytes())) {
-    for(u32 index = 0; index < length; index++) {
-      rdram.ram.Memory::Writable::write<Byte>((address + index) & 0x00ffffff, src[index]);
+  if(!shadow.active || (lumiverseAudioHLELevel() == 3 && (length > lumiverseAudioStateBytes() || forceOwn))) {
+    if(lumiverseAudioDeferWrites() && lumiverseAudioDeferredCount < 4096 && lumiverseAudioDeferredBytes + length <= sizeof(lumiverseAudioDeferredData)) {
+      auto& d = lumiverseAudioDeferred[lumiverseAudioDeferredCount++];
+      d.addr = address; d.length = length; d.offset = lumiverseAudioDeferredBytes; d.command = shadow.currentCommand; d.landed = false;
+      for(u32 index = 0; index < length; index++) lumiverseAudioDeferredData[d.offset + index] = src[index];
+      lumiverseAudioDeferredBytes += length;
+    } else {
+      for(u32 index = 0; index < length; index++) {
+        rdram.ram.Memory::Writable::write<Byte>((address + index) & 0x00ffffff, src[index]);
+      }
     }
     if(!shadow.active) return;
   }
@@ -864,6 +1002,11 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     for(u32 index = 0; index < 16; index++) {
       state.samples[index] = lumiverseAudioDmemReadS16(dmem, out - 32 + index * 2);
     }
+    if(lumiverseAudioNaStateWrites()) {
+      u8 blob[32];
+      for(u32 index = 0; index < 16; index++) { blob[index * 2] = (u16)state.samples[index] >> 8; blob[index * 2 + 1] = (u8)state.samples[index]; }
+      lumiverseAudioWriteRDRAM(shadow, w0 & 0x00ffffff, blob, 32);
+    }
     m.naDecodeSamples = outBytes / 2;
     m.naSrcMode = 0;
     break;
@@ -1053,6 +1196,15 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
       }
       const s32 avail = (s32)(m.naDecodeSamples ? m.naDecodeSamples : NaChunk / 2);
       state.frac = (u32)(s32)(position - ((s64)avail << 16));
+      if(lumiverseAudioNaStateWrites()) {
+        const s32 last = (s32)((position - step) >> 16);
+        u8 blob[16];
+        for(u32 j = 0; j < 4; j++) { const s32 v = sampleRaw(last + (s32)j); blob[j * 2] = (u16)v >> 8; blob[j * 2 + 1] = (u8)v; }
+        const u32 f = (u32)(position & 0xffff);
+        blob[8] = f >> 8; blob[9] = (u8)f;
+        for(u32 j = 0; j < 3; j++) { blob[10 + j * 2] = lumiverseAudioNaLastBlockLanes[j] >> 8; blob[11 + j * 2] = (u8)lumiverseAudioNaLastBlockLanes[j]; }
+        lumiverseAudioWriteRDRAM(shadow, w0 & 0x00ffffff, blob, 16);
+      }
       break;
     }
     for(u32 n = 0; n < NaChunk / 2; n++) {
@@ -1115,7 +1267,7 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     //the block as the game left it, for the envelope-model fits
     if(lumiverseAudioHLEDebug() >= 3) {
       static u32 lines = 0;
-      if(m.tasksExecuted >= 200 && lines < 4000) {
+      if(m.tasksExecuted >= 200 && lines < lumiverseAudioEnvLineCap()) {
         lines++;
         fprintf(stderr, "[rsp-hle-audio-env] task %llu cmd %08x %08x addr %06x pend L=%04x/%08x R=%04x/%08x volL=%04x wet=%04x dry=%04x | before",
           (unsigned long long)m.tasksExecuted, w0, w1, address, (u16)m.naPendTargetL, m.naPendRateL, (u16)m.naPendTargetR, m.naPendRateR,
@@ -1163,11 +1315,36 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
       //keeps the round-12 rule. This is the last known difference of the
       //block LLE writes and is what still flips Banjo-Tooie's and DK64's
       //game path under HLE (they read the block back).
+      //round 14 (2101 of 2101 fully-captured Banjo-Tooie / DK64 task blocks
+      //exact, DEBUG=3 dumps replayed through a Python model of the block):
+      //lane 7's multiplier is 0xffff — the (i+1)/8 Q16 table saturates at
+      //its top entry — and every lane is formed in a 48-bit accumulator
+      //(base << 16) + ((rate * mult) >> 16) whose 16-bit results are
+      //RSP-clamped: the int part saturates to +-0x7fff/-0x8000 and the
+      //fraction reads 0xffff (0x0000) when the int part overflowed
+      //positive (negative). That is what put the "instant" rate
+      //0x7fffffff's lane-7 fraction at 0xffff (base + 0x7fff7fff overflows
+      //-> 0x7fff:ffff, the target clamp then lowers the int) while the
+      //negative ramps carried rate - ceil(rate / 65536), and rate
+      //0x80000000 left 0x0000:8000 (no overflow). LUMIVERSE_ARES_N64_
+      //AUDIO_HLE_NA_LANE7=0 restores the round-12/13 lane-7 rule.
+      static const bool lane7Model = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NA_LANE7"); return !v || v[0] != '0'; }();
       const s64 pre = (envModel & 1) ? 0 : 1;
+      auto laneInit = [&](s32 base, u32 rate, u32 k) -> s64 {
+        if(!lane7Model) {
+          const s64 mult = (s64)k * 0x2000;
+          return ((s64)base << 16) + (k == 8 ? 8 * stepOf(rate) : (((s64)(s32)rate * mult) >> 16));
+        }
+        const s64 mult = k >= 8 ? 0xffff : (s64)k * 0x2000;
+        const s64 acc = ((s64)base << 16) + (((s64)(s32)rate * mult) >> 16);
+        const s64 hi = acc >> 16;
+        if(hi > 0x7fff) return ((s64)0x7fff << 16) | 0xffff;
+        if(hi < -0x8000) return ((s64)-0x8000 << 16);
+        return acc;
+      };
       for(u32 i = 0; i < 8; i++) {
-        const s64 mult = (s64)(i + pre) * 0x2000;
-        vl[i] = ((s64)m.naPendVolL << 16) + ((i + pre) == 8 ? 8 * stepOf(rateL) : (((s64)(s32)rateL * mult) >> 16));
-        vr[i] = ((s64)initVolR << 16) + ((i + pre) == 8 ? 8 * stepOf(rateR) : (((s64)(s32)rateR * mult) >> 16));
+        vl[i] = laneInit(m.naPendVolL, rateL, i + pre);
+        vr[i] = laneInit(initVolR, rateR, i + pre);
       }
     } else {
       targetL = rd16(0x40); rateL = rdu16(0x42) << 16 | rdu16(0x44);
@@ -1190,9 +1367,13 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     }
     const s64 stepL = stepOf(rateL), stepR = stepOf(rateR);
     const s64 groupL = (s64)(s32)rateL, groupR = (s64)(s32)rateR;
+    //round 14: a zero rate clamps like a positive one (LLE's lanes drop to
+    //the target on rate 0 blocks; 8 such blocks in the DK64 dump). Under the
+    //NA_LANE7=0 A/B the round-13 rule (no clamp at rate 0) is kept too.
+    static const bool zeroRateClamps = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NA_LANE7"); return !v || v[0] != '0'; }();
     auto clampLane = [](s64& v, s32 target, s64 step) {
       s32 vi = (s32)(v >> 16);
-      if(step > 0 && vi > target) vi = target;
+      if((step > 0 || (step == 0 && zeroRateClamps)) && vi > target) vi = target;
       if(step < 0 && vi < target) vi = target;
       if(vi > 0x7fff) vi = 0x7fff;
       if(vi < -0x8000) vi = -0x8000;
@@ -1230,10 +1411,11 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     wr16(0x40, (u32)targetL); wr16(0x42, rateL >> 16); wr16(0x44, rateL & 0xffff);
     wr16(0x46, (u32)targetR); wr16(0x48, rateR >> 16); wr16(0x4a, rateR & 0xffff);
     wr16(0x4c, (u32)wet); wr16(0x4e, (u32)dry);
-    lumiverseAudioWriteRDRAM(shadow, address, outBlock, 0x50);
+    lumiverseAudioWriteRDRAM(shadow, address, outBlock, 0x50, lumiverseAudioOwnDmem() >= 0);
+    for(u32 j = 0; j < 3; j++) lumiverseAudioNaLastBlockLanes[j] = (u16)outBlock[(5 + j) * 2] << 8 | outBlock[(5 + j) * 2 + 1];
     if(lumiverseAudioHLEDebug() >= 3) {
       static u32 lines = 0;
-      if(m.tasksExecuted >= 200 && lines < 4000) {
+      if(m.tasksExecuted >= 200 && lines < lumiverseAudioEnvLineCap()) {
         lines++;
         fprintf(stderr, "[rsp-hle-audio-env] task %llu addr %06x after", (unsigned long long)m.tasksExecuted, address);
         for(u32 o = 0x00; o < 0x50; o += 2) fprintf(stderr, "%s %04x", o % 16 == 0 ? " |" : "", (u32)((u16)outBlock[o] << 8 | outBlock[o + 1]));
@@ -1667,6 +1849,28 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
       //our output lead LLE's by 2 input samples), hence base 6.
       u64 position = ((u64)6 << 16) + frac;
       const u32 step = pitch << 1;  //Q16 samples per output sample
+      //round 14: LUMIVERSE_ARES_N64_AUDIO_HLE_ABI_KERNEL=1 runs this
+      //resampler on the kernel measured on the naudio-family RESAMPLE
+      //(round 13, lumiverseAudioNaKernelAt) at the same effective position
+      //(x1 = index - 1, x2 = index), without the prefilter (the kernel
+      //band-limits by itself). Default 1 since round 14: GoldenEye's Dam
+      //clicks 221/254 -> 58/90 (LLE 69/91); SF64/OoT fair gates 1.000/0.999
+      //with identical frames; ten-title ABI1/ABI2 real-gate regression
+      //neutral (SM64/MK64/MM/WR/PW/D64/CU/PS same, Yoshi clicks 202->185).
+      //0 = the round-4/8 Mitchell blend + prefilter.
+      static const bool abiKernel = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_ABI_KERNEL"); return !v || v[0] != '0'; }();
+      if(abiKernel) {
+        for(u32 n = 0; n < outSamples; n++) {
+          const u32 index = (u32)(position >> 16);
+          const u32 f = (u32)(position & 0xffff);
+          s32 taps[4] = { lumiverseAudioNaKernelAt(0x10000 + f), lumiverseAudioNaKernelAt(f), lumiverseAudioNaKernelAt(0x10000 - f), lumiverseAudioNaKernelAt(0x20000 - f) };
+          const s32 sum = taps[0] + taps[1] + taps[2] + taps[3];
+          if(sum > 0) for(auto& tap : taps) tap = (s32)(((s64)tap << 15) / sum);
+          const s64 acc = (s64)taps[0] * sampleRaw(index - 2) + (s64)taps[1] * sampleRaw(index - 1) + (s64)taps[2] * sampleRaw(index) + (s64)taps[3] * sampleRaw(index + 1);
+          lumiverseAudioDmemWriteS16(dmem, out + n * 2, lumiverseAudioClamp16((s32)((acc + 0x4000) >> 15)));
+          position += step;
+        }
+      } else
       for(u32 n = 0; n < outSamples; n++) {
         const u32 index = (u32)(position >> 16);
         const s64 f = (s64)(position & 0xffff);  //Q16 fraction
@@ -1952,12 +2156,23 @@ bool lumiverseAudioLLEWriteOverflow = false;
 extern LumiverseAudioShadow lumiverseAudioShadowState;
 //reverse-shadow side image (8 MiB, allocated on first use in level 3)
 u8* lumiverseAudioSideImage = nullptr;
-auto lumiverseAudioDivertLLEWrite(u32 dramAddress, u32 length) -> u8* {
+//round 14 diagnostic: LUMIVERSE_ARES_N64_AUDIO_HLE_OWN_DMEM=<hex> — in
+//reverse-shadow mode, LLE writes of <= STATE_BYTES whose DMEM source is this
+//address are NOT LLE-owned (they go to the side image, and our matching
+//ENVMIX block writes go to RDRAM), to tell the ENVMIX blocks apart from the
+//other writes of the same length
+auto lumiverseAudioOwnDmem() -> s32 {
+  static const s32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_OWN_DMEM"); return v ? (s32)::strtol(v, nullptr, 16) : -1; }();
+  return value;
+}
+auto lumiverseAudioDivertLLEWrite(u32 dramAddress, u32 length, u32 dmemAddress) -> u8* {
   if(lumiverseAudioHLELevel() != 3 || !lumiverseAudioShadowState.pending) return nullptr;
   //LUMIVERSE_ARES_N64_AUDIO_HLE_STATE_BYTES (default 32): writes up to this
   //length stay LLE-owned in reverse-shadow mode (round 13: 80 tests whether
   //a game reads the naudio ENVMIX parameter blocks)
-  if(length <= lumiverseAudioStateBytes()) return nullptr;  //state blobs stay in RDRAM: the microcode's own next task reads them
+  const bool ownDmem = lumiverseAudioOwnDmem() >= 0 && length == 80 && (s32)(dmemAddress & 0xfff) == lumiverseAudioOwnDmem();
+  if(length <= lumiverseAudioStateBytes() && !ownDmem) return nullptr;  //state blobs stay in RDRAM: the microcode's own next task reads them
+  lumiverseAudioReleaseDeferredWrites(dramAddress & 0x00ffffff, length);
   if(!lumiverseAudioSideImage) lumiverseAudioSideImage = new u8[0x800000]();
   return lumiverseAudioSideImage;
 }
@@ -2115,7 +2330,9 @@ auto lumiverseAudioShadowCompare(LumiverseAudioShadow& shadow) -> void {
       static u32 allBlockLines = 0;
       if(allBlockLines < 20000) {
         allBlockLines++;
-        fprintf(stderr, "[rsp-hle-audio-shadow]     blockall addr=%06x mine  :", write.addr);
+        u32 lleDmem = 0xfff;
+        for(u32 l = 0; l < lumiverseAudioLLEWriteCount; l++) if(lumiverseAudioLLEWrites[l].addr == write.addr && lumiverseAudioLLEWrites[l].length == 80) { lleDmem = lumiverseAudioLLEWrites[l].dmem; break; }
+        fprintf(stderr, "[rsp-hle-audio-shadow]     blockall addr=%06x dmem=%03x mine  :", write.addr, lleDmem);
         for(u32 b = 0; b < 80; b += 2) fprintf(stderr, "%s %04x", b % 16 == 0 ? " |" : "", (u16)((u16)shadow.data[write.offset + b] << 8 | shadow.data[write.offset + b + 1]));
         fprintf(stderr, "\n[rsp-hle-audio-shadow]     blockall theirs:");
         for(u32 b = 0; b < 80; b += 2) fprintf(stderr, "%s %04x", b % 16 == 0 ? " |" : "", (u16)((u16)lumiverseAudioTheirsByte(write.addr + b) << 8 | lumiverseAudioTheirsByte(write.addr + b + 1)));
@@ -2147,6 +2364,35 @@ auto lumiverseAudioShadowCompare(LumiverseAudioShadow& shadow) -> void {
         }
       }
     }
+  }
+  //round 14: ours-only writes — bytes WE write that no LLE DMA of this task
+  //touched (in reverse-shadow / real HLE those land in RDRAM the game may
+  //own: a clobber). Counted per task; the first 200 printed at DEBUG>=2.
+  {
+    static u64 oursOnlyWrites = 0, oursOnlyBytes = 0, oursOnlyLines = 0;
+    u32 taskOursOnly = 0;
+    for(u32 w = 0; w < shadow.writeCount; w++) {
+      const auto& write = shadow.writes[w];
+      u32 uncovered = 0; u32 firstUncovered = 0xffffffff;
+      for(u32 a = write.addr; a < write.addr + write.length; a++) {
+        bool hit = false;
+        for(u32 l = 0; l < lumiverseAudioLLEWriteCount && !hit; l++) {
+          const auto& lw = lumiverseAudioLLEWrites[l];
+          hit = a >= lw.addr && a < lw.addr + lw.length;
+        }
+        if(!hit) { uncovered++; if(firstUncovered == 0xffffffff) firstUncovered = a; }
+      }
+      if(uncovered && !lumiverseAudioLLEWriteOverflow) {
+        oursOnlyWrites++; oursOnlyBytes += uncovered; taskOursOnly++;
+        if(lumiverseAudioHLEDebug() >= 2 && oursOnlyLines < 200) {
+          oursOnlyLines++;
+          fprintf(stderr, "[rsp-hle-audio-shadow]   OURS-only write task=%llu cmd=%u addr=%06x len=%u uncovered=%u first=%06x\n",
+            (unsigned long long)shadow.task, write.command, write.addr, write.length, uncovered, firstUncovered);
+        }
+      }
+    }
+    if(taskOursOnly && lumiverseAudioHLEDebug() >= 2 && (oursOnlyWrites & 255) == 0)
+      fprintf(stderr, "[rsp-hle-audio-shadow] ours-only writes so far: %llu (%llu bytes)\n", (unsigned long long)oursOnlyWrites, (unsigned long long)oursOnlyBytes);
   }
   //LLE-only writes: bytes the microcode DMA'd out that no write of ours covers
   static u64 lleWrites = 0, lleOnlyWrites = 0, lleOnlyBytes = 0, lleOnlyLines = 0;
@@ -2377,6 +2623,33 @@ auto lumiverseAudioShadowSettle() -> void {
   }
 }
 
+//round 14: LUMIVERSE_ARES_N64_RSP_HLE_AUDIO_CYCLES_PER_CMD (default 0 =
+//instant completion): a natively executed audio task reports completion
+//after commands * this many RSP cycles, and its RDRAM output lands
+//progressively over that time (lumiverseAudioProgressDeferredWrites). The
+//Rare engines read the ENVMIX blocks back while the microcode works; with
+//instant completion (and with all output landing at once) their game path
+//diverged from LLE's. Measured LLE cost: Banjo-Tooie ~690 cycles/command
+//(7.4 ms tasks), DK64 similar (the shadow prints "LLE task duration").
+//round 14: LUMIVERSE_ARES_N64_AUDIO_HLE_NA_STATE_WRITES (default 1): the
+//naudio voice path also writes the two per-voice state blobs the microcode
+//keeps in RDRAM (the 32-byte ADPCM decoder state = the last 16 decoded
+//samples, bit-exact; the 16-byte RESAMPLE state = [4 history][fraction]
+//[3 words]). The 3 trailing words are what the microcode's state-staging
+//area (DMEM 0xfa0) held from the previous ENVMIX block staged there — its L
+//int lanes 5..7 (block dumps: "0b51 0b49 0b41" next to a block whose lanes
+//step by 8). Real HLE never wrote either blob before this round.
+auto lumiverseAudioNaStateWrites() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NA_STATE_WRITES"); return !v || v[0] != '0'; }();
+  return value;
+}
+u16 lumiverseAudioNaLastBlockLanes[3] = {};
+auto lumiverseAudioCyclesPerCommand() -> s32 {
+  static const s32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_AUDIO_CYCLES_PER_CMD"); return v ? ::atoi(v) : 0; }();
+  return value;
+}
+extern s32 lumiverseHLERequestedCompletionCycles;
+u64 lumiverseAudioCommandSum = 0;
 auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   const int level = lumiverseAudioHLELevel();
   if(level < 1) return false;
@@ -2409,6 +2682,11 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   const u32 dataPtr = task[12] & 0x00ffffff;
   u32 dataSize = task[13];
   if(!dataPtr || dataSize < 8 || dataSize > 0x10000) return false;
+  //round 14: any RDRAM writes still held from the previous task land now
+  //(normally flushed at that task's completion; this covers a task that
+  //never reported completion)
+  lumiverseAudioFlushDeferredWrites();
+  lumiverseAudioTaskStartCycles = rsp.profile.cycles ? rsp.profile.cycles : 1;
 
   auto& machine = lumiverseAudioMachine;
   auto& shadow = lumiverseAudioShadowState;
@@ -2601,11 +2879,37 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   machine.tasksExecuted++;
   taskIndex++;
   if(lumiverseAudioHLEDebug() >= 1 && (machine.tasksExecuted & 1023) == 1) {
+    if(lumiverseAudioTaskCycleCount) fprintf(stderr, "[rsp-hle-audio] LLE task duration: mean %.0f cycles (%.0f us) max %llu over %llu tasks; mean %.0f commands/task (%.0f cycles/command)\n",
+      (double)lumiverseAudioTaskCycleSum / lumiverseAudioTaskCycleCount, (double)lumiverseAudioTaskCycleSum / lumiverseAudioTaskCycleCount / 62.5, (unsigned long long)lumiverseAudioTaskCycleMax, (unsigned long long)lumiverseAudioTaskCycleCount,
+      (double)lumiverseAudioCommandSum / machine.tasksExecuted, (double)lumiverseAudioTaskCycleSum / (lumiverseAudioCommandSum ? lumiverseAudioCommandSum : 1));
     fprintf(stderr, "[rsp-hle-audio] executed=%llu fallback=%llu envmix-unknown-flags=%llu\n",
       (unsigned long long)machine.tasksExecuted, (unsigned long long)machine.tasksFallback,
       (unsigned long long)machine.unknownEnvmixFlags);
   }
 
+  //round 14: modelled task duration (see lumiverseAudioCyclesPerCommand)
+  //and the command count the progressive landing of the deferred output
+  //writes is scaled by
+  {
+    const u32 commands = dataSize / 8;
+    lumiverseAudioCommandSum += commands;
+    for(auto& c : lumiverseAudioTaskOps) c = 0;
+    lumiverseAudioCmdCostCount = 0;
+    const bool rareEngine = ucodeHash == LumiverseAudioUcodeBanjoK || ucodeHash == LumiverseAudioUcodeBanjoT
+      || ucodeHash == LumiverseAudioUcodeDK64 || ucodeHash == LumiverseAudioUcodeConker;
+    const bool costModel = lumiverseAudioCostModel() && rareEngine && lumiverseAudioCyclesPerCommand() <= 0;
+    u32 cost = lumiverseAudioRareCostConstant;
+    for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
+      const u32 op = lumiverseAudioRDRAMReadByte(dataPtr + offset) & 0x1f;
+      lumiverseAudioTaskOps[op]++;
+      if(costModel && lumiverseAudioCmdCostCount < 8192) { cost += lumiverseAudioRareCost[op]; lumiverseAudioCmdCostPrefix[lumiverseAudioCmdCostCount++] = cost; }
+    }
+    lumiverseAudioSetDeferredCommands(commands);
+    if(!shadow.active) {
+      if(lumiverseAudioCyclesPerCommand() > 0) lumiverseHLERequestedCompletionCycles = (s32)(commands * (u32)lumiverseAudioCyclesPerCommand());
+      else if(costModel) lumiverseHLERequestedCompletionCycles = (s32)cost;
+    }
+  }
   if(shadow.active) {
     shadow.active = false;
     shadow.pending = true;

@@ -24,7 +24,10 @@ namespace {
   //the game and the LLE microcode's buffer writes are diverted into a side
   //image for comparison; returns the side-image pointer for a diverted DMA
   //(nullptr = write RDRAM normally)
-  auto lumiverseAudioDivertLLEWrite(u32 dramAddress, u32 length) -> u8*;
+  auto lumiverseAudioDivertLLEWrite(u32 dramAddress, u32 length, u32 dmemAddress) -> u8*;
+  auto lumiverseAudioFlushDeferredWrites() -> void;
+  auto lumiverseAudioNoteTaskEnd(u64 cycles) -> void;
+  auto lumiverseAudioProgressDeferredWrites(s64 elapsed, s64 total) -> void;
 }
 #include "dma.cpp"
 //Lumiverse diagnostic hooks defined in rdp/io.cpp (LUMIVERSE_ARES_N64_IO_POLL_LOG)
@@ -70,8 +73,11 @@ auto RSP::main() -> void {
       step(128);
       profile.cycles += 128;
       lumiverseHLEPendingCycles -= 128;
+      //round 14: the audio HLE's deferred RDRAM output lands progressively over the modelled duration
+      lumiverseAudioProgressDeferredWrites(lumiverseHLERequestedCompletionCycles - lumiverseHLEPendingCycles, lumiverseHLERequestedCompletionCycles);
       if(lumiverseHLEPendingCycles <= 0) {
         lumiverseHLEPendingCycles = 0;
+        lumiverseAudioFlushDeferredWrites();  //round 14: the task's RDRAM output lands at completion
         status.halted = 1;
         status.broken = 1;
         status.signal[2] = 1;

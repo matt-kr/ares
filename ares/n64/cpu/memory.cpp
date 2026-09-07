@@ -146,8 +146,31 @@ inline auto CPU::busWriteBurst(u32 address, u32 *data) -> bool {
   return bus.writeBurst<Size>(address, data, *this);
 }
 
+//Lumiverse diagnostic (round 14): LUMIVERSE_ARES_N64_CPU_READ_LOG=<lo hex>:<hi hex>
+//logs CPU reads (uncached bus reads here, cache-line fills in dcache.cpp)
+//of physical addresses in [lo, hi) with the PC, to see which RSP-written
+//audio structures a game's CPU reads back. 600 lines, then silent.
+struct LumiverseCpuReadLog { u32 lo = 0, hi = 0; u32 lines = 0; bool on = false; };
+static auto lumiverseCpuReadLog() -> LumiverseCpuReadLog& {
+  static LumiverseCpuReadLog log = [] {
+    LumiverseCpuReadLog l;
+    if(const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_READ_LOG")) {
+      unsigned lo = 0, hi = 0;
+      if(::sscanf(v, "%x:%x", &lo, &hi) == 2 && hi > lo) { l.lo = lo; l.hi = hi; l.on = true; }
+    }
+    return l;
+  }();
+  return log;
+}
+auto lumiverseCpuReadNote(const char* kind, u32 paddr, u32 length, u64 pc) -> void {
+  auto& l = lumiverseCpuReadLog();
+  if(!l.on || paddr + length <= l.lo || paddr >= l.hi) return;
+  if(l.lines++ < 600) fprintf(stderr, "[cpu-read] %s paddr=%06x len=%u pc=%08llx\n", kind, paddr, length, (unsigned long long)(pc & 0xffffffff));
+}
+
 template<u32 Size>
 inline auto CPU::busRead(u32 address) -> u64 {
+  if(unlikely(lumiverseCpuReadLog().on)) lumiverseCpuReadNote("uncached", address, Size, ipu.pc);
   return bus.read<Size>(address, *this, RBusDevice::VR4300_UNCACHED);
 }
 

@@ -3,6 +3,7 @@ auto CPU::DataCache::Line::hit(u32 paddr) const -> bool {
   return valid() && (tagKey & ~1u) == t;
 }
 
+auto lumiverseCpuReadNote(const char* kind, u32 paddr, u32 length, u64 pc) -> void;
 auto CPU::DataCache::Line::fill(u32 paddr) -> void {
   cpu.step(40 * 2);
   const u32 tag = paddr & ~0x0000'0fffu;
@@ -57,6 +58,7 @@ auto CPU::DataCache::read(u64 vaddr, u32 paddr) -> u64 {
       self.profile.dcacheWritebacks++;
     }
     line.fill(paddr);
+    lumiverseCpuReadNote("dcache-read-miss", paddr, Size, cpu.ipu.pc);
     self.profile.dcacheMisses++;
   } else {
     cpu.step(1 * 2);
@@ -86,6 +88,7 @@ auto CPU::DataCache::write(u64 vaddr, u32 paddr, u64 data) -> void {
       self.profile.dcacheWritebacks++;
     }
     line.fill(paddr);
+    lumiverseCpuReadNote("dcache-write-miss", paddr, Size, cpu.ipu.pc);
     self.profile.dcacheMisses++;
   } else {
     cpu.step(1 * 2);
