@@ -375,11 +375,64 @@ auto CPU::lumiverseLoadFastConfig() -> void {
     const char* id = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_IDLE");
     const s64 idle = id ? ::atoll(id) : 1024;
     f.idle = idle > 0 ? (idle & ~1) : 0;
+    //LUMIVERSE_ARES_N64_CPU_FAST_POLL (default 4096, 0 = off): clock quantum
+    //stepped on each read of SP_STATUS / SP_DMA_FULL / SP_DMA_BUSY while the
+    //CPU spins polling it — round 14, from the CPU_DIAG histogram of Star
+    //Wars: Rogue Squadron's mission (a `jal isSpBusy; bnez v0` loop around
+    //`lw SP_STATUS; andi 0x1c` was 7% of all executed instructions while
+    //the LLE RSP ran a display list). See lumiversePollStatus(). Quantum:
+    //every warped read ends the batch (a scheduler synchronize), so 512
+    //cost the LLE-RSP mission 9% while 4096 gained 3% there and 27% on
+    //Perfect Dark (whose CPU was spinning through whole batches after the
+    //HLE'd task had finished); 16384 was no better than 4096.
+    const char* pl = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_POLL");
+    const s64 poll = pl ? ::atoll(pl) : 4096;
+    f.poll = poll > 0 ? (poll & ~1) : 0;
     const char* d = ::getenv("LUMIVERSE_ARES_N64_CPU_DIAG");
     f.diag = d ? ::atoi(d) : 0;
   }
   f.memoryLive = f.memory && !GDB::server.hasBreakpoints();
   lumiverseTlbMemoInvalidate();
+}
+
+//Lumiverse addition (round 14): SP status poll-loop warp. Called from
+//rsp/io.cpp for every CPU read of SP_STATUS (4), SP_DMA_FULL (5) or
+//SP_DMA_BUSY (6) with the value being returned. When the same PC reads the
+//same register and sees the same value three times in a row, with no CPU
+//write to an SP register in between and less than 1024 clocks between the
+//reads (a tight loop, not a frame loop that happens to poll), the CPU is
+//busy-waiting on the RSP or its DMA engine — the only other writers of
+//those bits. From then on each such read steps the machine one quantum
+//(bounded by the Compare timer and the next queued event, exactly like the
+//CPU_FAST_IDLE `j self` skip) and ends the batch so the RSP/DMA threads
+//catch up; the read still returns the value it saw. Nothing but the
+//latency of noticing the status change (<= the quantum, 4096 clocks =
+//22 us) is altered: the loop's own instructions still execute, just
+//fewer times per RSP task.
+auto CPU::lumiversePollStatus(u32 reg, u32 value) -> void {
+  const auto& fast = lumiverseFast;
+  if(!fast.poll) return;
+  auto& p = lumiversePoll;
+  const u64 pc = ipu.pc;
+  const s64 now = Thread::clock;
+  if(pc == p.pc && reg == p.reg && value == p.value && p.serial == p.serialSeen && (now - p.clock) < 1024) {
+    if(++p.count >= 3) {
+      s64 wait = fast.poll;
+      const s64 timerDelta = (s64)(u64)n33(scc.compare - scc.count) * 2;
+      const s64 queueDelta = queue.timeToNextEvent();
+      if(timerDelta > 0 && timerDelta < wait) wait = timerDelta;
+      if(queueDelta > 0 && queueDelta < wait) wait = queueDelta;
+      wait &= ~1;
+      if(wait >= 4) {
+        step((u32)wait);
+        jitClockTarget = Thread::clock;  //end the batch: synchronize() runs the RSP/RDP/AI/VI up to now
+        p.warps++;
+      }
+    }
+  } else {
+    p.pc = pc; p.reg = reg; p.value = value; p.count = 1; p.serialSeen = p.serial;
+  }
+  p.clock = Thread::clock;
 }
 
 auto CPU::instructionPrologue(u64 address, u32 instruction) -> void {

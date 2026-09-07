@@ -366,8 +366,24 @@ struct CPU : Thread {
     bool memoryLive = false;  //memory && no GDB breakpoints/watchpoints (refreshed per synchronize)
     bool tlb = false;     //CPU_FAST_TLB: one-page translation memo for TLB-mapped RDRAM (fetch/load/store)
     s64  idle = 0;        //CPU_FAST_IDLE: clock quantum stepped through a `j self; nop` idle loop (0 = off)
+    s64  poll = 0;        //CPU_FAST_POLL: clock quantum stepped per read while the CPU spins reading SP_STATUS/DMA_FULL/DMA_BUSY (0 = off)
     int  diag = 0;        //CPU_DIAG: 1 = batch telemetry, 2 = + PC histogram
   } lumiverseFast;
+  //Lumiverse addition (round 14): SP status poll-loop detector, see
+  //lumiversePollStatus() in cpu.cpp. serial counts CPU-side SP register
+  //writes (rsp/io.cpp) so a loop that writes SP registers is never warped.
+  struct LumiversePoll {
+    u64 pc = 0;          //PC of the last CPU read of an SP status register
+    u32 reg = 0;         //which register (4 = SP_STATUS, 5 = DMA_FULL, 6 = DMA_BUSY)
+    u32 value = 0;       //value it returned
+    u32 count = 0;       //consecutive identical reads from that PC
+    u64 serial = 0;      //CPU writes to SP registers so far
+    u64 serialSeen = 0;  //serial at the last read
+    s64 clock = 0;       //Thread::clock after the last read (post-warp)
+    u64 warps = 0;       //diagnostic
+  } lumiversePoll;
+  auto lumiversePollStatus(u32 reg, u32 value) -> void;
+  auto lumiversePollNoteWrite() -> void { lumiversePoll.serial++; }
 
   //Lumiverse addition (round 8): last successful TLB translation per
   //direction, 4 KiB granularity, for games whose code and data live in
