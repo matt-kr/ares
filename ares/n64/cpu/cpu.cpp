@@ -386,7 +386,21 @@ auto CPU::lumiverseLoadFastConfig() -> void {
     //Perfect Dark (whose CPU was spinning through whole batches after the
     //HLE'd task had finished); 16384 was no better than 4096.
     const char* pl = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_POLL");
-    const s64 poll = pl ? ::atoll(pl) : 4096;
+    s64 poll = pl ? ::atoll(pl) : 4096;
+    //round 15 regression pass: Conker's Bad Fur Day (game code NFU) hangs
+    //at its "mature audiences" boot screen under the relaxed IO sync with
+    //the warp at 4096 (also 4094, 4098, 8192; 512 / 2048 / 16384 / 65536
+    //boot, as do POLL=0, RELAX_IO_SYNC=0 and CPU_FAST=0) — 27 of 27 runs
+    //with the app env, reproducible, no RDP crash, CPU parked at
+    //0x1000117c with no SyncFull ever reaching the RDP. The mechanism is a
+    //quantum-specific race in its boot handshake that is not understood, so
+    //the warp is off for this title; LUMIVERSE_ARES_N64_CPU_FAST_POLL_FORCE=1
+    //keeps the configured quantum for experiments.
+    if(poll > 0 && cartridge.rom.size >= 0x40) {
+      const char code[4] = { (char)cartridge.rom.read<Byte>(0x3b), (char)cartridge.rom.read<Byte>(0x3c), (char)cartridge.rom.read<Byte>(0x3d), 0 };
+      const char* force = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_POLL_FORCE");
+      if(!::strcmp(code, "NFU") && !(force && *force == '1')) poll = 0;
+    }
     f.poll = poll > 0 ? (poll & ~1) : 0;
     const char* d = ::getenv("LUMIVERSE_ARES_N64_CPU_DIAG");
     f.diag = d ? ::atoi(d) : 0;

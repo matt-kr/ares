@@ -165,7 +165,10 @@ static auto lumiverseCpuReadLog() -> LumiverseCpuReadLog& {
 auto lumiverseCpuReadNote(const char* kind, u32 paddr, u32 length, u64 pc) -> void {
   auto& l = lumiverseCpuReadLog();
   if(!l.on || paddr + length <= l.lo || paddr >= l.hi) return;
-  if(l.lines++ < 600) fprintf(stderr, "[cpu-read] %s paddr=%06x len=%u pc=%08llx\n", kind, paddr, length, (unsigned long long)(pc & 0xffffffff));
+  //round 15: the RSP cycle counter next to each read (to place the read on
+  //the audio task's timeline); LUMIVERSE_ARES_N64_CPU_READ_LOG_LINES caps
+  static const u32 maxLines = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CPU_READ_LOG_LINES"); return v ? (u32)::atoi(v) : 600u; }();
+  if(l.lines++ < maxLines) fprintf(stderr, "[cpu-read] %s paddr=%06x len=%u pc=%08llx rspc=%llu\n", kind, paddr, length, (unsigned long long)(pc & 0xffffffff), (unsigned long long)rsp.profile.cycles);
 }
 
 template<u32 Size>

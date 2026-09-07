@@ -20,6 +20,11 @@ auto RDP::unload() -> void {
 
 auto RDP::crash(const char *reason) -> void {
   debug(unusual, "[RDP] software triggered a hardware bug; RDP crashed and will stop responding. Reason: ", reason);
+  //Lumiverse (round 15): the notice above is invisible without a debugger;
+  //a latched RDP crash is a permanent hang for a fifo/xbus microcode
+  //(DPC_STATUS reads freeze + busy forever), so say so on stderr where the
+  //smoke harness and the device console see it
+  fprintf(stderr, "[rdp] RDP crashed (latched, will not respond again): %s\n", reason ? reason : "?");
   command.crashed = 1;
   //guard against asynchronous reporting of crash state. We want the RDP to report that it's busy forever
   command.pipeBusy = 1;

@@ -299,6 +299,22 @@ constexpr u64 LumiverseAudioPrefixMK64   = 0x9cf990efdedb3b1eull;
 constexpr u64 LumiverseAudioPrefixPWSOTE = 0x1d095e498bf7f786ull;
 constexpr u64 LumiverseAudioPrefixGE     = 0xea212b6bce94100cull;
 constexpr u64 LumiverseAudioPrefixPM     = 0x4ea075cb3bd248f6ull;  //Paper Mario (naudio family, round 12)
+//round 15: San Francisco Rush's stable image (fabfd6fff1f6c2f1) shares the
+//Pilotwings/SOTE/Cruis'n World prefix and had been running on the ABI1
+//executor since round 11 without a gate (round 9 had NOT shipped it: WAV
+//envCorr 0.84). Regression pass with the app env: shadow per-task exact
+//(level 0.999, dratio 1.000 over 10500 writes) but fair gate 0.908 / 0.910
+//and real gate 0.82 / 0.80 with the race diverging — the game path is
+//sensitive to the task timing in a way the other ABI1 titles are not.
+//Correct beats fast: excluded from the prefix family, runs LLE.
+//LUMIVERSE_ARES_N64_AUDIO_HLE_RUSH=1 opts it back in.
+constexpr u64 LumiverseAudioUcodeRush    = 0xfabfd6fff1f6c2f1ull;
+//round 15: Tony Hawk's Pro Skater 2's audio image (stable, 971eca78873b6c68)
+//shares Paper Mario's 3 KiB prefix and is dispatched through the PM prefix
+//entry above. Shadow: 2049 tasks / 0 fallbacks, level 1.000, 0 bad writes
+//over 4715 buffer writes; real gate vs LLE audio on the app timeline 0.976,
+//level 0.998 (the round-14 "level 0.129" was an intermediate binary's run,
+//not reproducible on the shipped code). Kept on the executor.
 
 auto lumiverseAudioDialectForPrefixHash(u64 prefixHash) -> s32 {
   if(const s32 tried = lumiverseAudioTryDialect(prefixHash); tried >= 0) return tried;
@@ -2655,6 +2671,8 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   if(level < 1) return false;
   s32 dialect = lumiverseAudioDialectForHash(ucodeHash);
   bool polefFir = false;
+  static const bool rushOptIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_RUSH"); return v && v[0] == '1'; }();
+  if(dialect < 0 && ucodeHash == LumiverseAudioUcodeRush && !rushOptIn) return false;
   if(dialect < 0) {
     //self-modifying ucode? identify the family by its stable prefix
     const u32 ucode = task[4] & 0x00ffffff;
@@ -2905,9 +2923,15 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
       if(costModel && lumiverseAudioCmdCostCount < 8192) { cost += lumiverseAudioRareCost[op]; lumiverseAudioCmdCostPrefix[lumiverseAudioCmdCostCount++] = cost; }
     }
     lumiverseAudioSetDeferredCommands(commands);
+    //round 15 diagnostic (DEBUG>=2): the task's dispatch time on the RSP
+    //cycle counter, its command count and (real HLE) the modelled duration,
+    //so the CPU read log (rspc=) can be placed on the task timeline
+    if(lumiverseAudioHLEDebug() >= 2) fprintf(stderr, "[rsp-hle-audio-task] dispatch rspc=%llu modelled=%u cmds=%u shadow=%u\n",
+      (unsigned long long)rsp.profile.cycles, shadow.active ? 0u : (costModel ? cost : 0u), commands, (u32)shadow.active);
     if(!shadow.active) {
       if(lumiverseAudioCyclesPerCommand() > 0) lumiverseHLERequestedCompletionCycles = (s32)(commands * (u32)lumiverseAudioCyclesPerCommand());
       else if(costModel) lumiverseHLERequestedCompletionCycles = (s32)cost;
+
     }
   }
   if(shadow.active) {
