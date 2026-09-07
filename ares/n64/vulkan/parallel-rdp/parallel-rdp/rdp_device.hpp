@@ -134,6 +134,9 @@ public:
 	// Queues up state and drawing commands.
 	void enqueue_command(unsigned num_words, const uint32_t *words);
 	void enqueue_command_direct(unsigned num_words, const uint32_t *words);
+	// LUMIVERSE: batched enqueue (see CommandRing::enqueue_commands); falls
+	// back to per-command enqueue_command when the ring thread is not used
+	void enqueue_commands(unsigned count, const CommandRing::BatchedCommand *commands);
 
 	void set_quirks(const Quirks &quirks);
 

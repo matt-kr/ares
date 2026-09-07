@@ -46,6 +46,11 @@ public:
 	void drain();
 
 	void enqueue_command(unsigned num_words, const uint32_t *words);
+	// LUMIVERSE: enqueue a run of commands under one lock acquisition and one
+	// wake-up (the per-command lock + notify was 11% of the emulation thread
+	// in Star Wars: Rogue Squadron missions). Same ring layout and ordering.
+	struct BatchedCommand { unsigned num_words; const uint32_t *words; };
+	void enqueue_commands(unsigned count, const BatchedCommand *commands);
 
 private:
 	CommandProcessor *processor = nullptr;

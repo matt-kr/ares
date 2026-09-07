@@ -204,6 +204,21 @@ auto Vulkan::processQueuedCommands() -> bool {
   u32& queueSize = implementation->queueSize;
   u32& queueOffset = implementation->queueOffset;
 
+  //LUMIVERSE (round 13): LUMIVERSE_ARES_N64_RDP_BATCH (default 1, 0 = off):
+  //hand runs of commands to the RDP thread under one lock + one wake-up
+  //instead of one per command (a `sample` of Star Wars: Rogue Squadron
+  //missions put 11% of the emulation thread in that mutex/condvar pair).
+  //The run is flushed before anything that must observe ordering (the
+  //SyncFull timeline signal) and at the end of the queue, so the command
+  //stream the RDP thread sees is unchanged.
+  static const bool batch = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RDP_BATCH"); return !v || v[0] != '0'; }();
+  ::RDP::CommandRing::BatchedCommand pending[64];
+  u32 pendingCount = 0;
+  auto flush = [&]() {
+    if(pendingCount) implementation->processor->enqueue_commands(pendingCount, pending);
+    pendingCount = 0;
+  };
+
   while(queueOffset < queueSize) {
     u32 op = buffer[queueOffset * 2];
     u32 code = op >> 24 & 63;
@@ -211,14 +226,21 @@ auto Vulkan::processQueuedCommands() -> bool {
 
     if(queueOffset + length > queueSize) {
       //partial command, keep data around for next processing call
+      flush();
       return false;
     }
 
     if(code >= 8) {
-      implementation->processor->enqueue_command(length * 2, buffer + queueOffset * 2);
+      if(batch) {
+        pending[pendingCount++] = { length * 2, buffer + queueOffset * 2 };
+        if(pendingCount == 64) flush();
+      } else {
+        implementation->processor->enqueue_command(length * 2, buffer + queueOffset * 2);
+      }
     }
 
     if(::RDP::Op(code) == ::RDP::Op::SyncFull) {
+      flush();
       u64 timeline = implementation->processor->signal_timeline();
       const u64 waitStart = LumiverseStallStats::nowNs();
       if(lumiverseDeferSyncFullWait()) {
@@ -243,6 +265,7 @@ auto Vulkan::processQueuedCommands() -> bool {
 
     queueOffset += length;
   }
+  flush();
 
   queueOffset = 0;
   queueSize = 0;

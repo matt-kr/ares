@@ -876,6 +876,19 @@ void CommandProcessor::enqueue_command_inner(unsigned num_words, const uint32_t 
 		ring.enqueue_command(num_words, words);
 }
 
+void CommandProcessor::enqueue_commands(unsigned count, const CommandRing::BatchedCommand *commands)
+{
+	// LUMIVERSE: the dump writer and the single-threaded path keep their
+	// per-command semantics; only the ring thread gets the batched form
+	if (dump_writer || single_threaded_processing)
+	{
+		for (unsigned c = 0; c < count; c++)
+			enqueue_command(commands[c].num_words, commands[c].words);
+		return;
+	}
+	ring.enqueue_commands(count, commands);
+}
+
 void CommandProcessor::enqueue_command(unsigned num_words, const uint32_t *words)
 {
 	if (dump_writer && !dump_in_command_list)
