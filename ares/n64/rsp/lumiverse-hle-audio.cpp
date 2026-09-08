@@ -2796,6 +2796,38 @@ auto lumiverseAudioNaStateWrites() -> bool {
   return value;
 }
 u16 lumiverseAudioNaLastBlockLanes[3] = {};
+//round 16: LUMIVERSE_ARES_N64_AUDIO_HLE_ABI_COST (default 1): the ABI1/ABI2
+//executors report task completion after commands x the title's measured
+//LLE cost instead of instantly. With the live COP0 Count (CPU_FAST_COUNT)
+//the game can see how long an audio task takes; instant completion moved
+//the H-vs-M0 gates of every ABI title that times its audio thread (SF64
+//0.998 -> 0.971, SM64 0.996 -> 0.984, Pilotwings 0.946 -> 0.889) and the
+//measured mean restores them (0.998 / 0.997 with all frames identical /
+//0.951). Means = our own LLE's per-task RSP cycles over the shadow runs of
+//this round (the "LLE task duration" line), keyed on the stable ucode hash
+//or the self-modifying family's prefix; unknown ABI images get 600.
+auto lumiverseAudioAbiCostModel() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_ABI_COST"); return !v || v[0] != '0'; }();
+  return value;
+}
+auto lumiverseAudioAbiCyclesPerCommand(u64 ucodeHash, u64 prefixHash) -> s32 {
+  struct Entry { u64 hash; s32 cycles; };
+  static const Entry byHash[] = {
+    { LumiverseAudioUcodeStarFox64, 879 }, { LumiverseAudioUcodeSM64WR, 670 },   //SM64 684, Wave Race 652
+    { LumiverseAudioUcodeZeldaOoTU, 931 }, { LumiverseAudioUcodeZeldaMQ, 860 },
+    { LumiverseAudioUcodeMajoraU, 930 },   //Majora 947, Pokemon Stadium 2 (same image) 908
+    { LumiverseAudioUcodeSnapU, 390 }, { LumiverseAudioUcodeDoom64, 472 }, { LumiverseAudioUcodeCruisnUSA, 512 },
+    { LumiverseAudioUcodeRush, 436 }, { LumiverseAudioUcodeYoshi, 937 },
+  };
+  static const Entry byPrefix[] = {
+    { LumiverseAudioPrefixMK64, 843 }, { LumiverseAudioPrefixGE, 514 },
+    { LumiverseAudioPrefixPWSOTE, 370 },   //Pilotwings 365, Shadows of the Empire 385, Cruis'n World 369
+  };
+  for(auto& e : byHash) if(e.hash == ucodeHash) return e.cycles;
+  for(auto& e : byPrefix) if(e.hash == prefixHash) return e.cycles;
+  return 600;
+}
+
 auto lumiverseAudioCyclesPerCommand() -> s32 {
   static const s32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_AUDIO_CYCLES_PER_CMD"); return v ? ::atoi(v) : 0; }();
   return value;
@@ -2809,12 +2841,13 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   bool polefFir = false;
   static const bool rushOptOut = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_RUSH"); return v && v[0] == '0'; }();
   if(dialect < 0 && ucodeHash == LumiverseAudioUcodeRush && rushOptOut) return false;
+  u64 prefixHash = 0;
   if(dialect < 0) {
     //self-modifying ucode? identify the family by its stable prefix
     const u32 ucode = task[4] & 0x00ffffff;
     const u32 ucodeSize = task[5];
     if(ucode && (ucodeSize == 0 || ucodeSize >= LumiverseAudioUcodePrefixLength)) {
-      const u64 prefixHash = lumiverseHashRDRAM(ucode, LumiverseAudioUcodePrefixLength);
+      prefixHash = lumiverseHashRDRAM(ucode, LumiverseAudioUcodePrefixLength);
       dialect = lumiverseAudioDialectForPrefixHash(prefixHash);
       polefFir = prefixHash == LumiverseAudioPrefixPM;
     }
@@ -3081,10 +3114,12 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
     //so the CPU read log (rspc=) can be placed on the task timeline
     if(lumiverseAudioHLEDebug() >= 2) fprintf(stderr, "[rsp-hle-audio-task] dispatch rspc=%llu modelled=%u cmds=%u shadow=%u\n",
       (unsigned long long)rsp.profile.cycles, shadow.active ? 0u : (costModel ? cost : 0u), commands, (u32)shadow.active);
+    //round 16: ABI1/ABI2 titles complete after their measured mean cost (naudio titles stay instant)
+    const s32 abiCost = (!rareEngine && dialect != (s32)LumiverseAudioDialectNaudio && lumiverseAudioAbiCostModel()) ? lumiverseAudioAbiCyclesPerCommand(ucodeHash, prefixHash) : 0;
     if(!shadow.active) {
       if(lumiverseAudioCyclesPerCommand() > 0) lumiverseHLERequestedCompletionCycles = (s32)(commands * (u32)lumiverseAudioCyclesPerCommand());
       else if(costModel) lumiverseHLERequestedCompletionCycles = (s32)cost;
-
+      else if(abiCost > 0) lumiverseHLERequestedCompletionCycles = (s32)(commands * (u32)abiCost);
     }
   }
   if(shadow.active) {
