@@ -41,6 +41,17 @@ auto lumiverseSpTraceOn() -> bool;  //rdp/io.cpp (round 16): LUMIVERSE_ARES_N64_
 auto lumiverseSpTrace(const char* who, const char* op, const char* reg, u32 value, u64 extra) -> void;
 #include "dma.cpp"
 extern u64 lumiverseRdpTaskTag;  //rdp/io.cpp: graphics-task ordinal for dump alignment
+extern bool lumiverseDPInterruptDefer;    //rdp/io.cpp (round 19): SyncFull interrupt held during an HLE graphics task's modelled duration
+extern bool lumiverseDPInterruptPending;
+auto lumiverseAiTrace(const char* what, u32 a, u32 b, u32 c) -> void;  //ai/ai.cpp (round 19): LUMIVERSE_ARES_N64_AI_TRACE
+auto lumiverseAiTraceOn() -> bool;
+namespace {
+  //lumiverse-hle-gfx.cpp (round 19): LLE graphics task duration + display-list
+  //features for the per-opcode cost fit (LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST_LOG)
+  auto lumiverseGfxNoteTaskEnd(u64 cycles, bool yielded) -> void;
+  //lumiverse-hle.cpp: type (1 gfx / 2 audio) of the HLE task whose completion is pending
+  extern u32 lumiverseHLEPendingType;
+}
 #include "lumiverse-async-audio.cpp"
 #include "lumiverse-hle.cpp"
 #include "lumiverse-hle-gfx.cpp"
@@ -82,14 +93,7 @@ auto RSP::main() -> void {
       lumiverseHLEPendingCycles -= 128;
       //round 14: the audio HLE's deferred RDRAM output lands progressively over the modelled duration
       lumiverseAudioProgressDeferredWrites(lumiverseHLERequestedCompletionCycles - lumiverseHLEPendingCycles, lumiverseHLERequestedCompletionCycles);
-      if(lumiverseHLEPendingCycles <= 0) {
-        lumiverseHLEPendingCycles = 0;
-        lumiverseAudioFlushDeferredWrites();  //round 14: the task's RDRAM output lands at completion
-        status.halted = 1;
-        status.broken = 1;
-        status.signal[2] = 1;
-        if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
-      }
+      if(lumiverseHLEPendingCycles <= 0) lumiverseHLEDeliverCompletion();
     } else if(status.halted) {
       //Lumiverse addition: settle a truncated-task audio-HLE shadow compare
       //(debug tool; the game typically crashes after the experiment, so the
@@ -107,6 +111,23 @@ auto RSP::main() -> void {
 
     dmaStep(Thread::clock - clock);
   }
+}
+
+auto RSP::lumiverseHLEDeliverCompletion() -> void {
+  lumiverseHLEPendingCycles = 0;
+  lumiverseAudioFlushDeferredWrites();  //round 14: the task's RDRAM output lands at completion
+  //round 19: the SyncFull of the RDP stream this task queued at dispatch
+  //lands with the task (LLE order: the microcode's last DPC_END, then BREAK)
+  if(lumiverseDPInterruptPending) {
+    lumiverseDPInterruptPending = false;
+    mi.raise(MI::IRQ::DP);
+  }
+  //mirror BREAK semantics + the microcode's task-done signal (SIG2)
+  status.halted = 1;
+  status.broken = 1;
+  status.signal[2] = 1;
+  if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+  if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("hle-done", lumiverseHLEPendingType, 0, 0);
 }
 
 auto RSP::instruction() -> void {
@@ -239,6 +260,8 @@ auto RSP::power(bool reset) -> void {
   //first dispatch (RSP::main would otherwise count the stale cycles down,
   //land the old output in the new RDRAM and raise a spurious SP interrupt)
   lumiverseHLEPendingCycles = 0;
+  lumiverseDPInterruptDefer = false;
+  lumiverseDPInterruptPending = false;
   lumiverseHLEPowerReset();
   Thread::reset();
   dmem.fill();

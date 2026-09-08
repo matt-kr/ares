@@ -616,7 +616,8 @@ auto RDP::syncTile() -> void {
 //0x29
 auto RDP::syncFull() -> void {
   if(!command.crashed) {
-    mi.raise(MI::IRQ::DP);
+    if(lumiverseDPInterruptDefer) lumiverseDPInterruptPending = true;  //round 19: delivered at the HLE task's modelled completion
+    else mi.raise(MI::IRQ::DP);
     command.bufferBusy = 0;
     command.pipeBusy = 0;
   }

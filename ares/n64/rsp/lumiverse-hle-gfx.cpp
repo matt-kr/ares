@@ -197,7 +197,29 @@ auto lumiverseGfxAlignedChunk(const LumiverseGfxOut& out, u32 offset, u32 limit)
   return boundary;
 }
 
+//round 19: LUMIVERSE_ARES_N64_RSP_HLE_GFX_SHADOW=1 — at census level (LLE
+//executes every task) the executor also runs each whitelisted task with its
+//RDP output DISCARDED, so the projected-vertex dump describes exactly the
+//frame the LLE microcode drew (Conker's timeline is host-speed dependent, so
+//an HLE run's frame N is not the LLE run's frame N)
+static bool lumiverseGfxShadowDiscard = false;
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_SHADOW_DUMP=<path>: the shadow executor's RDP
+//stream as text words, tagged like the LLE RDP_STREAM_DUMP of the same run
+auto lumiverseGfxShadowDumpFile() -> FILE* {
+  static FILE* file = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_SHADOW_DUMP");
+    return path && path[0] ? fopen(path, "w") : nullptr;
+  }();
+  return file;
+}
 auto lumiverseGfxFlush(LumiverseGfxOut& out) -> void {
+  if(lumiverseGfxShadowDiscard) {
+    if(FILE* dump = lumiverseGfxShadowDumpFile()) {
+      fprintf(dump, "kick task=%llu src=shadow cur=000000 end=%06x\n", (unsigned long long)lumiverseRdpTaskTag, out.count * 4);
+      for(u32 index = 0; index + 1 < out.count; index += 2) fprintf(dump, "  %08x %08x\n", out.words[index], out.words[index + 1]);
+    }
+    out.count = 0; return;
+  }
   if(out.count == 0) return;
 
   if(out.fifo) {
@@ -390,6 +412,32 @@ struct LumiverseGfxMachine {
 //post-intro display list; n64js lists 0x08 as G_LINE3D (line microcodes
 //only). Experiment knob: treat it as a no-op instead of failing the task
 //over to LLE, validated against LLE frame checkpoints (round 8).
+//round 19: Conker's Bad Fur Day "F3DEXBG.NoN fifo 2.08" — the current task
+//runs Rare's custom F3DEX2 build (set by lumiverseGfxResolveDialect). Its
+//display lists carry opcodes 0x10-0x1f (every one of the sixteen, plus the
+//standard 0x01 VTX / 0x05 TRI1 / 0x06 TRI2 next to them) — our DL dumps of
+//the intro: one 8-byte command each, followed by ordinary GBI2 commands,
+//not a packed-data run as round 8 assumed. Decoded empirically against the
+//LLE RDP stream (see lumiverseGfxConkerTriangles).
+static bool lumiverseGfxConker = false;
+//LUMIVERSE_ARES_N64_CONKER_TRI_DECODE: candidate bit layout for the 0x1x
+//triangle-list command while it is being established (0 = draw nothing)
+auto lumiverseGfxConkerTriDecode() -> int {
+  static const int value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_TRI_DECODE"); return v ? ::atoi(v) : 4; }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_VTX_DUMP=<path>: the executor's projected
+//screen position of every loaded vertex + every Conker 0x1x command, tagged
+//by the RDP task ordinal — the ground truth the LLE RDP stream's triangles
+//are matched against to read the command's index layout
+auto lumiverseGfxVtxDumpFile() -> FILE* {
+  static FILE* file = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_VTX_DUMP");
+    return path && path[0] ? fopen(path, "w") : nullptr;
+  }();
+  return file;
+}
+
 auto lumiverseGfxOp08NoOp() -> bool {
   static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_GBI2_OP08_NOOP"); return v && v[0] == '1'; }();
   return value;
@@ -473,6 +521,11 @@ auto lumiverseGfxLoadUcodeDialect(u32 textAddress) -> s32 {
   case LumiverseUcodeF3DEX2NoN208: case LumiverseUcodeF3DEX2204H: case LumiverseUcodeF3DEX2206:
   case LumiverseUcodeF3DEX2207: case 0xfdeacd35544ff754ull: case LumiverseUcodeF3DEX2NoN208H:
   case LumiverseUcodeF3DEX2208K: case LumiverseUcodeF3DEX2208:
+    dialect = LumiverseDialectGBI2; break;
+  //round 19: Conker's Bad Fur Day reloads its OWN resident image (text
+  //0c1060) with G_LOAD_UCODE in every frame's display list; the walker used
+  //to stop there, so only the prefix of each DL was ever seen
+  case 0x63a15d2f6bdae1f5ull:
     dialect = LumiverseDialectGBI2; break;
   default: break;
   }
@@ -1000,6 +1053,19 @@ auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address
       vertex.g = lumiverseGfxByte(colorBase + 1);
       vertex.b = lumiverseGfxByte(colorBase + 2);
       vertex.a = lumiverseGfxByte(colorBase + 3);
+    }
+  }
+  if(FILE* dump = lumiverseGfxVtxDumpFile()) {
+    static u32 lines = 0;
+    if(lines++ < 400000) {
+      fprintf(dump, "vtx task=%llu v0=%u n=%u at=%06x vp=%.2f,%.2f,%.2f,%.2f ratio=%.2f geom=%08x\n", (unsigned long long)lumiverseRdpTaskTag, v0, n, address,
+        m.vpTransX, m.vpScaleX, m.vpTransY, m.vpScaleY, m.clipRatio, m.geometryMode);
+      for(u32 index = v0; index < v0 + n; index++) {
+        const auto& v = m.verts[index];
+        const f32 invW = v.w != 0.0f ? 1.0f / v.w : 0.0f;
+        fprintf(dump, "  %2u: sx=%.2f sy=%.2f z/w=%.4f w=%.2f clip=%02x rgba=%.0f,%.0f,%.0f,%.0f xyz=%.3f,%.3f,%.3f uv=%.2f,%.2f\n", index,
+          m.vpTransX + m.vpScaleX * (v.x * invW), m.vpTransY - m.vpScaleY * (v.y * invW), v.z * invW, v.w, v.clip, v.r, v.g, v.b, v.a, v.x, v.y, v.z, v.u, v.v);
+      }
     }
   }
 }
@@ -2343,6 +2409,61 @@ auto lumiverseGfxExecuteTask(LumiverseGfxMachine& m, u32 pc,
 //----------------------------------------------------------------------------
 
 //screen-space depth of a stored vertex (viewport z units, 0..~1023)
+//Conker 0x10-0x1f: candidate decodes of one 8-byte command into triangles
+//over the standard vertex buffer (indices < 32). Variant 1: the 60 bits
+//below the opcode's top nibble as twelve 5-bit indices, most significant
+//first, four triangles; a triangle with a repeated index is padding.
+//Variant 2: the 56 bits below the opcode byte as eleven 5-bit indices
+//(three triangles + a spare bit). Variant 3: as 1 but least significant
+//first. Which one the microcode implements is settled by the RDP stream
+//diff (rdpcmp.py) — see the round-19 report.
+auto lumiverseGfxConkerTriangles(LumiverseGfxMachine& m, u32 cmd0, u32 cmd1) -> void {
+  if(FILE* dump = lumiverseGfxVtxDumpFile()) fprintf(dump, "cmd task=%llu %08x %08x\n", (unsigned long long)lumiverseRdpTaskTag, cmd0, cmd1);
+  const int variant = lumiverseGfxConkerTriDecode();
+  if(variant == 0) return;
+  const u64 q = (u64)cmd0 << 32 | cmd1;
+  u32 idx[12]; u32 count = 0;
+  if(variant == 1) { for(u32 i = 0; i < 12; i++) idx[i] = (q >> (55 - i * 5)) & 31; count = 12; }
+  else if(variant == 2) { for(u32 i = 0; i < 11; i++) idx[i] = (q >> (51 - i * 5)) & 31; count = 9; }
+  else if(variant == 3) { for(u32 i = 0; i < 12; i++) idx[i] = (q >> (i * 5)) & 31; count = 12; }
+  else if(variant == 4) {
+    //the layout the LLE RDP stream confirms (round 19, N-logo scene, every
+    //command of the first vertex batches matched 4/4): four 15-bit
+    //triangles [v0 bits 0-4][v1 5-9][v2 10-14] — A at bits 0-14, B at
+    //15-29, C at 32-46, D = (bits 47-59 << 2) | bits 30-31 (the opcode's
+    //low nibble is part of D); the microcode issues them as B, A, C, D; a
+    //triangle with a repeated index is padding
+    const u32 tri[4] = { (u32)(q >> 15) & 0x7fff, (u32)q & 0x7fff, (u32)(q >> 32) & 0x7fff, (u32)(((q >> 47) & 0x1fff) << 2 | ((q >> 30) & 3)) };
+    //winding: the field order (bits 0-4, 5-9, 10-14) is the REVERSE of the
+    //draw order — read forward, every triangle of the N-logo scene failed
+    //the executor's backface test while the LLE microcode drew it (the
+    //standard 05/06 triangles keep the normal sense: inverting the cull for
+    //the whole pipeline instead dropped the match rate 57% -> 45%)
+    for(u32 t = 0; t < 4; t++) { idx[t * 3] = tri[t] >> 10 & 31; idx[t * 3 + 1] = tri[t] >> 5 & 31; idx[t * 3 + 2] = tri[t] & 31; }
+    count = 12;
+  }
+  else return;
+  for(u32 t = 0; t + 3 <= count; t += 3) {
+    const u32 a = idx[t], b = idx[t + 1], c = idx[t + 2];
+    if(a == b || b == c || a == c) continue;
+    //the microcode's z rule for these lists (LLE RDP stream of the N-logo
+    //frame, 2,220 decoded candidates vs 770 drawn): a triangle with any
+    //vertex beyond the far plane or in front of the near plane is dropped
+    //whole — no z clipping — while x/y excursions inside the guard band are
+    //drawn (scissored) as usual; backface culling applies with the winding
+    //above (accepted set: 0 of 178 fully-inside triangles back-facing)
+    if(variant == 4 && a < 32 && b < 32 && c < 32 && ((m.verts[a].clip | m.verts[b].clip | m.verts[c].clip) & (LumiverseClipFar | LumiverseClipNear))) { m.trisRejected++; continue; }
+    if(FILE* dump = lumiverseGfxVtxDumpFile()) {
+      const auto& va = m.verts[a]; const auto& vb = m.verts[b]; const auto& vc = m.verts[c];
+      auto sx = [&](const LumiverseGfxVertex& v) { return v.w != 0.0f ? m.vpTransX + m.vpScaleX * (v.x / v.w) : 0.0f; };
+      auto sy = [&](const LumiverseGfxVertex& v) { return v.w != 0.0f ? m.vpTransY - m.vpScaleY * (v.y / v.w) : 0.0f; };
+      fprintf(dump, "tri task=%llu %u %u %u | (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) clip=%02x%02x%02x tris=%llu rej=%llu\n", (unsigned long long)lumiverseRdpTaskTag, a, b, c,
+        sx(va), sy(va), sx(vb), sy(vb), sx(vc), sy(vc), va.clip, vb.clip, vc.clip, (unsigned long long)m.trisEmitted, (unsigned long long)m.trisRejected);
+    }
+    lumiverseGfxDrawTriangle(m, a, b, c, a);
+  }
+}
+
 auto lumiverseGfxVertexScreenZ(LumiverseGfxMachine& m, u32 index) -> f32 {
   const auto& vertex = m.verts[index];
   if(vertex.w < LumiverseWEpsilon) return 0.0f;
@@ -2465,6 +2586,12 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
         (cmd1 >> 1) & 0x7f, 0);
       break;
     }
+
+    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17:
+    case 0x18: case 0x19: case 0x1a: case 0x1b: case 0x1c: case 0x1d: case 0x1e: case 0x1f:
+      if(lumiverseGfxConker) { lumiverseGfxConkerTriangles(m, cmd0, cmd1); break; }
+      lumiverseGfxLogUnimplementedOnce(opcode, cmd0, cmd1);
+      break;
 
     case 0x08: {  //(experiment) G_LINE3D-slot opcode as a no-op (Banjo-Tooie)
       if(!lumiverseGfxOp08NoOp()) {
@@ -2761,6 +2888,19 @@ struct LumiverseGfxCensus {
   bool seen[256] = {};
 };
 
+//round 19: per-task display-list features gathered by the dry-run walkers
+//(reset at each walk): opcode counts, vertices loaded, triangles issued.
+//They feed the graphics cost model (the modelled RSP duration of an HLE
+//task) and the LLE cost log it was fitted on.
+struct LumiverseGfxTaskFeatures {
+  u32 ops[256] = {};
+  u32 commands = 0;
+  u32 vertices = 0;
+  u32 tris = 0;
+};
+static LumiverseGfxTaskFeatures lumiverseGfxTaskFeatures;
+
+
 auto lumiverseGfxOpcodeSupported(u8 opcode) -> bool {
   switch(opcode) {
   case 0x00: case 0x01: case 0x03: case 0x04: case 0x06:
@@ -2814,6 +2954,8 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
   //no other GBI command interleaved; anything else fails the task to LLE
   u32 bakedFirst = 0;
   u32 bakedCount = 0;
+  auto& features = lumiverseGfxTaskFeatures;
+  features = {};
 
   auto segmentAddress = [&](u32 address) -> u32 {
     return (segments[(address >> 24) & 0xf] + (address & 0x00ffffff)) & 0x00ffffff;
@@ -2844,6 +2986,13 @@ auto lumiverseGfxDryRun(u32 pc, LumiverseGfxCensus& census, u32 dialect = Lumive
 
     census.counts[opcode]++;
     if(!census.seen[opcode]) { census.seen[opcode] = true; newOpcode = true; }
+    features.ops[opcode]++;
+    features.commands++;
+    if(!s2dex) {
+      if(opcode == 0x04) features.vertices += ((cmd0 >> 20) & 0xf) + 1;
+      else if(opcode == 0xbf) features.tris += 1;
+      else if(opcode == 0xb1) features.tris += dialect == LumiverseDialectGBI0 ? 4 : 2;
+    }
 
     if(opcode == 0xaf) {  //G_LOAD_UCODE
       const s32 target = lumiverseGfxLoadUcodeDialect(cmd1);
@@ -3164,6 +3313,8 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
   u32 pendingCount = 0;
   bool newOpcode = false;
   bool supported = true;
+  auto& features = lumiverseGfxTaskFeatures;
+  features = {};
 
   auto segmentAddress = [&](u32 address) -> u32 {
     return (segments[(address >> 24) & 0xf] + (address & 0x00ffffff)) & 0x00ffffff;
@@ -3171,6 +3322,19 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
   bool s2dex = false;
   FILE* s2dexDump = lumiverseGfxS2DEXDumpTaskWanted() ? lumiverseGfxS2DEXDumpFile() : nullptr;
   if(s2dexDump) fprintf(s2dexDump, "task %llu dl=%06x dialect=gbi2\n", (unsigned long long)lumiverseRdpTaskTag, rootPC);
+  //round 19: LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP=<path> for GBI2 too
+  //(Conker's custom ops): every walked command of the tasks in the
+  //DL_DUMP_SKIP/DL_DUMP_TASKS window, tagged by the RDP task ordinal so the
+  //LLE RDP stream dump (RDP_STREAM_DUMP, same tag) lines up per task; an
+  //unsupported opcode also dumps the 256 raw qwords that follow it
+  static FILE* dlDump = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP");
+    return path && path[0] ? fopen(path, "w") : nullptr;
+  }();
+  static const u32 dlDumpLimit = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP_TASKS"); return v ? (u32)::atoi(v) : 400u; }();
+  static const u32 dlDumpSkip = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_DL_DUMP_SKIP"); return v ? (u32)::atoi(v) : 0u; }();
+  FILE* dl = dlDump && lumiverseRdpTaskTag > dlDumpSkip && lumiverseRdpTaskTag <= dlDumpSkip + dlDumpLimit ? dlDump : nullptr;
+  if(dl) fprintf(dl, "task %llu dl=%06x dialect=gbi2\n", (unsigned long long)lumiverseRdpTaskTag, rootPC);
 
   u32 steps = 0;
   u32 pc = rootPC;
@@ -3179,9 +3343,17 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
     const u32 cmd1 = lumiverseGfxWord(pc + 4);
     pc += 8;
     const u8 opcode = cmd0 >> 24;
+    if(dl && steps < 20000) fprintf(dl, "  %06x: %08x %08x%s\n", pc - 8, cmd0, cmd1, stackDepth ? "" : " *");
 
     census.counts[opcode]++;
     if(!census.seen[opcode]) { census.seen[opcode] = true; newOpcode = true; }
+    features.ops[opcode]++;
+    features.commands++;
+    if(!s2dex) {
+      if(opcode == 0x01) features.vertices += (cmd0 >> 12) & 0xff;
+      else if(opcode == 0x05) features.tris += 1;
+      else if(opcode == 0x06 || opcode == 0x07) features.tris += 2;
+    }
 
     if(opcode == 0xdd) {  //G_LOAD_UCODE (round 10: F3DZEX <-> S2DEX2)
       const s32 target = lumiverseGfxLoadUcodeDialect(cmd1);
@@ -3224,6 +3396,7 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
       }
     }
 
+    if(lumiverseGfxConker && opcode >= 0x10 && opcode <= 0x1f) continue;  //Conker triangle list (executor)
     if(!lumiverseGfxOpcodeSupportedGBI2(opcode)) {
       static bool logged[256];
       if(!logged[opcode]) {
@@ -3237,6 +3410,16 @@ auto lumiverseGfxDryRunGBI2(u32 rootPC, LumiverseGfxCensus& census) -> bool {
           fprintf(stderr, "[rsp-hle-gfx]   %s %06x: %08x %08x\n",
             offset == 0 ? ">" : " ", at, lumiverseGfxWord(at), lumiverseGfxWord(at + 4));
         }
+      }
+      if(dl) {
+        fprintf(dl, "  unsupported %02x at %06x; raw qwords follow:\n", opcode, pc - 8);
+        for(u32 q = 0; q < 256; q++) fprintf(dl, "  %06x: %08x %08x\n", pc + q * 8, lumiverseGfxWord(pc + q * 8), lumiverseGfxWord(pc + q * 8 + 4));
+        //the segment table + the referenced blocks of the custom command
+        fprintf(dl, "  segments:"); for(u32 s = 0; s < 16; s++) fprintf(dl, " %x=%06x", s, segments[s]); fprintf(dl, "\n");
+        const u32 ref = segmentAddress(cmd1);
+        fprintf(dl, "  cmd1 -> %06x:\n", ref);
+        for(u32 q = 0; q < 128; q++) fprintf(dl, "  %06x: %08x %08x\n", ref + q * 8, lumiverseGfxWord(ref + q * 8), lumiverseGfxWord(ref + q * 8 + 4));
+        fflush(dl);
       }
       supported = false;
       break;  //stop walking: a bad branch would only pollute the census
@@ -3329,11 +3512,13 @@ auto lumiverseGfxEnvDefaultOn(const char* name) -> bool {
   return !value || value[0] != '0';
 }
 
-auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
 #if defined(VULKAN)
-  u32 dialect;
-  u32 gbi0Vertex = LumiverseGBI0VertexStandard;
-  bool geBaked = false;
+//microcode hash -> executor dialect (+ vertex variant, GoldenEye baked-RDP
+//admission); false = not whitelisted or opted out by its env knob
+auto lumiverseGfxResolveDialect(u64 ucodeHash, u32& dialect, u32& gbi0Vertex, bool& geBaked) -> bool {
+  gbi0Vertex = LumiverseGBI0VertexStandard;
+  geBaked = false;
+  lumiverseGfxConker = ucodeHash == 0x63a15d2f6bdae1f5ull;
   switch(ucodeHash) {
   case LumiverseUcodeF3DEXNoN122:   dialect = LumiverseDialectGBI1; break;
   case LumiverseUcodeF3DEX121:      dialect = LumiverseDialectGBI1; break;
@@ -3452,6 +3637,282 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   }
   default: return false;
   }
+  return true;
+}
+
+//----------------------------------------------------------------------------
+//round 19: graphics task duration model
+//----------------------------------------------------------------------------
+//With graphics HLE a task completes at dispatch; the LLE microcode takes
+//1-8 ms of RSP time per frame, and the Zeldas' audio thread schedules
+//around that (round 7: Master Quest title-screen seam clicks 10/14 with
+//instant completion vs 1/1 LLE, the deferred-completion knob at a flat
+//4 ms halved them). Like the audio executors' models (rounds 14/16/18),
+//an HLE graphics task now "runs" for a modelled RSP duration computed from
+//its display list: a per-opcode cycle table + per-vertex + per-triangle
+//costs + a constant, fitted by least squares on LLE task durations of our
+//own emulator (LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST_LOG=1 prints the
+//per-task [rsp-hle-gfx-cost] lines the fit reads). The RDP stream is still
+//queued at dispatch (the picture is identical); its SyncFull interrupt is
+//held until the modelled completion. LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST=0
+//restores instant completion.
+auto lumiverseGfxCostModel() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST"); return !v || v[0] != '0'; }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST_SCALE=<percent> (default 100): scales the
+//modelled duration (A/B lever for the click gates)
+auto lumiverseGfxCostScale() -> u32 {
+  static const u32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST_SCALE"); return v ? (u32)::atoi(v) : 100u; }();
+  return value;
+}
+struct LumiverseGfxCostTable {
+  u32 constant;
+  u32 perVertex;
+  u32 perTri;
+  u32 ops[256];
+};
+//fitted tables (RSP cycles); see the round-19 report for the fit
+//fit (round 19, LLE runs of our own emulator, 4000 steps each, generic
+//script, yielded segments summed): GBI2 = OoT + Master Quest + Majora +
+//Smash (10,448 + 3,780 tasks, rms 5.3% of the mean 5.4 ms task, median
+//1.9%); GBI1 = SF64 + Mario Kart 64 (3,680 tasks, rms 0.8% of 18.7 ms —
+//Banjo-Kazooie excluded: its tasks stall on the DPC FREEZE its engine
+//holds, 58 ms mean); GBI0 = SM64 (1,813 tasks, rms 13% of 32 ms). A flat
+//per-command cost was 13.6% / 41% / 18%. Non-negative least squares, so
+//collinear opcodes (VTX vs the triangle it feeds) land on one of them.
+static const LumiverseGfxCostTable lumiverseGfxCostGBI2 = { 0, 0, 0, {
+  0, 0, 0, 0, 0, 1708, 0, 889, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 2710, 1753, 0, 2023, 0, 0, 5715, 0, 0,
+  244, 0, 0, 0, 516, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9801,
+  0, 0, 0, 598, 121, 0, 0, 0, 0, 0, 0, 1100, 0, 0, 0, 0 } };
+static const LumiverseGfxCostTable lumiverseGfxCostGBI1 = { 442, 1934, 1227, {
+  0, 818, 0, 2249, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 548, 0, 0, 0, 2188, 0, 0, 0, 0, 139, 0, 0, 0, 0, 131,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 625, 0, 442, 0, 0, 0, 0, 0, 0,
+  0, 0, 1893, 44, 0, 0, 0, 215, 0, 0, 0, 0, 1579, 0, 0, 0 } };
+//GBI0 (Fast3D) per image: one table per microcode build — fitted together
+//they disagree (16.8% rms; SM64 2.0D vs Pilotwings vs Wave Race vs SOTE vs
+//Cruis'n USA builds have different per-command costs): SM64 1,813 tasks
+//13%, Pilotwings 1,430 tasks 5.7% (76 ms mean!), Wave Race 12%, SOTE 14%,
+//Cruis'n USA 6.2%. GoldenEye / Perfect Dark (baked-RDP Fast3D) stay
+//instant: no fit (their audio gates were built on instant completion).
+static const LumiverseGfxCostTable lumiverseGfxCostSM64 = { 0, 128, 762, {
+  0, 3022, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 17413, 0, 0, 0, 0, 0, 62318, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 111946, 3762, 0, 0, 0, 0, 0 } };
+static const LumiverseGfxCostTable lumiverseGfxCostPW64 = { 0, 919, 0, {
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 5377, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 8190, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 51918, 8165, 0, 0, 0, 0, 0 } };
+static const LumiverseGfxCostTable lumiverseGfxCostWR64 = { 0, 0, 0, {
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 5320, 0, 0, 0, 0, 0, 0, 0, 55446, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 435, 495006, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 47704, 0, 95734, 0, 0, 0, 0, 6163, 0, 0, 0, 0 } };
+static const LumiverseGfxCostTable lumiverseGfxCostSOTE = { 0, 0, 1157, {
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 831, 2450, 0, 165, 0, 0, 0, 1157,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 597, 0, 0, 0, 14287, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 1394, 2028, 0, 0, 224, 0, 0, 0, 0, 0 } };
+static const LumiverseGfxCostTable lumiverseGfxCostCUSA = { 0, 0, 885, {
+  0, 0, 0, 1082, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 3206, 0, 913, 0, 0, 0, 1033, 2168, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 4222, 0, 0, 0, 3511, 0, 0, 0, 853, 0, 1615, 0, 0, 273 } };
+static const LumiverseGfxCostTable lumiverseGfxCostNone = { 0, 0, 0, {} };
+auto lumiverseGfxCostTableFor(u64 ucodeHash, u32 dialect) -> const LumiverseGfxCostTable& {
+  if(dialect == LumiverseDialectGBI2 || dialect == LumiverseDialectS2DEX2) return lumiverseGfxCostGBI2;
+  if(dialect != LumiverseDialectGBI0) return lumiverseGfxCostGBI1;
+  switch(ucodeHash) {
+  case LumiverseUcodeFast3DSM64: return lumiverseGfxCostSM64;
+  case LumiverseUcodeFast3DPW64: return lumiverseGfxCostPW64;
+  case LumiverseUcodeFast3DWR64: return lumiverseGfxCostWR64;
+  case LumiverseUcodeFast3DSOTE: return lumiverseGfxCostSOTE;
+  case LumiverseUcodeFast3DCUSA: return lumiverseGfxCostCUSA;
+  default: return lumiverseGfxCostNone;  //GoldenEye / Perfect Dark: instant
+  }
+}
+auto lumiverseGfxModelledCycles(u64 ucodeHash, u32 dialect, const LumiverseGfxTaskFeatures& f) -> u32 {
+  const LumiverseGfxCostTable& t = lumiverseGfxCostTableFor(ucodeHash, dialect);
+  u64 cycles = t.constant + (u64)f.vertices * t.perVertex + (u64)f.tris * t.perTri;
+  for(u32 op = 0; op < 256; op++) if(f.ops[op]) cycles += (u64)f.ops[op] * t.ops[op];
+  cycles = cycles * lumiverseGfxCostScale() / 100;
+  if(cycles > 20000000) cycles = 20000000;  //0.32 s: a runaway list never wedges the RSP
+  return (u32)cycles;
+}
+
+//cost log: the LLE duration (RSP cycles from dispatch to BREAK) of every
+//graphics task next to its display-list features — walked at dispatch by
+//the same dry-run the HLE uses, so the features are exactly what the model
+//sees. Level 1 (census, LLE execution) runs give the fit data.
+auto lumiverseGfxCostLog() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST_LOG"); return v && v[0] == '1'; }();
+  return value;
+}
+//A yielded task (the OS asks the RSP for the audio task mid-frame — the
+//Zeldas do it every frame: dispatch, yield ~100 us later, audio task, the
+//graphics task resumed with OSTask flags bit 0 set) is ONE task: the
+//segments' durations are summed and the line is printed at the final
+//(non-yielded) BREAK.
+static u64 lumiverseGfxTaskStartCycles = 0;
+static u64 lumiverseGfxTaskAccumulated = 0;
+static u32 lumiverseGfxTaskSegments = 0;
+static u32 lumiverseGfxLoggedDataPtr = 0;
+static LumiverseGfxTaskFeatures lumiverseGfxLoggedFeatures;
+static u32 lumiverseGfxLoggedDialect = 0;
+static u64 lumiverseGfxLoggedHash = 0;
+static bool lumiverseGfxLoggedWalkable = false;
+auto lumiverseGfxNoteTaskDispatch(const u32 task[16], u64 ucodeHash) -> void {
+  const u32 dataPtr = task[12] & 0x00ffffff;
+  const bool resumed = (task[1] & 1) && lumiverseGfxTaskSegments && dataPtr == lumiverseGfxLoggedDataPtr;
+  lumiverseGfxTaskStartCycles = 0;
+  if(resumed) {
+    lumiverseGfxTaskSegments++;
+    lumiverseGfxTaskStartCycles = rsp.profile.cycles ? rsp.profile.cycles : 1;
+    return;
+  }
+  lumiverseGfxTaskAccumulated = 0;
+  lumiverseGfxTaskSegments = 0;
+  u32 dialect, gbi0Vertex; bool geBaked;
+  if(!lumiverseGfxResolveDialect(ucodeHash, dialect, gbi0Vertex, geBaked)) return;
+  if(!dataPtr) return;
+  static LumiverseGfxCensus census;
+  lumiverseGfxLoggedWalkable = dialect == LumiverseDialectGBI2
+    ? lumiverseGfxDryRunGBI2(dataPtr, census)
+    : lumiverseGfxDryRun(dataPtr, census, dialect, geBaked, gbi0Vertex);
+  static const bool shadow = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_SHADOW"); return v && v[0] == '1'; }();
+  if(shadow && lumiverseGfxLoggedWalkable && lumiverseHLELevel() < 2) {
+    static LumiverseGfxMachine machine;
+    machine.out.fifo = false;
+    lumiverseGfxShadowDiscard = true;
+    if(dialect == LumiverseDialectGBI2) lumiverseGfxExecuteTaskGBI2(machine, dataPtr);
+    else lumiverseGfxExecuteTask(machine, dataPtr, dialect, gbi0Vertex, geBaked);
+    lumiverseGfxShadowDiscard = false;
+  }
+  lumiverseGfxLoggedFeatures = lumiverseGfxTaskFeatures;
+  lumiverseGfxLoggedDialect = dialect;
+  lumiverseGfxLoggedHash = ucodeHash;
+  lumiverseGfxLoggedDataPtr = dataPtr;
+  lumiverseGfxTaskSegments = 1;
+  lumiverseGfxTaskStartCycles = rsp.profile.cycles ? rsp.profile.cycles : 1;
+}
+auto lumiverseGfxNoteTaskEnd(u64 cycles, bool yielded) -> void {
+  if(!lumiverseGfxTaskStartCycles) return;
+  lumiverseGfxTaskAccumulated += cycles - lumiverseGfxTaskStartCycles;
+  lumiverseGfxTaskStartCycles = 0;
+  if(yielded) return;  //resumed later with OSTask flags bit 0; printed then
+  const u64 d = lumiverseGfxTaskAccumulated;
+  const u32 segments = lumiverseGfxTaskSegments;
+  lumiverseGfxTaskAccumulated = 0;
+  lumiverseGfxTaskSegments = 0;
+  static u32 lines = 0;
+  if(lines++ >= 60000) return;
+  const auto& f = lumiverseGfxLoggedFeatures;
+  fprintf(stderr, "[rsp-hle-gfx-cost] cycles=%llu dialect=%u walkable=%u segments=%u cmds=%u vtx=%u tri=%u model=%u ops",
+    (unsigned long long)d, lumiverseGfxLoggedDialect, (u32)lumiverseGfxLoggedWalkable, segments, f.commands, f.vertices, f.tris,
+    lumiverseGfxModelledCycles(lumiverseGfxLoggedHash, lumiverseGfxLoggedDialect, f));
+  for(u32 op = 0; op < 256; op++) if(f.ops[op]) fprintf(stderr, " %02x:%u", op, f.ops[op]);
+  fprintf(stderr, "\n");
+}
+#else
+auto lumiverseGfxCostLog() -> bool { return false; }
+auto lumiverseGfxNoteTaskDispatch(const u32 task[16], u64 ucodeHash) -> void { (void)task; (void)ucodeHash; }
+auto lumiverseGfxNoteTaskEnd(u64 cycles, bool yielded) -> void { (void)cycles; (void)yielded; }
+#endif
+
+auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
+#if defined(VULKAN)
+  u32 dialect;
+  u32 gbi0Vertex = LumiverseGBI0VertexStandard;
+  bool geBaked = false;
+  if(!lumiverseGfxResolveDialect(ucodeHash, dialect, gbi0Vertex, geBaked)) return false;
   if(!vulkan.enable) return false;
 
   static LumiverseGfxMachine machine;
@@ -3487,11 +3948,23 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
     rdp.writeWord(0x0c, 0x0001, rsp);  //DPC_STATUS: clear xbus -> RDRAM source
   }
 
+  //round 19: modelled duration — the SyncFull of the stream queued below is
+  //held until the task's completion (RSP::lumiverseHLEDeliverCompletion)
+  const u32 modelledCycles = lumiverseGfxCostModel() && lumiverseHLERequestedCompletionCycles <= 0
+    ? lumiverseGfxModelledCycles(ucodeHash, dialect, lumiverseGfxTaskFeatures) : 0;
+  lumiverseDPInterruptPending = false;
+  lumiverseDPInterruptDefer = modelledCycles > 0;
   const bool ok = dialect == LumiverseDialectGBI2
     ? lumiverseGfxExecuteTaskGBI2(machine, dataPtr)
     : lumiverseGfxExecuteTask(machine, dataPtr, dialect, gbi0Vertex, geBaked);
-  if(ok) tasksExecuted++;
-  else tasksFallback++;
+  lumiverseDPInterruptDefer = false;
+  if(ok) {
+    tasksExecuted++;
+    if(modelledCycles > 0) lumiverseHLERequestedCompletionCycles = (s32)modelledCycles;
+  } else {
+    tasksFallback++;
+    if(lumiverseDPInterruptPending) { lumiverseDPInterruptPending = false; mi.raise(MI::IRQ::DP); }
+  }
 
   if(lumiverseGfxLogLevel() >= 1 && ((tasksExecuted + tasksFallback) & 63) == 1) {
     fprintf(stderr,

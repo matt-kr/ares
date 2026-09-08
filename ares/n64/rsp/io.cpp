@@ -216,19 +216,44 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
     if(data.bit(22) && !data.bit(21)) status.signal[6] = 1;
     if(data.bit(23) && !data.bit(24)) status.signal[7] = 0;
     if(data.bit(24) && !data.bit(23)) status.signal[7] = 1;
+    //round 19: a yield request (SIG0 set) while an HLE graphics task is
+    //"running" for its modelled duration. The work is already done, so the
+    //task answers as the microcode would when it has nothing left: task
+    //done (SIG2), not yielded (SIG1) — the OS then dispatches the audio
+    //task it wanted the RSP for and never resumes this one.
+    //LUMIVERSE_ARES_N64_RSP_HLE_GFX_YIELD=0 ignores the request (the task
+    //completes on its schedule).
+    if(lumiverseHLEPendingCycles > 0 && lumiverseHLEPendingType == 1 && data.bit(10) && !data.bit(9) && lumiverseHLEYieldMode() != 0) {
+      if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("yield-req", lumiverseHLEPendingCycles, lumiverseHLERequestedCompletionCycles, lumiverseHLEYieldMode());
+      if(lumiverseHLEYieldCompletes()) lumiverseHLEDeliverCompletion();
+      else {
+        //yield like the microcode (mode 2): halt as yielded, keep the
+        //remaining modelled cycles for the resume dispatch. The SyncFull
+        //interrupt stays held until the resumed task completes.
+        lumiverseHLEYieldedRemaining = lumiverseHLEPendingCycles;
+        lumiverseHLEYieldedDataPtr = lumiverseHLEYieldedTaskDataPtr;
+        lumiverseHLEPendingCycles = 0;
+        status.halted = 1;
+        status.broken = 1;
+        status.signal[1] = 1;
+        status.signal[2] = 1;
+        if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+      }
+    }
     if(lumiverseHLEComplete) {
       if(lumiverseHLERequestedCompletionCycles > 0) {
         //deferred: report "running" and let RSP::main deliver the
         //completion after the requested emulated duration
         status.halted = 0;
         lumiverseHLEPendingCycles = lumiverseHLERequestedCompletionCycles;
+        lumiverseHLEPendingType = lumiverseHLELastDispatchType;
+        lumiverseHLEYieldedTaskDataPtr = lumiverseHLELastDispatchDataPtr;
       } else {
-        //mirror BREAK semantics + the microcode's task-done signal (SIG2)
-        lumiverseAudioFlushDeferredWrites();  //round 14: instant completion — the output lands now
-        status.broken = 1;
-        status.signal[2] = 1;
-        if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+        lumiverseHLEPendingType = lumiverseHLELastDispatchType;
+        lumiverseHLEDeliverCompletion();
       }
+    } else if(unlikely(lumiverseAiTraceOn()) && data.bit(10) && !data.bit(9) && !status.halted) {
+      lumiverseAiTrace("yield-req", status.halted, 0, 0);  //LLE task — the microcode answers
     }
     //Lumiverse addition: hand a requested audio task to the worker thread
     //only now, after the start write's own set/clear bits (which typically

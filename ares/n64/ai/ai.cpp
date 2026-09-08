@@ -5,6 +5,31 @@ auto lumiverseSpTraceOn() -> bool;  //rdp/io.cpp (round 16): LUMIVERSE_ARES_N64_
 auto lumiverseSpTrace(const char* who, const char* op, const char* reg, u32 value, u64 extra) -> void;
 
 AI ai;
+
+//Lumiverse round 19 diagnostics (the Master Quest seam-click investigation):
+//LUMIVERSE_ARES_N64_AI_TRACE=<path> logs every AI DMA event (enqueue, a
+//buffer starting to play, the queue running dry) and — from the RSP side —
+//task dispatch / completion / yield events on ONE timebase: the DAC output
+//sample index (lumiverseAiSampleIndex, what the app-side WAV is made of),
+//the RSP's monotonic cycle counter and the CPU Count. A click found in the
+//DAC stream can then be placed against the buffer that was playing and the
+//tasks in flight. LUMIVERSE_ARES_N64_AI_DAC_DUMP=<path> writes the raw DAC
+//output (s16le stereo at the DAC rate, before the app's resampler).
+u64 lumiverseAiSampleIndex = 0;
+auto lumiverseAiTrace(const char* what, u32 a, u32 b, u32 c) -> void {
+  static FILE* file = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_AI_TRACE");
+    return path && path[0] ? fopen(path, "w") : nullptr;
+  }();
+  if(!file) return;
+  fprintf(file, "%s idx=%llu rspc=%llu cc=%llu a=%06x b=%u c=%u\n", what,
+    (unsigned long long)lumiverseAiSampleIndex, (unsigned long long)rsp.profile.cycles,
+    (unsigned long long)(u64)cpu.scc.count, a, b, c);
+}
+auto lumiverseAiTraceOn() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AI_TRACE"); return v && v[0]; }();
+  return value;
+}
 #include "io.cpp"
 #include "debugger.cpp"
 #include "serialization.cpp"
@@ -33,9 +58,18 @@ auto AI::main() -> void {
     const char* value = ::getenv("LUMIVERSE_ARES_N64_TIMING_DIAG");
     return value && *value == '1';
   }();
+  static FILE* dacDump = [] () -> FILE* {
+    const char* path = ::getenv("LUMIVERSE_ARES_N64_AI_DAC_DUMP");
+    return path && path[0] ? fopen(path, "wb") : nullptr;
+  }();
   while(Thread::clock < 0) {
     sample();
     stream->frame(dac.left, dac.right);
+    lumiverseAiSampleIndex++;
+    if(dacDump) {
+      const s16 pair[2] = { (s16)(dac.left * 32767.0), (s16)(dac.right * 32767.0) };
+      fwrite(pair, 2, 2, dacDump);
+    }
     step(dac.period);
     if(timingDiag) {
       static u64 samples = 0;
@@ -68,6 +102,9 @@ auto AI::sample() -> void {
       io.dmaLength[0]   = io.dmaLength[1];
       io.dmaOriginPc[0] = io.dmaOriginPc[1];
       mi.raise(MI::IRQ::AI);
+      if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("play", io.dmaAddress[0], io.dmaLength[0], io.dmaCount);
+    } else {
+      if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("dry", 0, 0, 0);
     }
   }
 

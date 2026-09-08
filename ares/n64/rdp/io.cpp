@@ -25,6 +25,15 @@ auto lumiverseDpcLogLimit() -> u32 {
 //Lumiverse diagnostic: graphics-task ordinal (bumped by the RSP dispatch
 //hook) so RDP stream dumps and display-list dumps can be aligned per task
 u64 lumiverseRdpTaskTag = 0;
+//round 19: while a natively-executed graphics task "runs" for its modelled
+//duration (LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST), the SyncFull interrupt of
+//the RDP stream it queued at dispatch is held back and delivered with the
+//task's completion — under the LLE microcode the RDP stream reaches the
+//RDP over the task, so its SyncFull lands at the END of the task, not at
+//dispatch. Set by lumiverseExecuteGraphicsTask around the executor,
+//consumed by RSP::lumiverseHLEDeliverCompletion.
+bool lumiverseDPInterruptDefer = false;
+bool lumiverseDPInterruptPending = false;
 
 auto lumiverseIOPollLog() -> bool {
   static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_IO_POLL_LOG"); return v && v[0] == '1'; }();
@@ -320,7 +329,10 @@ auto RDP::flushCommands() -> void {
     const char* path = ::getenv("LUMIVERSE_ARES_N64_RDP_STREAM_DUMP");
     return path && path[0] ? fopen(path, "w") : nullptr;
   }();
-  if(lumiverseStreamDump && command.end > command.current) {
+  //round 19: _SKIP / _TASKS window on the graphics-task ordinal (the DL dump's tags)
+  static const u64 dumpSkip = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RDP_STREAM_DUMP_SKIP"); return v ? ::strtoull(v, nullptr, 0) : 0ull; }();
+  static const u64 dumpTasks = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RDP_STREAM_DUMP_TASKS"); return v ? ::strtoull(v, nullptr, 0) : ~0ull; }();
+  if(lumiverseStreamDump && command.end > command.current && lumiverseRdpTaskTag > dumpSkip && lumiverseRdpTaskTag <= dumpSkip + dumpTasks) {
     auto& memory = !command.source ? (Memory::Writable&)rdram.ram : (Memory::Writable&)rsp.dmem;
     fprintf(lumiverseStreamDump, "kick task=%llu src=%s cur=%06x end=%06x\n",
       (unsigned long long)lumiverseRdpTaskTag, command.source ? "xbus" : "rdram", (u32)command.current, (u32)command.end);

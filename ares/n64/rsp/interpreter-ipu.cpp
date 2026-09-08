@@ -55,10 +55,12 @@ auto RSP::BREAK() -> void {
   //Lumiverse addition (round 14): in audio reverse-shadow mode the HLE's
   //deferred RDRAM output lands when the microcode itself completes
   lumiverseAudioNoteTaskEnd(profile.cycles);
+  lumiverseGfxNoteTaskEnd(profile.cycles, status.signal[1]);  //round 19: LLE graphics task duration for the cost fit
   lumiverseAudioFlushDeferredWrites();
   status.halted = 1;
   status.broken = 1;
   if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+  if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("break", lumiverseHLELastDispatchType, status.signal[1], status.signal[2]);
   if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("rsp", "BREAK", "-", 0, profile.cycles);
 }
 

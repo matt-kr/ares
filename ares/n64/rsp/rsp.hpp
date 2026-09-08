@@ -310,6 +310,12 @@ struct RSP : Thread, Memory::RCP<RSP> {
   //dispatch instead of instantly, mimicking the microcode's real duration;
   //the RSP reports "running" meanwhile and executes nothing.
   s32 lumiverseHLEPendingCycles = 0;
+  //round 19: the one place a natively-executed task completes — BREAK +
+  //task-done signal + SP interrupt, the audio executor's deferred RDRAM
+  //output, and a SyncFull interrupt held back during the modelled duration
+  //(instant completion, the timed completion in main(), and a yield request
+  //answered as "done" all go through it)
+  auto lumiverseHLEDeliverCompletion() -> void;
 
   //lumiverse-async-audio.cpp
   //Lumiverse addition: opt-in worker-thread execution of audio (type-2)

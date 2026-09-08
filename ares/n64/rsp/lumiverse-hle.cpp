@@ -96,6 +96,35 @@ auto lumiverseHLECompletionCycles(u32 taskType) -> s32 {
   return taskType == 1 ? gfx : audio;
 }
 s32 lumiverseHLERequestedCompletionCycles = 0;
+//round 19: type of the task whose HLE completion is pending / of the last
+//dispatched task (LLE or HLE), for the yield answer and the traces
+u32 lumiverseHLEPendingType = 0;
+u32 lumiverseHLELastDispatchType = 0;
+u32 lumiverseHLELastDispatchDataPtr = 0;
+u32 lumiverseHLEYieldedTaskDataPtr = 0;
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_YIELD: what a yield request (SIG0) does to
+//a graphics task "running" for its modelled duration.
+//  2 (default) = yield like the microcode: the task halts as "yielded"
+//      (SIG1, our LLE trace shows SIG1+SIG2 at that BREAK), the OS runs its
+//      audio task and re-dispatches the graphics task with OSTask flags
+//      bit 0 set; that resume dispatch is NOT re-executed — the task just
+//      runs for its remaining modelled cycles. The Zeldas do this every
+//      frame (LLE trace: dispatch, yield 100 us later, audio task, resume).
+//  1 = answer "done" (SIG2): the task completes at the yield request.
+//  0 = the request is ignored; the task completes on its schedule.
+auto lumiverseHLEYieldMode() -> int {
+  static const int value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_YIELD"); return v ? ::atoi(v) : 2; }();
+  return value;
+}
+auto lumiverseHLEYieldCompletes() -> bool { return lumiverseHLEYieldMode() == 1; }
+//yielded HLE graphics task awaiting its resume dispatch
+s32 lumiverseHLEYieldedRemaining = 0;
+u32 lumiverseHLEYieldedDataPtr = 0;
+//lumiverse-hle-gfx.cpp (round 19): LUMIVERSE_ARES_N64_RSP_HLE_GFX_COST_LOG=1 —
+//walk every graphics task's display list at dispatch (LLE runs included) and
+//print its LLE duration + features at BREAK, the data behind the cost model
+auto lumiverseGfxCostLog() -> bool;
+auto lumiverseGfxNoteTaskDispatch(const u32 task[16], u64 ucodeHash) -> void;
 
 //task census (was function-local in lumiverseTaskDispatchHook): file scope
 //so a power cycle / ROM switch starts a fresh per-ROM census — every ucode
@@ -107,6 +136,10 @@ static u64 lumiverseHLETotalDispatches = 0;
 //round 18: called from RSP::power() (every ROM load, every reset)
 auto lumiverseHLEPowerReset() -> void {
   lumiverseHLERequestedCompletionCycles = 0;
+  lumiverseHLEPendingType = 0;
+  lumiverseHLELastDispatchType = 0;
+  lumiverseHLEYieldedRemaining = 0;
+  lumiverseHLEYieldedDataPtr = 0;
   lumiverseHLESignatureCount = 0;
   lumiverseHLETotalDispatches = 0;
   lumiverseAudioPowerReset();
@@ -213,6 +246,10 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
   //silently absent from it)
   static u64 guardedDispatches = 0;
   static u32 guardedTypes[4];
+  if(unlikely(lumiverseAiTraceOn()) && taskType == 1) {
+    lumiverseAiTrace("ostask", task[1], task[4], task[6]);
+    lumiverseAiTrace("ostask2", task[5], task[7], task[14]);
+  }
   if(taskType != 1 && taskType != 2) {
     guardedDispatches++;
     if(guardedDispatches <= 3 || ((guardedDispatches & 1023) == 0 && lumiverseVerboseLog())) {
@@ -221,6 +258,29 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
         dataPtr, dataSize);
     }
     return false;
+  }
+  //round 19: the resume dispatch of a yielded HLE graphics task. The OS
+  //re-dispatches a yielded task with OSTask flags bit 0 set, ucode_data
+  //pointing at the yield buffer (3 KiB) and — observed on our own LLE trace
+  //vs the HLE run — a ZERO ucode pointer when no microcode ever saved its
+  //state (the LLE microcode's yield leaves a real pointer behind). Nothing
+  //is executed: the RDP stream went out at the first dispatch; the task
+  //runs for its remaining modelled cycles and completes (SyncFull
+  //interrupt included). Checked before the size guards below, which would
+  //otherwise hand the resume to the LLE RSP with nothing to run.
+  if(taskType == 1 && lumiverseHLEYieldedRemaining > 0) {
+    const s32 remaining = lumiverseHLEYieldedRemaining;
+    lumiverseHLEYieldedRemaining = 0;
+    if((task[1] & 1) && dataPtr == lumiverseHLEYieldedDataPtr) {
+      lumiverseHLELastDispatchType = 1;
+      lumiverseHLELastDispatchDataPtr = dataPtr;
+      lumiverseHLERequestedCompletionCycles = remaining;
+      if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("gfx-resume", dataPtr, remaining, task[1]);
+      return true;
+    }
+    //a fresh task instead: the yielded one was abandoned by the OS; its
+    //held SyncFull interrupt goes with it
+    lumiverseDPInterruptPending = false;
   }
   //ucode_size 0 = "microcode already resident" (Conker's Bad Fur Day passes
   //0 for every task; its engine loads the ucode itself): hash the full
@@ -258,6 +318,10 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
   auto& totalDispatches = lumiverseHLETotalDispatches;
   totalDispatches++;
   if(taskType == 1) lumiverseRdpTaskTag++;
+  lumiverseHLELastDispatchType = taskType;
+  lumiverseHLELastDispatchDataPtr = dataPtr;
+  if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace(taskType == 1 ? "gfx-disp" : "aud-disp", dataPtr, dataSize, task[1]);
+  if(taskType == 1 && lumiverseGfxCostLog()) lumiverseGfxNoteTaskDispatch(task, ucodeHash);
 
   LumiverseTaskSignature* signature = nullptr;
   for(u32 index = 0; index < signatureCount; index++) {
@@ -404,6 +468,7 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
       //completion status — BREAK plus the microcode's task-done signal
       //(SIG2, per n64js devices/sp.js TASKDONE|BROKE|HALT) — after the
       //start write's own set/clear bits have been processed.
+      if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("gfx-hle", dataPtr, lumiverseHLERequestedCompletionCycles, 0);
       return true;
     }
   }
@@ -413,7 +478,10 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
   //behavior (mute probe / async / serial LLE) for unrecognized ucodes, tasks
   //that fail validation, and shadow-compare mode (=2).
   if(level >= 2 && taskType == 2) {
-    if(lumiverseExecuteAudioTask(task, ucodeHash)) return true;
+    if(lumiverseExecuteAudioTask(task, ucodeHash)) {
+      if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("aud-hle", dataPtr, lumiverseHLERequestedCompletionCycles, 0);
+      return true;
+    }
   }
 
   //diagnostic (LUMIVERSE_ARES_N64_MUTE_AUDIO_TASKS=1): complete type-2

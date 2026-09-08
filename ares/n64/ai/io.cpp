@@ -40,6 +40,10 @@ auto AI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
     n18 length = data.bit(0,17) & ~7;
     if(io.dmaCount < 2) {
       if(io.dmaCount == 0) mi.raise(MI::IRQ::AI);
+      if(unlikely(lumiverseAiTraceOn())) {
+        lumiverseAiTrace("enq", io.dmaAddress[io.dmaCount], length, io.dmaCount);
+        if(io.dmaCount == 0) lumiverseAiTrace("play", io.dmaAddress[0], length, 1);
+      }
       io.dmaLength[io.dmaCount] = length;
       io.dmaOriginPc[io.dmaCount] = cpu.ipu.pc;
       //Lumiverse addition: LUMIVERSE_ARES_N64_AI_DUMP=<path> appends every
@@ -89,6 +93,7 @@ auto AI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
     io.dacRate = data.bit(0,13);
     dac.frequency = max(1, system.videoFrequency() / (io.dacRate + 1));
     dac.period = system.frequency() / dac.frequency;
+    if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("dacrate", io.dacRate, dac.frequency, 0);
     if(frequency != dac.frequency) {
       stream->setFrequency(dac.frequency);
       updateDecay();
