@@ -150,11 +150,20 @@ CommandProcessor::CommandProcessor(Vulkan::Device &device_, void *rdram_ptr,
 
 	if (!single_threaded_processing)
 	{
+		// LUMIVERSE (round 16): LUMIVERSE_ARES_N64_RDP_RING_WORDS (power of two,
+		// default 4096 = upstream) — the producer waits for space when a display
+		// list bursts faster than the ring thread is rescheduled
+		unsigned ring_words = 4 * 1024;
+		if (const char *v = getenv("LUMIVERSE_ARES_N64_RDP_RING_WORDS"))
+		{
+			unsigned w = (unsigned)strtoul(v, nullptr, 10);
+			if (w >= 1024 && (w & (w - 1)) == 0) ring_words = w;
+		}
 		ring.init(
 #ifdef PARALLEL_RDP_SHADER_DIR
 				Granite::Global::create_thread_context(),
 #endif
-				this, 4 * 1024);
+				this, ring_words);
 	}
 
 	if (const char *env = getenv("PARALLEL_RDP_BENCH"))

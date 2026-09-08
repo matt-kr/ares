@@ -26,6 +26,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <atomic>
 
 #ifdef PARALLEL_RDP_SHADER_DIR
 #include "global_managers.hpp"
@@ -59,9 +60,23 @@ private:
 	std::condition_variable cond;
 
 	std::vector<uint32_t> ring;
-	uint64_t write_count = 0;
-	uint64_t read_count = 0;
-	uint64_t completed_count = 0;
+	// LUMIVERSE (round 16): single-producer / single-consumer ring without a
+	// mutex on the hot path. The producer (emulation thread) writes the words
+	// and release-stores write_count; the consumer (this thread) acquire-loads
+	// it, copies the run out, release-stores read_count; completed_count is
+	// published after the run was processed. The mutex/condvar are only used
+	// to park the consumer when the ring is empty (after a short spin) and to
+	// block drain() / a full ring; the producer takes the lock only when the
+	// consumer says it is parked. LUMIVERSE_ARES_N64_RDP_RING=0 restores the
+	// upstream mutex-per-run ring (the round-13 batched form).
+	std::atomic<uint64_t> write_count{0};
+	std::atomic<uint64_t> read_count{0};
+	std::atomic<uint64_t> completed_count{0};
+	std::atomic<bool> consumer_parked{false};
+	std::atomic<bool> drain_waiting{false};
+	bool lockfree = true;
+	void wait_for_space(unsigned words);
+	void wake_consumer();
 
 	void thread_loop();
 	void teardown_thread();
