@@ -28,6 +28,9 @@
 
 namespace RDP
 {
+static std::atomic<uint64_t> lumiverse_ring_spin_capped_count{0};
+uint64_t lumiverse_ring_spin_capped() { return lumiverse_ring_spin_capped_count.load(std::memory_order_relaxed); }
+
 void CommandRing::init(
 #ifdef PARALLEL_RDP_SHADER_DIR
 		Granite::Global::GlobalManagersHandle global_handles_,
@@ -72,10 +75,19 @@ void CommandRing::drain()
 	std::unique_lock<std::mutex> holder{lock};
 	if (lockfree)
 	{
+		// LUMIVERSE round 17: a Perfect Dark run deadlocked here (emulation
+		// thread in this wait, consumer idle with the ring empty, r17a): the
+		// consumer publishes completed_count then checks drain_waiting, and
+		// this side stored drain_waiting then loaded completed_count with an
+		// ACQUIRE load — a Dekker hand-off that is only sound with seq_cst on
+		// all four accesses (the acquire load may be hoisted above the
+		// store), so the consumer's notify could be skipped and nothing ever
+		// re-notified this wait. Both loads are seq_cst now AND the wait is
+		// timed: a missed notify costs at most 100 us (drain runs once per
+		// VI field), never a hang.
 		drain_waiting.store(true, std::memory_order_seq_cst);
-		cond.wait(holder, [this]() {
-			return write_count.load(std::memory_order_acquire) == completed_count.load(std::memory_order_acquire);
-		});
+		while (write_count.load(std::memory_order_seq_cst) != completed_count.load(std::memory_order_seq_cst))
+			cond.wait_for(holder, std::chrono::microseconds(100));
 		drain_waiting.store(false, std::memory_order_seq_cst);
 		return;
 	}
@@ -215,6 +227,18 @@ void CommandRing::thread_loop()
 		const char *v = ::getenv("LUMIVERSE_ARES_N64_RDP_RING_SPIN");
 		return v ? (unsigned)atoi(v) : 200000u;
 	}();
+	// LUMIVERSE round 17: wall-clock cap on one spin (microseconds,
+	// LUMIVERSE_ARES_N64_RDP_RING_SPIN_US, default 2000; 0 = iterations
+	// only). The iteration budget is ~100-200 us on the host; on a device
+	// core that is throttled, shared or descheduled the same iterations can
+	// take far longer, and a consumer spinning for a display list that is
+	// not coming would burn that core. The clock is read every 2048
+	// iterations (a steady_clock read is ~20-40 ns; the spin loop itself
+	// is one acquire load per iteration).
+	static const long spin_cap_us = [] {
+		const char *v = ::getenv("LUMIVERSE_ARES_N64_RDP_RING_SPIN_US");
+		return v ? atol(v) : 2000l;
+	}();
 
 	for (;;)
 	{
@@ -225,9 +249,21 @@ void CommandRing::thread_loop()
 			// wait for data: spin, then park on the condvar with the idle timeout
 			bool have = false;
 			uint64_t r = read_count.load(std::memory_order_relaxed);
+			std::chrono::steady_clock::time_point spin_start{};
+			bool spin_timed = false;
 			for (unsigned i = 0; i < spin_iterations; i++)
 			{
 				if (write_count.load(std::memory_order_acquire) > r) { have = true; break; }
+				if (spin_cap_us > 0 && (i & 2047u) == 2047u)
+				{
+					auto now = std::chrono::steady_clock::now();
+					if (!spin_timed) { spin_start = now; spin_timed = true; }
+					else if (std::chrono::duration_cast<std::chrono::microseconds>(now - spin_start).count() >= spin_cap_us)
+					{
+						lumiverse_ring_spin_capped_count.fetch_add(1, std::memory_order_relaxed);
+						break;
+					}
+				}
 			}
 			if (!have)
 			{

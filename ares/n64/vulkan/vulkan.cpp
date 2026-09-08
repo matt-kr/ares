@@ -70,12 +70,13 @@ struct LumiverseStallStats {
     if(windowStartNs == 0) windowStartNs = now;
     if(now - windowStartNs >= 1000000000ull) {
       fprintf(stderr,
-        "[ares-perf] sync %u/s wait %.1f ms/s (max %.2f) | rdp-enqueue %.1f ms/s | scanout %.1f ms/s\n",
+        "[ares-perf] sync %u/s wait %.1f ms/s (max %.2f) | rdp-enqueue %.1f ms/s | scanout %.1f ms/s | ring-spin-capped %llu\n",
         syncCount,
         syncWaitNs / 1e6,
         syncWaitMaxNs / 1e6,
         renderNs / 1e6,
-        scanoutNs / 1e6);
+        scanoutNs / 1e6,
+        (unsigned long long)::RDP::lumiverse_ring_spin_capped());
       syncWaitNs = 0;
       syncWaitMaxNs = 0;
       syncCount = 0;

@@ -34,6 +34,9 @@
 
 namespace RDP
 {
+// LUMIVERSE round 17: consumer spins ended by the wall-clock cap (LUMIVERSE_ARES_N64_RDP_RING_SPIN_US)
+uint64_t lumiverse_ring_spin_capped();
+
 class CommandProcessor;
 class CommandRing
 {
@@ -74,6 +77,7 @@ private:
 	std::atomic<uint64_t> completed_count{0};
 	std::atomic<bool> consumer_parked{false};
 	std::atomic<bool> drain_waiting{false};
+
 	bool lockfree = true;
 	void wait_for_space(unsigned words);
 	void wake_consumer();
