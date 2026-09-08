@@ -36,7 +36,11 @@ auto CPU::getControlRegister(n5 index) -> u64 {
     data = scc.badVirtualAddress;
     break;
   case  9:  //count
-    data.bit(0,31) = scc.count >> 1;
+    //Lumiverse addition (round 16, CPU_FAST_COUNT): the live count inside a
+    //scheduler batch (scc.count is the batch-start value; see cpu.cpp)
+    if(lumiverseFast.liveCount) data.bit(0,31) = lumiverseLiveCount() >> 1;
+    else data.bit(0,31) = scc.count >> 1;
+    if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("cpu", "R", "COUNT", (u32)data.bit(0,31), (u32)scc.count);
     break;
   case 10:  //entryhi
     data.bit( 0, 7) = scc.tlb.addressSpaceID;
@@ -171,6 +175,10 @@ auto CPU::setControlRegister(n5 index, n64 data) -> void {
     break;
   case  9:  //count
     scc.count = data.bit(0,31) << 1;
+    //Lumiverse addition (round 16, CPU_FAST_COUNT): keep the batch-start
+    //convention so that the live count reads back the written value
+    if(lumiverseFast.liveCount) scc.count = n33(scc.count - (Thread::clock >> 1));
+    if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("cpu", "W", "COUNT", (u32)scc.count, 0);
     break;
   case 10:  //entryhi
     lumiverseTlbMemoInvalidate();  //ASID may change
@@ -181,6 +189,8 @@ auto CPU::setControlRegister(n5 index, n64 data) -> void {
   case 11:  //compare
     scc.compare = data.bit(0,31) << 1;
     setInterruptPending(Interrupt::Timer, 0);
+    lumiverseCompareWritten();  //round 16 (CPU_FAST_COUNT): re-bound the batch
+    if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("cpu", "W", "COMPARE", (u32)scc.compare, (u32)scc.count | ((u64)(u32)Thread::clock << 32));
     break;
   case 12: {//status
     bool floatingPointMode = scc.status.floatingPointMode;

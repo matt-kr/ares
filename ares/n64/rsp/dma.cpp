@@ -78,6 +78,7 @@ auto RSP::dmaTransferStep() -> void {
   } else {
     dma.busy = {0,0};
     dma.current.length = 0xFF8;
+    if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("rsp", "DMADONE", "-", dma.current.dramAddress, dma.current.pbusAddress);
     dmaTransferStart(*this);
   }
 }

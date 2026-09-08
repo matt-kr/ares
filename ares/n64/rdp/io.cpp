@@ -46,6 +46,45 @@ auto lumiverseIOPollNote(u32 slot, u32 value) -> void {
   }
 }
 
+//Lumiverse diagnostic (round 16): LUMIVERSE_ARES_N64_SP_TRACE=1 prints every
+//SP / DPC register access by the CPU or the RSP, RSP BREAKs, SP DMA
+//completions and CPU_FAST_POLL warps as `[sp-trace]` lines, from CPU Count
+//LUMIVERSE_ARES_N64_SP_TRACE_FROM (default 0) for at most
+//LUMIVERSE_ARES_N64_SP_TRACE_LINES lines (default 400000). Timebase: cc =
+//CPU Count at the last scheduler sync, cclk / rclk = the CPU's and the RSP's
+//Thread::clock since then (rclk < 0 = the RSP is behind the CPU).
+auto lumiverseSpTraceOn() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_SP_TRACE"); return v && v[0] == '1'; }();
+  return value;
+}
+auto lumiverseSpTrace(const char* who, const char* op, const char* reg, u32 value, u64 extra) -> void {
+  static const u64 from = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_SP_TRACE_FROM"); return v ? ::strtoull(v, nullptr, 10) : 0ull; }();
+  static const u64 cap = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_SP_TRACE_LINES"); return v ? ::strtoull(v, nullptr, 10) : 400000ull; }();
+  static u64 lines = 0;
+  if((u64)cpu.scc.count < from || lines >= cap) return;
+  //consecutive identical events (a poll loop) collapse into one line plus a REPEAT count
+  static const char* lastWho = nullptr; static const char* lastOp = nullptr; static const char* lastReg = nullptr; static u32 lastValue = 0; static u64 repeats = 0;
+  static u64 lastCc = 0; static s64 lastCclk = 0, lastRclk = 0;
+  if(who == lastWho && op == lastOp && reg == lastReg && value == lastValue && op[0] == 'R') {
+    repeats++; lastCc = cpu.scc.count; lastCclk = cpu.clock; lastRclk = rsp.clock; return;
+  }
+  if(repeats) {
+    fprintf(stderr, "[sp-trace] cc=%llu cclk=%lld rclk=%lld %s %s %s %08x REPEAT %llu\n", (unsigned long long)lastCc, (long long)lastCclk, (long long)lastRclk, lastWho, lastOp, lastReg, lastValue, (unsigned long long)repeats);
+    repeats = 0;
+  }
+  lastWho = who; lastOp = op; lastReg = reg; lastValue = value;
+  lines++;
+  fprintf(stderr, "[sp-trace] cc=%llu cclk=%lld rclk=%lld %s %s %s %08x x=%llx cpc=%llx rpc=%03x h=%u b=%u sig=%u%u%u%u%u%u%u%u dma=%u%u dpc=%06x/%06x/%06x s=%u%u%u%u f=%u\n",
+    (unsigned long long)cpu.scc.count, (long long)cpu.clock, (long long)rsp.clock, who, op, reg, value, (unsigned long long)extra,
+    (unsigned long long)cpu.ipu.pc, (u32)rsp.ipu.pc, (u32)rsp.status.halted, (u32)rsp.status.broken,
+    (u32)rsp.status.signal[0], (u32)rsp.status.signal[1], (u32)rsp.status.signal[2], (u32)rsp.status.signal[3],
+    (u32)rsp.status.signal[4], (u32)rsp.status.signal[5], (u32)rsp.status.signal[6], (u32)rsp.status.signal[7],
+    (u32)rsp.dma.busy.read, (u32)rsp.dma.busy.write,
+    rdp.command.start, rdp.command.end, rdp.command.current,
+    (u32)(rdp.command.tmemBusy > 0), (u32)(rdp.command.pipeBusy > 0), (u32)(rdp.command.bufferBusy > 0), (u32)rdp.command.ready, (u32)rdp.command.freeze);
+  if(lines == cap) fprintf(stderr, "[sp-trace] cap reached\n");
+}
+
 auto RDP::readWord(u32 address, Thread& thread) -> u32 {
   address = (address & 0x1f) >> 2;
   n32 data;
@@ -112,6 +151,7 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
   }
 
   if(lumiverseIOPollLog()) lumiverseIOPollNote(&thread == &cpu ? (address & 7) : 15, data);
+  if(unlikely(lumiverseSpTraceOn())) { static const char* n[8] = {"DPC_START","DPC_END","DPC_CURRENT","DPC_STATUS","DPC_CLOCK","DPC_BUSY","DPC_PIPE","DPC_TMEM"}; lumiverseSpTrace(&thread == &cpu ? "cpu" : "rsp", "R", n[address & 7], data, 0); }
   debugger.ioDPC(Read, address, data);
   return data;
 }
@@ -119,6 +159,7 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
 auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
   address = (address & 0x1f) >> 2;
   n32 data = data_;
+  if(unlikely(lumiverseSpTraceOn())) { static const char* n[8] = {"DPC_START","DPC_END","DPC_CURRENT","DPC_STATUS","DPC_CLOCK","DPC_BUSY","DPC_PIPE","DPC_TMEM"}; lumiverseSpTrace(&thread == &cpu ? "cpu" : "rsp", "W", n[address & 7], data, 0); }
 
   if(address == 0) {
     //DPC_START

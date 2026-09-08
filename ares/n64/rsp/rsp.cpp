@@ -29,10 +29,12 @@ namespace {
   auto lumiverseAudioNoteTaskEnd(u64 cycles) -> void;
   auto lumiverseAudioProgressDeferredWrites(s64 elapsed, s64 total) -> void;
 }
-#include "dma.cpp"
 //Lumiverse diagnostic hooks defined in rdp/io.cpp (LUMIVERSE_ARES_N64_IO_POLL_LOG)
 auto lumiverseIOPollLog() -> bool;
 auto lumiverseIOPollNote(u32 slot, u32 value) -> void;
+auto lumiverseSpTraceOn() -> bool;  //rdp/io.cpp (round 16): LUMIVERSE_ARES_N64_SP_TRACE
+auto lumiverseSpTrace(const char* who, const char* op, const char* reg, u32 value, u64 extra) -> void;
+#include "dma.cpp"
 extern u64 lumiverseRdpTaskTag;  //rdp/io.cpp: graphics-task ordinal for dump alignment
 #include "lumiverse-async-audio.cpp"
 #include "lumiverse-hle.cpp"

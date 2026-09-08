@@ -1,6 +1,8 @@
 #include <n64/n64.hpp>
 
 namespace ares::Nintendo64 {
+auto lumiverseSpTraceOn() -> bool;  //rdp/io.cpp (round 16): LUMIVERSE_ARES_N64_SP_TRACE
+auto lumiverseSpTrace(const char* who, const char* op, const char* reg, u32 value, u64 extra) -> void;
 
 AI ai;
 #include "io.cpp"

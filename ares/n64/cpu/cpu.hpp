@@ -367,6 +367,7 @@ struct CPU : Thread {
     bool tlb = false;     //CPU_FAST_TLB: one-page translation memo for TLB-mapped RDRAM (fetch/load/store)
     s64  idle = 0;        //CPU_FAST_IDLE: clock quantum stepped through a `j self; nop` idle loop (0 = off)
     s64  poll = 0;        //CPU_FAST_POLL: clock quantum stepped per read while the CPU spins reading SP_STATUS/DMA_FULL/DMA_BUSY (0 = off)
+    bool liveCount = false;  //CPU_FAST_COUNT: mfc0 Count returns the live value inside a batch; a Compare write re-bounds the batch (round 16)
     int  diag = 0;        //CPU_DIAG: 1 = batch telemetry, 2 = + PC histogram
   } lumiverseFast;
   //Lumiverse addition (round 14): SP status poll-loop detector, see
@@ -383,6 +384,10 @@ struct CPU : Thread {
     u64 warps = 0;       //diagnostic
   } lumiversePoll;
   auto lumiversePollStatus(u32 reg, u32 value) -> void;
+  //Lumiverse addition (round 16): live Count inside a scheduler batch, see lumiverseLoadFastConfig()
+  auto lumiverseLiveCount() const -> n33 { return n33(scc.count + (Thread::clock >> 1)); }
+  auto lumiverseTimerClocks() const -> s64;  //clocks from now until Count reaches Compare (modular, like beginBatch)
+  auto lumiverseCompareWritten() -> void;
   auto lumiversePollNoteWrite() -> void { lumiversePoll.serial++; }
 
   //Lumiverse addition (round 8): last successful TLB translation per

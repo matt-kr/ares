@@ -1,6 +1,8 @@
 #include <n64/n64.hpp>
 
 namespace ares::Nintendo64 {
+auto lumiverseSpTraceOn() -> bool;  //rdp/io.cpp (round 16): LUMIVERSE_ARES_N64_SP_TRACE
+auto lumiverseSpTrace(const char* who, const char* op, const char* reg, u32 value, u64 extra) -> void;
 
 MI mi;
 #include "io.cpp"
@@ -33,6 +35,7 @@ auto MI::raise(IRQ source) -> void {
     }
   }
   debugger.interrupt((u32)source);
+  if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("mi", "RAISE", source == IRQ::SP ? "SP" : source == IRQ::SI ? "SI" : source == IRQ::AI ? "AI" : source == IRQ::VI ? "VI" : source == IRQ::PI ? "PI" : "DP", 0, 0);
   switch(source) {
   case IRQ::SP: irq.sp.line = 1; break;
   case IRQ::SI: irq.si.line = 1; break;
@@ -45,6 +48,7 @@ auto MI::raise(IRQ source) -> void {
 }
 
 auto MI::lower(IRQ source) -> void {
+  if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("mi", "LOWER", source == IRQ::SP ? "SP" : source == IRQ::SI ? "SI" : source == IRQ::AI ? "AI" : source == IRQ::VI ? "VI" : source == IRQ::PI ? "PI" : "DP", 0, 0);
   switch(source) {
   case IRQ::SP: irq.sp.line = 0; break;
   case IRQ::SI: irq.si.line = 0; break;

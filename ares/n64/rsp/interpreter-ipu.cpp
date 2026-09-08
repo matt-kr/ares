@@ -59,6 +59,7 @@ auto RSP::BREAK() -> void {
   status.halted = 1;
   status.broken = 1;
   if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+  if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("rsp", "BREAK", "-", 0, profile.cycles);
 }
 
 auto RSP::J(u32 imm) -> void {

@@ -2,6 +2,8 @@
 #include <nall/gdb/server.hpp>
 
 namespace ares::Nintendo64 {
+auto lumiverseSpTraceOn() -> bool;  //rdp/io.cpp (round 16): LUMIVERSE_ARES_N64_SP_TRACE
+auto lumiverseSpTrace(const char* who, const char* op, const char* reg, u32 value, u64 extra) -> void;
 
 CPU cpu;
 #include "context.cpp"
@@ -123,6 +125,7 @@ auto CPU::synchronize() -> void {
   clocks >>= 1;
   if(scc.count < scc.compare && scc.count + clocks >= scc.compare) {
     setInterruptPending(Interrupt::Timer, 1);
+    if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("cpu", "TIMER", "fire", (u32)scc.compare, clocks);
   }
   scc.count += clocks;
   profile.cpuCycles += clocks;
@@ -146,6 +149,7 @@ auto CPU::instruction() -> bool {
   if(auto interrupts = scc.cause.interruptPending & scc.status.interruptMask) {
     if(scc.status.interruptEnable && !scc.status.exceptionLevel && !scc.status.errorLevel) {
       debugger.interrupt(scc.cause.interruptPending);
+      if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("cpu", "IRQ", "taken", (u32)scc.cause.interruptPending | ((u32)scc.status.interruptMask << 8), ipu.pc);
       step(1 * 2);
       exception.interrupt();
       return true;
@@ -227,8 +231,9 @@ auto CPU::instruction() -> bool {
     && (((pcExec + 4) & ~0x0fff'ffffull) | (u64)((opcodeWord & 0x03ff'ffff) << 2)) == pcExec
     && icache.fetch(pcExec + 4, paddr + 4, cpu) == 0) {
       s64 wait = fast.idle;
-      const s64 timerDelta = (s64)(u64)n33(scc.compare - scc.count) * 2;
-      const s64 queueDelta = queue.timeToNextEvent();
+      //round 16 (CPU_FAST_COUNT): distances measured from now, not from the batch start
+      const s64 timerDelta = fast.liveCount ? lumiverseTimerClocks() : (s64)(u64)n33(scc.compare - scc.count) * 2;
+      const s64 queueDelta = queue.timeToNextEvent() - (fast.liveCount ? Thread::clock : 0);
       if(timerDelta > 0 && timerDelta < wait) wait = timerDelta;
       if(queueDelta > 0 && queueDelta < wait) wait = queueDelta;
       wait &= ~1;
@@ -387,21 +392,35 @@ auto CPU::lumiverseLoadFastConfig() -> void {
     //HLE'd task had finished); 16384 was no better than 4096.
     const char* pl = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_POLL");
     s64 poll = pl ? ::atoll(pl) : 4096;
-    //round 15 regression pass: Conker's Bad Fur Day (game code NFU) hangs
-    //at its "mature audiences" boot screen under the relaxed IO sync with
-    //the warp at 4096 (also 4094, 4098, 8192; 512 / 2048 / 16384 / 65536
-    //boot, as do POLL=0, RELAX_IO_SYNC=0 and CPU_FAST=0) — 27 of 27 runs
-    //with the app env, reproducible, no RDP crash, CPU parked at
-    //0x1000117c with no SyncFull ever reaching the RDP. The mechanism is a
-    //quantum-specific race in its boot handshake that is not understood, so
-    //the warp is off for this title; LUMIVERSE_ARES_N64_CPU_FAST_POLL_FORCE=1
-    //keeps the configured quantum for experiments.
-    if(poll > 0 && cartridge.rom.size >= 0x40) {
-      const char code[4] = { (char)cartridge.rom.read<Byte>(0x3b), (char)cartridge.rom.read<Byte>(0x3c), (char)cartridge.rom.read<Byte>(0x3d), 0 };
-      const char* force = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_POLL_FORCE");
-      if(!::strcmp(code, "NFU") && !(force && *force == '1')) poll = 0;
-    }
     f.poll = poll > 0 ? (poll & ~1) : 0;
+    //LUMIVERSE_ARES_N64_CPU_FAST_COUNT (default 1, 0 = off): the COP0 Count
+    //register is live inside a scheduler batch. scc.count is only advanced
+    //in synchronize(), so under the batch model an mfc0 Count returned the
+    //batch-START value, up to a batch (16384 cycles) stale, while the timer
+    //check at the batch end compares Compare against that same stale count.
+    //Round 16, Conker's Bad Fur Day (the round-15 "boot hang at poll
+    //quantum 4096"; game code NFU was gated off the poll warp): its kernel
+    //programs a short timer as Compare = Count + ~2k cycles. When the Count
+    //read and the Compare write fall in the SAME batch the stale count is
+    //still below the written Compare and the batch-end check fires it (late
+    //but not lost); when a batch boundary falls between them the CPU's
+    //count is already PAST the new Compare at the write, the batch-end
+    //check never sees count < compare, and the timer is lost for a full
+    //2^32 wrap — the audio task that timer schedules is never dispatched,
+    //the scheduler stops, the game sits on its boot screen. Which quantum
+    //hangs depends only on where the poll warp moves the batch boundaries
+    //(4096 did, 2048 / 16384 did not), so any change to batch boundaries
+    //in any game reading Count with a delta under a batch can bite. Fix:
+    //mfc0 Count returns scc.count + Thread::clock / 2 (the live count),
+    //mtc0 Count stores relative to it, an mtc0 Compare re-bounds the
+    //current batch so the timer fires when it should (queueInsert does the
+    //same for queued events), and the idle / poll warps measure the timer
+    //and queue distance from now instead of from the batch start. The
+    //stock recompiler has the same staleness at its 2048-cycle interleave
+    //(too short for this kernel's delta); the stock interpreter syncs every
+    //instruction and never had it.
+    const char* lc = ::getenv("LUMIVERSE_ARES_N64_CPU_FAST_COUNT");
+    f.liveCount = !lc || *lc != '0';
     const char* d = ::getenv("LUMIVERSE_ARES_N64_CPU_DIAG");
     f.diag = d ? ::atoi(d) : 0;
   }
@@ -423,6 +442,26 @@ auto CPU::lumiverseLoadFastConfig() -> void {
 //latency of noticing the status change (<= the quantum, 4096 clocks =
 //22 us) is altered: the loop's own instructions still execute, just
 //fewer times per RSP task.
+//Lumiverse addition (round 16, CPU_FAST_COUNT): clocks from now until the
+//Count register reaches Compare (modular like beginBatch; 0 = it is now)
+auto CPU::lumiverseTimerClocks() const -> s64 {
+  return (s64)(u64)n33(scc.compare - lumiverseLiveCount()) * 2;
+}
+
+//Lumiverse addition (round 16, CPU_FAST_COUNT): an mtc0 Compare inside a
+//batch re-bounds the batch so synchronize() runs (and fires the timer)
+//when Count reaches the new Compare, exactly as queueInsert() does for
+//queued events. Without it the batch ran to its full budget and the timer
+//fired up to a batch late; with a stale Count read it was lost outright.
+auto CPU::lumiverseCompareWritten() -> void {
+  const auto& fast = lumiverseFast;
+  if(!fast.enabled || !fast.batch || !fast.liveCount) return;
+  const s64 distance = lumiverseTimerClocks();
+  if(distance <= 0) return;
+  const s64 target = Thread::clock + distance;
+  if(target < jitClockTarget) jitClockTarget = target;
+}
+
 auto CPU::lumiversePollStatus(u32 reg, u32 value) -> void {
   const auto& fast = lumiverseFast;
   if(!fast.poll) return;
@@ -432,8 +471,9 @@ auto CPU::lumiversePollStatus(u32 reg, u32 value) -> void {
   if(pc == p.pc && reg == p.reg && value == p.value && p.serial == p.serialSeen && (now - p.clock) < 1024) {
     if(++p.count >= 3) {
       s64 wait = fast.poll;
-      const s64 timerDelta = (s64)(u64)n33(scc.compare - scc.count) * 2;
-      const s64 queueDelta = queue.timeToNextEvent();
+      //round 16 (CPU_FAST_COUNT): distances measured from now, not from the batch start
+      const s64 timerDelta = fast.liveCount ? lumiverseTimerClocks() : (s64)(u64)n33(scc.compare - scc.count) * 2;
+      const s64 queueDelta = queue.timeToNextEvent() - (fast.liveCount ? Thread::clock : 0);
       if(timerDelta > 0 && timerDelta < wait) wait = timerDelta;
       if(queueDelta > 0 && queueDelta < wait) wait = queueDelta;
       wait &= ~1;
@@ -441,6 +481,7 @@ auto CPU::lumiversePollStatus(u32 reg, u32 value) -> void {
         step((u32)wait);
         jitClockTarget = Thread::clock;  //end the batch: synchronize() runs the RSP/RDP/AI/VI up to now
         p.warps++;
+        if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("cpu", "WARP", reg == 4 ? "SP_STATUS" : reg == 5 ? "SP_DMA_FULL" : "SP_DMA_BUSY", value, (u64)wait);
       }
     }
   } else {

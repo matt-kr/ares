@@ -26,6 +26,7 @@ auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
       //Lumiverse addition (round 14): a CPU spinning on the snapshot while
       //the async audio task runs is a poll loop too (cpu.cpp)
       if(address >= 4 && address <= 6 && &thread == &cpu) cpu.lumiversePollStatus(address, shadow);
+      if(unlikely(lumiverseSpTraceOn())) lumiverseSpTrace("cpu", "Rshadow", "SP", shadow, address);
       return shadow;
     }
     lumiverseAsyncDrain();
@@ -109,6 +110,7 @@ auto RSP::ioRead(u32 address, Thread &thread) -> u32 {
         (u32)dma.current.length, (u32)dma.current.count, (long long)dma.clock, (u32)dma.full.read, (u32)dma.full.write, (long long)Thread::clock);
     }
   }
+  if(unlikely(lumiverseSpTraceOn())) { static const char* n[8] = {"SP_PBUS","SP_DRAM","SP_RDLEN","SP_WRLEN","SP_STATUS","SP_DMA_FULL","SP_DMA_BUSY","SP_SEMAPHORE"}; lumiverseSpTrace(&thread == &cpu ? "cpu" : "rsp", "R", n[address & 7], data, 0); }
   debugger.ioSCC(Read, address, data);
   return data;
 }
@@ -137,6 +139,7 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
   //Lumiverse addition (round 14): any CPU write to an SP register ends a
   //poll-loop warp candidate (cpu.cpp lumiversePollStatus)
   if(&thread == &cpu) cpu.lumiversePollNoteWrite();
+  if(unlikely(lumiverseSpTraceOn())) { static const char* n[8] = {"SP_PBUS","SP_DRAM","SP_RDLEN","SP_WRLEN","SP_STATUS","SP_DMA_FULL","SP_DMA_BUSY","SP_SEMAPHORE"}; lumiverseSpTrace(&thread == &cpu ? "cpu" : "rsp", "W", n[address & 7], data, 0); }
 
   if(address == 0) {
     //SP_PBUS_ADDRESS

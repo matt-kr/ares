@@ -1,6 +1,7 @@
 auto AI::readWord(u32 address, Thread& thread) -> u32 {
   address = (address & 0x1f) >> 2;
   n32 data;
+  if(unlikely(lumiverseSpTraceOn())) { static const char* n[8] = {"AI_DRAM","AI_LENGTH","AI_CONTROL","AI_STATUS","AI_DACRATE","AI_BITRATE","AI_6","AI_7"}; lumiverseSpTrace("cpu", "R", n[address & 7], io.dmaLength[0], io.dmaCount); }
 
   if(address != 3) {
     //AI_LENGTH (mirrored)
@@ -25,6 +26,7 @@ auto AI::readWord(u32 address, Thread& thread) -> u32 {
 auto AI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
   address = (address & 0x1f) >> 2;
   n32 data = data_;
+  if(unlikely(lumiverseSpTraceOn())) { static const char* n[8] = {"AI_DRAM","AI_LENGTH","AI_CONTROL","AI_STATUS","AI_DACRATE","AI_BITRATE","AI_6","AI_7"}; lumiverseSpTrace("cpu", "W", n[address & 7], data, io.dmaCount); }
 
   if(address == 0) {
     //AI_DRAM_ADDRESS
