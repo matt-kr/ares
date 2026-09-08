@@ -307,7 +307,15 @@ constexpr u64 LumiverseAudioPrefixPM     = 0x4ea075cb3bd248f6ull;  //Paper Mario
 //and real gate 0.82 / 0.80 with the race diverging — the game path is
 //sensitive to the task timing in a way the other ABI1 titles are not.
 //Correct beats fast: excluded from the prefix family, runs LLE.
-//LUMIVERSE_ARES_N64_AUDIO_HLE_RUSH=1 opts it back in.
+//round 16: the "timing sensitivity" was the 80-byte ENVMIXER state block
+//the ABI1 microcode writes after every ENVMIXER and Rush's driver reads
+//back (with the block kept LLE-owned in reverse-shadow mode the fair gate
+//went 0.976 -> 1.000 with identical frames). The ABI1 executor now writes
+//that block (lumiverseAudioAbiEnvState), Rush's fair gate is 1.000 / 1.000
+//with frames identical on the LLE timeline, and it is back on the prefix
+//family; the real gate stays at the chaos floor of its race (0.85; LLE
+//audio on the Turbo timeline scores 0.82 against stock, round 15).
+//LUMIVERSE_ARES_N64_AUDIO_HLE_RUSH=0 opts it out again.
 constexpr u64 LumiverseAudioUcodeRush    = 0xfabfd6fff1f6c2f1ull;
 //round 15: Tony Hawk's Pro Skater 2's audio image (stable, 971eca78873b6c68)
 //shares Paper Mario's 3 KiB prefix and is dispatched through the PM prefix
@@ -911,6 +919,21 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
 //tasks at pitch 0x1fff: every phase gives the four taps at distances 1+f,
 //f, 1-f, 2-f; the points folded on the mirror symmetry and smoothed).
 //h(0) = 0.80, h(0.5) = 0.51, h(1) = 0.10, h(1.5) = -0.01, h(2) = 0.
+//round 16: LUMIVERSE_ARES_N64_AUDIO_HLE_NA_POLEF_STATE (default 1): the Rare
+//one-pole 0e keeps its history in the 8-byte RDRAM block at cmd1.lo24 (see
+//the handler); 0 = the round-13 "w1 bit 24 = init" form
+//round 16: LUMIVERSE_ARES_N64_AUDIO_HLE_ABI_ENV_STATE (default 1): the ABI1
+//ENVMIXER writes the microcode's 80-byte state block (see the handler)
+auto lumiverseAudioAbiEnvState() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_ABI_ENV_STATE"); return !v || v[0] != '0'; }();
+  return value;
+}
+auto lumiverseAudioNaPolefState() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NA_POLEF_STATE"); return !v || v[0] != '0'; }();
+  return value;
+}
+auto lumiverseAudioNaStateWrites() -> bool;
+
 auto lumiverseAudioNaKernelAt(u32 t) -> s32 {  //t in Q16 samples
   static const s16 kernel[129] = {
     26177,26152,26065,25986,25944,25954,25865,25724,25543,25386,25204,25003,24773,24487,24174,23843,
@@ -972,19 +995,38 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
   case 0x01: {  //ADPCM decode staged bytes -> decode buffer
     auto& state = lumiverseAudioState(w0 & 0x00ffffff);
     const u32 outBytes = w1 >> 16 & 0xfff;
-    const bool init = (w1 >> 28) & 1;   //bit 28 = voice start
+    const u32 flags = w1 >> 28;         //bit 28 = voice start, bit 29 = loop (round 16)
+    const bool init = flags & 1;
+    //round 16 (Conker's Bad Fur Day, looping voices; truncated-task oracle
+    //on task 494 commands 12-13): cmd1's low 12 bits are the OUTPUT address
+    //(0x170 for a chunk's first piece — the constant the round-12 layout
+    //note took it for). A voice whose loop point falls inside the chunk is
+    //decoded in two pieces: `01 ... 00bc6170` (94 samples to the loop end,
+    //data at 0x190..0x24c), `0f` SETLOOP, `01 ... 20cc4260` (flag 2 = the
+    //16-sample history comes from the SETLOOP block; prefix at 0x260, data
+    //at 0x280), then `0a 027e 024c 00ce` slides the second piece down to
+    //butt against the first. LLE's prefix at 0x260 is byte-for-byte the
+    //SETLOOP block (0x2410 0x0bc3 0xf004 ...). A count that is not a frame
+    //multiple decodes the whole final frame (0xbc -> 6 frames), like the
+    //ABI executor; the slide overwrites the excess.
+    const u32 outBase = w1 & 0xfff;
     s16 last[16];
     if(init) for(auto& sample : last) sample = 0;
+    else if(flags & 2) {
+      u8 raw[32];
+      lumiverseAudioReadRDRAM(shadow, m.loopAddr, raw, 32);
+      for(u32 index = 0; index < 16; index++) last[index] = (s16)((u16)raw[index * 2] << 8 | raw[index * 2 + 1]);
+    }
     else for(u32 index = 0; index < 16; index++) last[index] = state.samples[index];
-    //state prefix at the decode buffer base
-    for(u32 index = 0; index < 16; index++) lumiverseAudioDmemWriteS16(dmem, NaDecode + index * 2, last[index]);
+    //state prefix at the output base
+    for(u32 index = 0; index < 16; index++) lumiverseAudioDmemWriteS16(dmem, outBase + index * 2, last[index]);
     s32 prev2 = last[14], prev1 = last[15];
     //cmd1 bits 12-15 = byte offset of the first frame inside the staged
     //block (the loader DMAs 8-byte-aligned; verified bit-exact against LLE
     //decodes at offsets 0 and 2)
     u32 in = NaStaging + (w1 >> 12 & 0xf);
-    u32 out = NaDecode + 32;
-    const u32 frames = outBytes / 32;
+    u32 out = outBase + 32;
+    const u32 frames = (outBytes + 31) / 32;
     for(u32 frame = 0; frame < frames; frame++) {
       const u8 header = dmem[in++ & 0xfff];
       const u32 scale = header >> 4;
@@ -1023,8 +1065,14 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
       for(u32 index = 0; index < 16; index++) { blob[index * 2] = (u16)state.samples[index] >> 8; blob[index * 2 + 1] = (u8)state.samples[index]; }
       lumiverseAudioWriteRDRAM(shadow, w0 & 0x00ffffff, blob, 32);
     }
-    m.naDecodeSamples = outBytes / 2;
+    //a second piece (the loop continuation above) extends the chunk's data
+    if(outBase == NaDecode) m.naDecodeSamples = outBytes / 2;
+    else m.naDecodeSamples += outBytes / 2;
     m.naSrcMode = 0;
+    break;
+  }
+  case 0x0f: {  //SETLOOP (round 16): the loop-point history block for the next ADPCM
+    m.loopAddr = w1 & 0x00ffffff;
     break;
   }
   case 0x05: {  //RESAMPLE decode stream -> 184 samples at staging.
@@ -1488,18 +1536,46 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     //[8 zeros][a^(j+1) Q14] and g = 1 - a, a unity-DC lowpass); LSQ fit
     //g 11649 / a 4732 (x16384) residual 0.49 LSB, the state = y[n-1].
     //w1 bit 24 = init (history zero). Enabled per ucode (naPolefOnePole).
+    //round 16 (Conker's Bad Fur Day, first-area tasks): w1 bit 24 is NOT an
+    //init flag — every one of Conker's 9632 gain-carrying 0e commands has it
+    //set (the 206 without it have gain 0), and the truncated-task oracle
+    //(task 493 command 34) shows LLE's first output y[0] = 1276 for x[0] =
+    //1402 with g = 0.711 / a = 0.289, i.e. a carried y[-1] of ~965 where
+    //this handler started from zero (996). The history lives in RDRAM: the
+    //microcode writes 8 bytes (DMEM 0x7d8) to the command's cmd1.lo24
+    //address after every chunk — the blob is the chunk's last four outputs
+    //y[180..183] (our own carried y[183] sits within 6 LSB of its last
+    //word) — and reads it back at the next chunk, so a CPU-side clear of
+    //that block is what resets the filter. NA_POLEF_STATE=0 restores the
+    //round-13 flag form. The state read sees this task's deferred writes.
     if(m.naPolefOnePole) {
-      auto& state = lumiverseAudioState(w1 & 0x00ffffff);
+      const u32 stateAddr = w1 & 0x00ffffff;
+      auto& state = lumiverseAudioState(stateAddr);
       const s32 gain = (s16)(w0 & 0xffff);
       const s32 pole = m.bookEntries >= 16 ? m.book[8] : 0;
       const bool init = (w1 >> 24) & 1;
-      s32 prevY = init ? 0 : state.samples[8];
+      s32 prevY;
+      if(lumiverseAudioNaPolefState()) {
+        u8 blob[8];
+        lumiverseAudioReadRDRAM(shadow, stateAddr, blob, 8);
+        prevY = (s16)((u16)blob[6] << 8 | blob[7]);
+      } else {
+        prevY = init ? 0 : state.samples[8];
+      }
       for(u32 n = 0; n < NaChunk / 2; n++) {
         const s32 x = lumiverseAudioDmemReadS16(dmem, 0x170 + n * 2);
         prevY = lumiverseAudioClamp16((s32)(((s64)gain * x + (s64)pole * prevY) >> 14));
         lumiverseAudioDmemWriteS16(dmem, 0x170 + n * 2, (s16)prevY);
       }
       state.samples[8] = (s16)prevY;
+      if(lumiverseAudioNaPolefState() && lumiverseAudioNaStateWrites()) {
+        u8 blob[8];
+        for(u32 k = 0; k < 4; k++) {
+          const s16 y = lumiverseAudioDmemReadS16(dmem, 0x170 + (NaChunk / 2 - 4 + k) * 2);
+          blob[k * 2] = (u16)y >> 8; blob[k * 2 + 1] = (u8)y;
+        }
+        lumiverseAudioWriteRDRAM(shadow, stateAddr, blob, 8);
+      }
       break;
     }
     if(m.naPolefFir) {
@@ -1773,9 +1849,13 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
         if(next < 0) next = 0;
         return next;
       };
+      //round 16: the per-lane volumes of the last 8-sample group, for the
+      //microcode's state block (below)
+      s64 laneL[8] = {}, laneR[8] = {};
       for(u32 n = 0; n < samples; n++) {
         const s32 x = lumiverseAudioDmemReadS16(dmem, m.inBuf + n * 2);
         const s32 vl = (s32)(vl32 >> 16), vr = (s32)(vr32 >> 16);
+        laneL[n & 7] = vl32; laneR[n & 7] = vr32;
         const s32 l = x * vl + 0x4000 >> 15;
         const s32 r = x * vr + 0x4000 >> 15;
         accumulate(m.outBuf, n, l * dry + 0x4000 >> 15);
@@ -1786,6 +1866,35 @@ auto lumiverseAudioExecute(LumiverseAudioMachine& m, LumiverseAudioShadow& shado
         }
         vl32 = ramp(vl32, targetL, rateL, r8L);
         vr32 = ramp(vr32, targetR, rateR, r8R);
+      }
+      //round 16 (San Francisco Rush): the ABI1 microcode writes an 80-byte
+      //state block to the command's address after every ENVMIXER (LLE-only
+      //write class 80/f90, 59 per task) and Rush's driver READS it — with
+      //the block kept LLE-owned in reverse-shadow mode the race's fair gate
+      //went from 0.976 (0.61 in the worst 5 s window) to 1.000 with identical
+      //frames, so the game path depends on it. Layout from the DEBUG>=3 blob
+      //probe next to this executor's state: [volL int x8 lanes][volL frac
+      //x8][volR int x8][volR frac x8][targetL rateL.hi rateL.lo targetR
+      //rateR.hi rateR.lo dry wet]; the lanes are the last group's per-lane
+      //volumes (lane i = lane 0 * rate^(i/8), i.e. this executor's
+      //per-sample ramp). At rest (rate 0x7fffffff, target reached) LLE
+      //holds frac 0xffff. Written from this executor's model (within 0.1%
+      //of LLE's lanes on the ramping blobs); not bit-exact.
+      //LUMIVERSE_ARES_N64_AUDIO_HLE_ABI_ENV_STATE=0 disables the write.
+      if(lumiverseAudioAbiEnvState()) {
+        u8 blob[80];
+        auto put = [&](u32 offset, u32 value) { blob[offset] = (u8)(value >> 8); blob[offset + 1] = (u8)value; };
+        const bool restL = rateL >= 0x10000 ? (s32)(vl32 >> 16) >= targetL : (s32)(vl32 >> 16) <= targetL;
+        const bool restR = rateR >= 0x10000 ? (s32)(vr32 >> 16) >= targetR : (s32)(vr32 >> 16) <= targetR;
+        for(u32 i = 0; i < 8; i++) {
+          const s64 vl = samples >= 8 ? laneL[i] : laneL[0], vr = samples >= 8 ? laneR[i] : laneR[0];
+          put(0x00 + i * 2, (u32)(vl >> 16)); put(0x10 + i * 2, restL ? 0xffff : (u32)(vl & 0xffff));
+          put(0x20 + i * 2, (u32)(vr >> 16)); put(0x30 + i * 2, restR ? 0xffff : (u32)(vr & 0xffff));
+        }
+        put(0x40, (u32)targetL); put(0x42, rateL >> 16); put(0x44, rateL & 0xffff);
+        put(0x46, (u32)targetR); put(0x48, rateR >> 16); put(0x4a, rateR & 0xffff);
+        put(0x4c, (u32)dry); put(0x4e, (u32)wet);
+        lumiverseAudioWriteRDRAM(shadow, address, blob, 80);
       }
       state.samples[0] = (s16)(u16)(vl32 >> 16);
       state.samples[1] = (s16)(u16)(vl32 & 0xffff);
@@ -2452,13 +2561,15 @@ auto lumiverseAudioShadowCompare(LumiverseAudioShadow& shadow) -> void {
       //state-blob probe (debug>=3): print LLE's 32-byte state write next to
       //our private state for the same address, to learn the blob layout
       static u32 blobLines = 0;
-      if(lumiverseAudioHLEDebug() >= 3 && lw.length == 32 && blobLines < 60) {
+      static const u64 blobMinTask = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_DUMP_MIN_TASK"); return v ? (u64)::atoll(v) : 0; }();
+      if(lumiverseAudioHLEDebug() >= 3 && (lw.length == 32 || lw.length == 8 || lw.length == 16 || lw.length == 80) && blobLines < 400 && shadow.task >= blobMinTask) {
         blobLines++;
         auto& st = lumiverseAudioState(lw.addr);
-        fprintf(stderr, "[rsp-hle-audio-shadow]   state blob addr=%06x dmem=%03x LLE:", lw.addr, lw.dmem);
-        for(u32 b = 0; b < 32; b += 2) fprintf(stderr, " %04x", (u16)((u16)lumiverseAudioRDRAMReadByte(lw.addr + b) << 8 | lumiverseAudioRDRAMReadByte(lw.addr + b + 1)));
+        fprintf(stderr, "[rsp-hle-audio-shadow]   state blob addr=%06x len=%u dmem=%03x task=%llu LLE:", lw.addr, lw.length, lw.dmem, (unsigned long long)shadow.task);
+        for(u32 b = 0; b < lw.length; b += 2) fprintf(stderr, " %04x", (u16)((u16)lumiverseAudioRDRAMReadByte(lw.addr + b) << 8 | lumiverseAudioRDRAMReadByte(lw.addr + b + 1)));
         fprintf(stderr, "\n[rsp-hle-audio-shadow]     ours (samples[0..15], frac=%04x):", st.frac & 0xffff);
         for(u32 b = 0; b < 16; b++) fprintf(stderr, " %04x", (u16)st.samples[b]);
+        if(lw.length == 80) { fprintf(stderr, " | env: vl=%04x.%04x vr=%04x.%04x tgt=%04x/%04x rate=%04x%04x/%04x%04x dry=%04x wet=%04x", (u16)st.samples[0], (u16)st.samples[1], (u16)st.samples[2], (u16)st.samples[3], (u16)st.samples[4], (u16)st.samples[5], (u16)st.samples[6], (u16)st.samples[7], (u16)st.samples[8], (u16)st.samples[9], (u16)st.samples[10], (u16)st.samples[11]); }
         fprintf(stderr, "\n");
       }
       if(lleOnlyLines < 400 && lw.length > 32) {
@@ -2612,10 +2723,35 @@ s64 lumiverseAudioTruncateDumpTask = -1;
 //settle any outstanding shadow comparison (called from every RSP task
 //dispatch so a comparison still happens when the game stops issuing audio
 //tasks, e.g. after a truncated-task experiment)
+//round 16 diagnostic (DEBUG>=3, shadow mode): Conker's op 0x07 — the
+//streamed-voice decoder (576 twelve-bit samples per call, written to the
+//0x07 address as three 384-byte DMAs from DMEM 0xe70; state block at the
+//preceding 0x08 address, 1088 bytes, written back from DMEM 0x8a0). The
+//probe prints the state block as the task is dispatched (before LLE runs
+//it) and the state block + output region after LLE ran, up to
+//LUMIVERSE_ARES_N64_AUDIO_HLE_PROBE07 tasks, as raw material for decoding
+//the format offline. Not an emulation path.
+struct LumiverseAudioProbe07 { bool armed = false; u64 task = 0; u32 stateAddr = 0; u32 outAddr = 0; u32 param = 0; u32 count = 0; };
+LumiverseAudioProbe07 lumiverseAudioProbe07;
+auto lumiverseAudioProbe07Limit() -> u32 {
+  static const u32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_PROBE07"); return v ? (u32)::atoi(v) : 0u; }();
+  return value;
+}
+auto lumiverseAudioProbe07Dump(const char* tag, u32 addr, u32 bytes) -> void {
+  fprintf(stderr, "[rsp-hle-audio-07] task %llu %s @%06x:", (unsigned long long)lumiverseAudioProbe07.task, tag, addr);
+  for(u32 b = 0; b < bytes; b += 2) fprintf(stderr, " %04x", (u16)((u16)lumiverseAudioRDRAMReadByte(addr + b) << 8 | lumiverseAudioRDRAMReadByte(addr + b + 1)));
+  fprintf(stderr, "\n");
+}
+
 auto lumiverseAudioShadowSettle() -> void {
   if(lumiverseAudioHLELevel() < 2) return;
   auto& shadow = lumiverseAudioShadowState;
   const bool hadPending = shadow.pending;
+  if(hadPending && lumiverseAudioProbe07.armed && lumiverseAudioProbe07.task == shadow.task) {
+    lumiverseAudioProbe07.armed = false;
+    lumiverseAudioProbe07Dump("post-state", lumiverseAudioProbe07.stateAddr, 1088);
+    lumiverseAudioProbe07Dump("post-out", lumiverseAudioProbe07.outAddr, 1152);
+  }
   lumiverseAudioShadowCompare(shadow);
   if(hadPending && lumiverseAudioHLEDebug() >= 2) {
     const s32 worst = lumiverseAudioShadowCompareDMEM(lumiverseAudioMachine, shadow.task);
@@ -2671,8 +2807,8 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   if(level < 1) return false;
   s32 dialect = lumiverseAudioDialectForHash(ucodeHash);
   bool polefFir = false;
-  static const bool rushOptIn = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_RUSH"); return v && v[0] == '1'; }();
-  if(dialect < 0 && ucodeHash == LumiverseAudioUcodeRush && !rushOptIn) return false;
+  static const bool rushOptOut = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_RUSH"); return v && v[0] == '0'; }();
+  if(dialect < 0 && ucodeHash == LumiverseAudioUcodeRush && rushOptOut) return false;
   if(dialect < 0) {
     //self-modifying ucode? identify the family by its stable prefix
     const u32 ucode = task[4] & 0x00ffffff;
@@ -2848,6 +2984,23 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   //shadow mode: settle the previous task's comparison first (LLE has
   //completed it by now — audio tasks are serialized)
   if(level >= 2) lumiverseAudioShadowSettle();
+  //round 16: op 0x07 probe (see lumiverseAudioProbe07)
+  if(level >= 2 && lumiverseAudioHLEDebug() >= 3 && lumiverseAudioProbe07.count < lumiverseAudioProbe07Limit()) {
+    u32 stateAddr = 0;
+    for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
+      u32 w0 = 0, w1 = 0;
+      for(u32 b = 0; b < 4; b++) w0 = w0 << 8 | lumiverseAudioRDRAMReadByte(dataPtr + offset + b);
+      for(u32 b = 0; b < 4; b++) w1 = w1 << 8 | lumiverseAudioRDRAMReadByte(dataPtr + offset + 4 + b);
+      if((w0 >> 24) == 0x08) stateAddr = w1 & 0x00ffffff;
+      if((w0 >> 24) == 0x07 && stateAddr && !lumiverseAudioProbe07.armed) {
+        auto& pr = lumiverseAudioProbe07;
+        pr.armed = true; pr.task = taskIndex; pr.stateAddr = stateAddr; pr.outAddr = w1 & 0x00ffffff; pr.param = w0 & 0xffffff; pr.count++;
+        fprintf(stderr, "[rsp-hle-audio-07] task %llu cmd %u: 07 param=%06x out=%06x state=%06x\n", (unsigned long long)taskIndex, offset / 8, pr.param, pr.outAddr, pr.stateAddr);
+        lumiverseAudioProbe07Dump("pre-state", stateAddr, 1088);
+        lumiverseAudioProbe07Dump("pre-out", pr.outAddr, 1152);
+      }
+    }
+  }
 
   lumiverseAudioValidateTaskIndex = taskIndex;
   if(!lumiverseAudioValidate(machine, dataPtr, dataSize, (u32)dialect)) {
