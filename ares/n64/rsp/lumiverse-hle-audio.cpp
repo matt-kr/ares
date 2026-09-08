@@ -3127,6 +3127,59 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
         }
         fprintf(stderr, "[rsp-hle-audio] poked probe table at %06x\n", (u32)pokeAddr & 0x00ffffff);
       }
+      //round 21 oracle: LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_PATCH=
+      //"<delta>:<w0 hex>:<w1 hex>[,...]" rewrites the alist command at
+      //(truncated command + delta) IN RDRAM before the LLE runs the task —
+      //a parameter sweep of one command (delta 0) or a substitution of the
+      //commands that produce its input (negative deltas, e.g. a LOADBUFF of
+      //a known signal from the scratch area below in place of the
+      //RESAMPLE). The truncation already patches the alist in place; the
+      //game rebuilds it every task.
+      if(const char* patch = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_TRUNCATE_PATCH")) {
+        const char* c = patch;
+        while(*c) {
+          char* end = nullptr;
+          const long delta = ::strtol(c, &end, 10);
+          if(!end || *end != ':') break;
+          const u32 w0 = (u32)::strtoul(end + 1, &end, 16);
+          if(!end || *end != ':') break;
+          const u32 w1 = (u32)::strtoul(end + 1, &end, 16);
+          const s64 at = truncateCommand + delta;
+          if(at >= 0 && (u64)at * 8 + 8 <= (u64)dataSize + 8) {
+            const u32 address = dataPtr + (u32)at * 8;
+            for(u32 b = 0; b < 4; b++) {
+              rdram.ram.Memory::Writable::write<Byte>((address + b) & 0x00ffffff, (w0 >> (24 - b * 8)) & 0xff);
+              rdram.ram.Memory::Writable::write<Byte>((address + 4 + b) & 0x00ffffff, (w1 >> (24 - b * 8)) & 0xff);
+            }
+            u32 r0 = 0, r1 = 0;
+            for(u32 b = 0; b < 4; b++) { r0 = r0 << 8 | lumiverseAudioRDRAMReadByte(address + b); r1 = r1 << 8 | lumiverseAudioRDRAMReadByte(address + 4 + b); }
+            fprintf(stderr, "[rsp-hle-audio] patched command %lld at %06x: %08x %08x (readback %08x %08x)\n", (long long)at, address, w0, w1, r0, r1);
+          }
+          if(!end || *end != ',') break;
+          c = end + 1;
+        }
+      }
+      //round 21 oracle: LUMIVERSE_ARES_N64_AUDIO_HLE_SCRATCH="<addr hex>:<kind>:<n>[:<a>[:<b>]]"
+      //fills n s16 samples at addr: zero | dc:<v> | impulse:<pos>:<amp> |
+      //sine:<period>:<amp> | ramp:<step> | noise:<amp> (deterministic LCG)
+      if(const char* scratch = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_SCRATCH")) {
+        char kind[32] = {}; unsigned addr = 0; int n = 0, a = 0, b = 0;
+        if(::sscanf(scratch, "%x:%31[a-z]:%d:%d:%d", &addr, kind, &n, &a, &b) >= 3) {
+          u32 seed = 0x12345678;
+          for(int i = 0; i < n; i++) {
+            s32 v = 0;
+            if(!::strcmp(kind, "dc")) v = a;
+            else if(!::strcmp(kind, "impulse")) v = i == a ? b : 0;
+            else if(!::strcmp(kind, "sine")) v = (s32)(b * ::sin(2.0 * 3.14159265358979 * i / (a ? a : 1)));
+            else if(!::strcmp(kind, "ramp")) v = i * a;
+            else if(!::strcmp(kind, "noise")) { seed = seed * 1664525u + 1013904223u; v = (s32)((seed >> 16) & 0xffff) - 32768; v = (s32)((s64)v * a / 32768); }
+            const u16 h = (u16)v;
+            rdram.ram.Memory::Writable::write<Byte>((addr + i * 2 + 0) & 0x00ffffff, h >> 8);
+            rdram.ram.Memory::Writable::write<Byte>((addr + i * 2 + 1) & 0x00ffffff, h & 0xff);
+          }
+          fprintf(stderr, "[rsp-hle-audio] scratch %s x%d at %06x\n", kind, n, addr & 0x00ffffff);
+        }
+      }
       fprintf(stderr, "[rsp-hle-audio] truncated task %llu after command %lld (size=%u)\n",
         (unsigned long long)taskIndex, (long long)truncateCommand, dataSize);
     }

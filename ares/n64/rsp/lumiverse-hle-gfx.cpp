@@ -389,6 +389,11 @@ struct LumiverseGfxMachine {
   struct { f32 r, g, b; f32 dx, dy, dz; u32 param; f32 px, py, pz; } conkerLights[16] = {};
   u32 conkerNumLights = 0;
   f32 conkerView[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+  //round 21: the per-slot packed normals of Conker's movemem index 0x0e
+  //block (32 halfwords, one per vertex-buffer slot: x in the high byte, y
+  //in the low byte, s8 / 127; z is the low byte of the vertex's flag
+  //halfword) — see lumiverseGfxLoadVertices
+  u16 conkerNormalXY[32] = {};
   f32 texScaleS = 1.0f, texScaleT = 1.0f;
   u32 texTile = 0, texLevel = 0;
   u32 rdpHalf1 = 0;
@@ -485,6 +490,26 @@ auto lumiverseGfxConkerLighting() -> bool {
 //matched character vertices; median 0.73, quartiles 0.35 / 0.85)
 auto lumiverseGfxConkerNormalFactor() -> f32 {
   static const f32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_NORMAL_FACTOR"); return (v ? ::atoi(v) : 60) / 100.0f; }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_CONKER_NORMALS: 1 (default) = per-vertex packed
+//normals (round 21: x/y = the movemem 0x0e block's halfword at the
+//vertex's buffer slot, z = the flag byte, s8 / 127, rotated by the bone
+//matrix and normalised — the light-patch oracle recovers them to a median
+//1.5 degrees over 4,228 logo-scene vertices), 0 = the round-20 flat
+//stand-in (CONKER_NORMAL_FACTOR)
+auto lumiverseGfxConkerNormals() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_NORMALS"); return !v || v[0] != '0'; }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_CONKER_FAR_LIGHT: 1 = a point light 1,448+ units from a
+//packed-normal vertex is unattenuated (16-bit wrap of d^2/64 — fitted to
+//ONE entry of the dialogue close-up: (7c5e5e), dir (0,0,-126), param 0x14,
+//LLE att 0.99-1.02 where 1/d^2 gives 0.017; but (ffac51) at the SAME
+//position with param 0x20 attenuates by 1/d^2 in LLE, so the rule is
+//not the microcode's — default 0 = 1/d^2 everywhere)
+auto lumiverseGfxConkerFarLight() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_FAR_LIGHT"); return v && v[0] == '1'; }();
   return value;
 }
 auto lumiverseGfxConkerTriDecode() -> int {
@@ -1101,19 +1126,68 @@ auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address
       const f32 ez = vx * cv[2] + vy * cv[6] + vz * cv[10] + cv[14];
       const auto& amb = m.conkerLights[m.conkerNumLights];
       f32 ir = amb.r, ig = amb.g, ib = amb.b;
-      const f32 directional = (m.geometryMode & 0x400000) ? lumiverseGfxConkerNormalFactor() : 1.0f;
+      //round 21: vertices of batches with geometry-mode bit 0x400000 carry
+      //a packed normal — x and y in the movemem 0x0e block's halfword at
+      //the vertex's buffer slot (high / low byte), z in the low byte of the
+      //flag halfword, all s8 / 127 — rotated by the bone's modelview and
+      //normalised (the recovered length is independent of the bone scale);
+      //the light directions are in the same (modelview output) space.
+      //Established with the light-patch oracle: median 1.5 degrees from
+      //the LLE-recovered normals over 4,228 vertices, see the report.
+      const bool packedNormal = (m.geometryMode & 0x400000) != 0;
+      f32 nnx = 0, nny = 0, nnz = 0;
+      if(packedNormal && lumiverseGfxConkerNormals()) {
+        const u16 xy = m.conkerNormalXY[(v0 + index) & 31];
+        const f32 px = (s8)(xy >> 8), py = (s8)(xy & 0xff), pz = (s8)lumiverseGfxByte(base + 7);
+        nnx = px * mv[0] + py * mv[4] + pz * mv[8];
+        nny = px * mv[1] + py * mv[5] + pz * mv[9];
+        nnz = px * mv[2] + py * mv[6] + pz * mv[10];
+        //the LLE response is |p|/127 x cos x 127/128 x 254/255 (the
+        //light-patch oracle: f = 0.981 x N.dir over 15,688 probe samples,
+        //the packed vector is not renormalised, |p| = 0.986..1.0): keep the
+        //packed length, the s8 direction is scaled by 1/128 below
+        const f32 l2 = nnx * nnx + nny * nny + nnz * nnz;
+        const f32 lp = ::sqrtf(px * px + py * py + pz * pz) / 127.0f;
+        if(l2 > 0.0f) { const f32 inv = lp / ::sqrtf(l2); nnx *= inv; nny *= inv; nnz *= inv; }
+      }
+      const f32 directional = packedNormal && !lumiverseGfxConkerNormals() ? lumiverseGfxConkerNormalFactor() : 1.0f;
+      const bool decodedNormal = packedNormal && lumiverseGfxConkerNormals();
       for(u32 li = 0; li < m.conkerNumLights; li++) {
         const auto& l = m.conkerLights[li];
-        if(!l.param) continue;
+        //round 21: a param-0 entry is an UNattenuated (directional) light
+        //for packed-normal vertices — the logo scene's (105,105,105) entry
+        //lights the characters at colour x max(0, N.dir) — and nothing
+        //for vertices without a normal (round 20: the param-0 probe on the
+        //floor gives 0)
+        if(!l.param && !decodedNormal) continue;
         const f32 ddx = ex - l.px, ddy = ey - l.py, ddz = ez - l.pz;
         const f32 d2 = ddx * ddx + ddy * ddy + ddz * ddz;
         //param x 2^19 / d^2 on the 0..255 scale (the floor's 2^20/d^2 was param 2)
-        f32 att = d2 > 1.0f ? (f32)l.param * 524288.0f / d2 / 255.0f : 1.0f;
+        //round 21: the microcode's d^2 is a 16-bit quantity of d^2 / 64 —
+        //a light 1,448+ units away wraps it and comes out UNattenuated (the
+        //dialogue close-up's (7c5e5e) light at d = 1,510, param 0x14: LLE
+        //att_eff 0.99-1.02 over 52 single-lit vertices where 1/d^2 gives
+        //0.017; the two lights at d = 540-600 fit 1/d^2 to 2 decimals)
+        //...packed-normal vertices only: the no-normal path keeps 1/d^2 to
+        //any distance (the same close-up's room vertices: median 1 LSB
+        //without the wrap, 20 with it)
+        const s16 q = (s16)((u32)(d2 / 64.0f) & 0xffff);
+        f32 att = !l.param ? 1.0f
+          : decodedNormal && lumiverseGfxConkerFarLight() ? (q <= 0 ? 1.0f : (f32)l.param * 8192.0f / (f32)q / 255.0f)
+          : d2 > 1.0f ? (f32)l.param * 524288.0f / d2 / 255.0f : 1.0f;
         if(att > 1.0f) att = 1.0f;
         att *= directional;
+        if(decodedNormal) {
+          const f32 dot = (nnx * l.dx + nny * l.dy + nnz * l.dz) / 128.0f * (254.0f / 255.0f);
+          att *= dot > 0.0f ? dot : 0.0f;
+        }
         ir += l.r * att; ig += l.g * att; ib += l.b * att;
       }
       const f32 cr = lumiverseGfxByte(colorBase + 0), cg = lumiverseGfxByte(colorBase + 1), cb = lumiverseGfxByte(colorBase + 2);
+      //round 21: the light sum saturates at 255 per channel BEFORE the
+      //vertex colour multiply (LLE: a vertex with vcol (192,154,76) under
+      //a sum > 255 comes out exactly (192,154,76))
+      if(ir > 255.0f) ir = 255.0f; if(ig > 255.0f) ig = 255.0f; if(ib > 255.0f) ib = 255.0f;
       vertex.r = lumiverseClampValue(cr * ir / 255.0f, 0.0f, 255.0f);
       vertex.g = lumiverseClampValue(cg * ig / 255.0f, 0.0f, 255.0f);
       vertex.b = lumiverseClampValue(cb * ib / 255.0f, 0.0f, 255.0f);
@@ -2799,6 +2873,32 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       const u32 type = (cmd0 >> 16) & 0xff;
       const u32 offset = cmd0 & 0xffff;
       if(FILE* dump = lumiverseGfxVtxDumpFile()) fprintf(dump, "mw task=%llu pc=%06x %08x %08x\n", (unsigned long long)lumiverseRdpTaskTag, m.pc - 8, cmd0, cmd1);
+      //round 21 oracle: LUMIVERSE_ARES_N64_GFX_MW_PATCH="<type hex>:<offset hex>:<w1 hex>[,...]"
+      //(shadow mode) rewrites the data word of matching G_MOVEWORD commands
+      //in RDRAM after the executor read them, so the LLE microcode — which
+      //runs the task next — sees the patched value; the DL is rebuilt by
+      //the CPU every frame. Used on Conker's undecoded type 0x10 block.
+      if(lumiverseGfxShadowDiscard) {
+        static const char* patch = ::getenv("LUMIVERSE_ARES_N64_GFX_MW_PATCH");
+        if(patch) {
+          const char* c = patch;
+          while(*c) {
+            char* end = nullptr;
+            const u32 ptype = (u32)::strtoul(c, &end, 16);
+            if(!end || *end != ':') break;
+            const u32 poffset = (u32)::strtoul(end + 1, &end, 16);
+            if(!end || *end != ':') break;
+            const u32 pw1 = (u32)::strtoul(end + 1, &end, 16);
+            if(ptype == type && poffset == offset) {
+              lumiverseGfxWriteWord(m.pc - 4, pw1);
+              static u32 logged = 0;
+              if(logged++ < 4) fprintf(stderr, "[rsp-hle-gfx] mw patch task=%llu type=%02x offset=%04x %08x -> %08x\n", (unsigned long long)lumiverseRdpTaskTag, type, offset, cmd1, pw1);
+            }
+            if(!end || *end != ',') break;
+            c = end + 1;
+          }
+        }
+      }
       switch(type) {
       case 0x00: {  //G_MW_MATRIX: patch one 32-bit word of the combined MVP
         //(Super Smash Bros., fifo 2.04H). Empirical (own DL dumps): the game
@@ -2950,7 +3050,14 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
         //the group landed far behind the camera (w = -77602 on the N-logo
         //frame; the class behind 73% of the stray on-screen area). The
         //bone's MV x P is what the LLE stream shows for those vertices.
-        if(lumiverseGfxConker && !lumiverseGfxConkerMv14()) break;
+        if(lumiverseGfxConker && !lumiverseGfxConkerMv14()) {
+          //round 21: the block is the batch's packed-normal table — one
+          //halfword per vertex-buffer slot (x, y as s8 / 127; z is the
+          //vertex's flag byte). Consecutive G_VTX loads of one bone group
+          //share one block (the game stores them per 32-slot chunk).
+          for(u32 slot = 0; slot < 32; slot++) m.conkerNormalXY[slot] = lumiverseGfxHalf(address + slot * 2);
+          break;
+        }
         lumiverseGfxLoadMatrix(address, m.combined);
         m.combinedDirty = false;
         combinedForced = true;
@@ -3458,7 +3565,16 @@ auto lumiverseGfxS2DEXAdmit(u8 opcode, u32 cmd0, u32 cmd1, bool gbi2, u32 struct
   case 0x01: case 0xda: return true;
   case 0x04: why = "s2dex2 SELECT_DL"; return false;
   case 0x09: if(lumiverseGfxS2DEXBackground4BitSupported(structAt) || lumiverseGfxS2DEXBackgroundSupported(structAt)) return true; why = "s2dex2 BG_1CYC (scrolled/scaled/flipped)"; return false;
-  case 0x0a: if(lumiverseGfxS2DEXBackgroundCopySupported(structAt)) return true; why = "s2dex2 BG_COPY (scrolled/flipped/non-16-bit)"; return false;
+  case 0x0a: {
+    if(lumiverseGfxS2DEXBackgroundCopySupported(structAt)) return true;
+    //round 21: name the form in the log (imageX/Y 10.5, flip, load, siz)
+    static char form[160]; static u32 logged = 0;
+    if(logged++ < 3) fprintf(stderr, "[rsp-hle-gfx] s2dex2 BG_COPY struct at %06x: imageX=%04x imageW=%04x frameX=%04x frameW=%04x imageY=%04x imageH=%04x frameY=%04x frameH=%04x load=%04x fmt/siz=%02x%02x flip=%04x tmemW=%04x tmemH=%04x\n",
+      structAt, lumiverseGfxHalf(structAt + 0), lumiverseGfxHalf(structAt + 2), lumiverseGfxHalf(structAt + 4), lumiverseGfxHalf(structAt + 6), lumiverseGfxHalf(structAt + 8), lumiverseGfxHalf(structAt + 10), lumiverseGfxHalf(structAt + 12), lumiverseGfxHalf(structAt + 14),
+      lumiverseGfxHalf(structAt + 20), lumiverseGfxByte(structAt + 22), lumiverseGfxByte(structAt + 23), lumiverseGfxHalf(structAt + 26), lumiverseGfxHalf(structAt + 28), lumiverseGfxHalf(structAt + 30));
+    (void)form;
+    why = "s2dex2 BG_COPY (scrolled/flipped/non-16-bit)"; return false;
+  }
   case 0xd5: why = "s2dex2 DL_COUNT"; return false;
   default: return true;  //base GBI2 command
   }
