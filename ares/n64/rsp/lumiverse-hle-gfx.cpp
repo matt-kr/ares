@@ -85,6 +85,28 @@ auto lumiverseGfxShort(u32 address) -> s16 {
 auto lumiverseGfxByte(u32 address) -> u8 {
   return rdram.ram.Memory::Writable::read<Byte>(address & 0x00ffffff);
 }
+auto lumiverseGfxWriteWord(u32 address, u32 value) -> void {
+  rdram.ram.Memory::Writable::write<Word>(address & 0x00ffffff, value);
+}
+//round 20 oracle: LUMIVERSE_ARES_N64_GFX_LIGHT_PATCH="<col hex6>:<dx>,<dy>,<dz>:<param>:<px>,<py>,<pz>:<amb hex6>" —
+//the shadow executor (which runs BEFORE the LLE RSP on the same task)
+//rewrites every 48-byte light entry Conker's DL loads (movemem index 0x0a,
+//offsets >= 0x60): the first entry becomes the probe light, the others go
+//black, the ambient entry (the last one, dir = 0) takes <amb>. The LLE
+//microcode then DMAs the patched entries, so its per-vertex colours are
+//the response to ONE known light — the decoder for the packed normals.
+struct LumiverseGfxLightPatch { bool on = false; u32 col = 0; s32 dir[3] = {}; u32 param = 0; s32 pos[3] = {}; u32 amb = 0; };
+auto lumiverseGfxLightPatch() -> const LumiverseGfxLightPatch& {
+  static const LumiverseGfxLightPatch p = [] {
+    LumiverseGfxLightPatch r; const char* v = ::getenv("LUMIVERSE_ARES_N64_GFX_LIGHT_PATCH"); if(!v || !v[0]) return r;
+    unsigned col, amb; int dx, dy, dz, param, px, py, pz;
+    if(::sscanf(v, "%x:%d,%d,%d:%d:%d,%d,%d:%x", &col, &dx, &dy, &dz, &param, &px, &py, &pz, &amb) == 9) {
+      r.on = true; r.col = col; r.dir[0] = dx; r.dir[1] = dy; r.dir[2] = dz; r.param = param; r.pos[0] = px; r.pos[1] = py; r.pos[2] = pz; r.amb = amb;
+    }
+    return r;
+  }();
+  return p;
+}
 
 auto lumiverseGfxSByte(u32 address) -> s8 {
   return (s8)lumiverseGfxByte(address);
@@ -358,6 +380,15 @@ struct LumiverseGfxMachine {
   LumiverseGfxLight lights[8];
   u32 numLights = 0;
   f32 fogMul = 0, fogOff = 0;
+  //round 20: Conker's lighting (F3DEXBG): 48-byte light entries with a
+  //colour, a direction, an attenuation parameter and a view-space
+  //position; the vertex's colour bytes are a colour (the normal is packed
+  //in the flag halfword); the view matrix is the one multiplied into the
+  //projection (G_MTX proj, load=0). Established with the light-patch
+  //oracle on the LLE stream, see the round-20 report.
+  struct { f32 r, g, b; f32 dx, dy, dz; u32 param; f32 px, py, pz; } conkerLights[16] = {};
+  u32 conkerNumLights = 0;
+  f32 conkerView[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
   f32 texScaleS = 1.0f, texScaleT = 1.0f;
   u32 texTile = 0, texLevel = 0;
   u32 rdpHalf1 = 0;
@@ -422,6 +453,40 @@ struct LumiverseGfxMachine {
 static bool lumiverseGfxConker = false;
 //LUMIVERSE_ARES_N64_CONKER_TRI_DECODE: candidate bit layout for the 0x1x
 //triangle-list command while it is being established (0 = draw nothing)
+//LUMIVERSE_ARES_N64_CONKER_MV14: 1 = treat Conker's movemem index 0x0e as
+//gSPForceMatrix (rounds 8-19, wrong), 0 = matrix state untouched (default)
+auto lumiverseGfxConkerMv14() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_MV14"); return v && v[0] == '1'; }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_CONKER_NEARFAR: which clip flags drop a list triangle
+//whole: 1 = near|far (round 19's rule — fitted while movemem 0x0e was still
+//trashing the MVP, so most "near" vertices were garbage; with that fixed
+//the LLE stream clips near vertices like any F3DEX2.NoN build: the
+//ground-plane quads of the logo frames, 33k px each, only appear with
+//0 or 2), 2 = far only, 3 = near only, 0 = none (default; 0 and 2 are
+//identical over the intro window, the general clipper handles far)
+auto lumiverseGfxConkerNearFarMask() -> u8 {
+  static const u8 value = [] () -> u8 {
+    const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_NEARFAR"); const int mode = v ? ::atoi(v) : 0;
+    return mode == 1 ? (LumiverseClipFar | LumiverseClipNear) : mode == 2 ? LumiverseClipFar : mode == 3 ? LumiverseClipNear : 0;
+  }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_CONKER_LIGHTING: 1 (default) = the round-20 Conker
+//lighting model, 0 = the F3DEX2 path (colour bytes as normals; wrong)
+auto lumiverseGfxConkerLighting() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_LIGHTING"); return !v || v[0] != '0'; }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_CONKER_NORMAL_FACTOR: stand-in for max(0, N.dir) on
+//packed-normal vertices, percent (default 60 = the mean of
+//(LLE - ambient) / (colour x attenuation) over the logo scene's 39
+//matched character vertices; median 0.73, quartiles 0.35 / 0.85)
+auto lumiverseGfxConkerNormalFactor() -> f32 {
+  static const f32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_NORMAL_FACTOR"); return (v ? ::atoi(v) : 60) / 100.0f; }();
+  return value;
+}
 auto lumiverseGfxConkerTriDecode() -> int {
   static const int value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_CONKER_TRI_DECODE"); return v ? ::atoi(v) : 4; }();
   return value;
@@ -1016,7 +1081,44 @@ auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address
     vertex.w = x * wvp[3] + y * wvp[7] + z * wvp[11] + wvp[15];
     vertex.clip = lumiverseGfxCalcClipFlags(vertex.x, vertex.y, vertex.z, vertex.w);
 
-    if(lighting) {
+    if(lighting && lumiverseGfxConker && lumiverseGfxConkerLighting()) {
+      //Conker (round 20): colour = vertex colour x (ambient + sum over the
+      //lights of colour x min(1, param x 2^19 / d^2)), d = distance from
+      //the view-space vertex to the light's position (LLE oracle: the
+      //logo-scene floor fits 38 + 2^20/d^2 to 1.3 rms over 45 vertices;
+      //the light-patch probes give col x param x 2^19 / d^2 exactly, no
+      //direction term for vertices without a packed normal). Vertices of
+      //batches with geometry-mode bit 0x400000 carry a packed normal in
+      //the flag halfword and take col x att x max(0, N.dir); N's packing
+      //is NOT decoded yet — a flat 0.5 stands in for max(0, N.dir),
+      //which is the class of residual documented in the report.
+      const f32 vx = x * mv[0] + y * mv[4] + z * mv[8]  + mv[12];
+      const f32 vy = x * mv[1] + y * mv[5] + z * mv[9]  + mv[13];
+      const f32 vz = x * mv[2] + y * mv[6] + z * mv[10] + mv[14];
+      const f32* cv = m.conkerView;
+      const f32 ex = vx * cv[0] + vy * cv[4] + vz * cv[8]  + cv[12];
+      const f32 ey = vx * cv[1] + vy * cv[5] + vz * cv[9]  + cv[13];
+      const f32 ez = vx * cv[2] + vy * cv[6] + vz * cv[10] + cv[14];
+      const auto& amb = m.conkerLights[m.conkerNumLights];
+      f32 ir = amb.r, ig = amb.g, ib = amb.b;
+      const f32 directional = (m.geometryMode & 0x400000) ? lumiverseGfxConkerNormalFactor() : 1.0f;
+      for(u32 li = 0; li < m.conkerNumLights; li++) {
+        const auto& l = m.conkerLights[li];
+        if(!l.param) continue;
+        const f32 ddx = ex - l.px, ddy = ey - l.py, ddz = ez - l.pz;
+        const f32 d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+        //param x 2^19 / d^2 on the 0..255 scale (the floor's 2^20/d^2 was param 2)
+        f32 att = d2 > 1.0f ? (f32)l.param * 524288.0f / d2 / 255.0f : 1.0f;
+        if(att > 1.0f) att = 1.0f;
+        att *= directional;
+        ir += l.r * att; ig += l.g * att; ib += l.b * att;
+      }
+      const f32 cr = lumiverseGfxByte(colorBase + 0), cg = lumiverseGfxByte(colorBase + 1), cb = lumiverseGfxByte(colorBase + 2);
+      vertex.r = lumiverseClampValue(cr * ir / 255.0f, 0.0f, 255.0f);
+      vertex.g = lumiverseClampValue(cg * ig / 255.0f, 0.0f, 255.0f);
+      vertex.b = lumiverseClampValue(cb * ib / 255.0f, 0.0f, 255.0f);
+      vertex.a = lumiverseGfxByte(colorBase + 3);
+    } else if(lighting) {
       const f32 nxRaw = lumiverseGfxSByte(colorBase + 0);
       const f32 nyRaw = lumiverseGfxSByte(colorBase + 1);
       const f32 nzRaw = lumiverseGfxSByte(colorBase + 2);
@@ -1058,13 +1160,17 @@ auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address
   if(FILE* dump = lumiverseGfxVtxDumpFile()) {
     static u32 lines = 0;
     if(lines++ < 400000) {
-      fprintf(dump, "vtx task=%llu v0=%u n=%u at=%06x vp=%.2f,%.2f,%.2f,%.2f ratio=%.2f geom=%08x\n", (unsigned long long)lumiverseRdpTaskTag, v0, n, address,
-        m.vpTransX, m.vpScaleX, m.vpTransY, m.vpScaleY, m.clipRatio, m.geometryMode);
+      fprintf(dump, "vtx task=%llu v0=%u n=%u at=%06x vp=%.2f,%.2f,%.2f,%.2f ratio=%.2f geom=%08x cmd=%08x%08x seg=", (unsigned long long)lumiverseRdpTaskTag, v0, n, address,
+        m.vpTransX, m.vpScaleX, m.vpTransY, m.vpScaleY, m.clipRatio, m.geometryMode, m.cmd0, m.cmd1);
+      for(u32 s = 0; s < 16; s++) fprintf(dump, "%06x%s", m.segments[s], s == 15 ? "\n" : ",");
+      fprintf(dump, "  mvp:"); for(u32 e = 0; e < 16; e++) fprintf(dump, " %.4f", wvp[e]); fprintf(dump, "\n");
       for(u32 index = v0; index < v0 + n; index++) {
         const auto& v = m.verts[index];
         const f32 invW = v.w != 0.0f ? 1.0f / v.w : 0.0f;
-        fprintf(dump, "  %2u: sx=%.2f sy=%.2f z/w=%.4f w=%.2f clip=%02x rgba=%.0f,%.0f,%.0f,%.0f xyz=%.3f,%.3f,%.3f uv=%.2f,%.2f\n", index,
-          m.vpTransX + m.vpScaleX * (v.x * invW), m.vpTransY - m.vpScaleY * (v.y * invW), v.z * invW, v.w, v.clip, v.r, v.g, v.b, v.a, v.x, v.y, v.z, v.u, v.v);
+        const u32 raw = address + (index - v0) * (pd ? 12 : 16);
+        fprintf(dump, "  %2u: sx=%.2f sy=%.2f z/w=%.4f w=%.2f clip=%02x rgba=%.0f,%.0f,%.0f,%.0f xyz=%.3f,%.3f,%.3f uv=%.2f,%.2f raw=%08x%08x%08x%08x\n", index,
+          m.vpTransX + m.vpScaleX * (v.x * invW), m.vpTransY - m.vpScaleY * (v.y * invW), v.z * invW, v.w, v.clip, v.r, v.g, v.b, v.a, v.x, v.y, v.z, v.u, v.v,
+          lumiverseGfxWord(raw), lumiverseGfxWord(raw + 4), lumiverseGfxWord(raw + 8), lumiverseGfxWord(raw + 12));
       }
     }
   }
@@ -1189,6 +1295,15 @@ auto lumiverseGfxDrawTriangle(LumiverseGfxMachine& m, u32 index0, u32 index1, u3
   const auto& a = m.verts[index0];
   const auto& b = m.verts[index1];
   const auto& c = m.verts[index2];
+  //round 20: provenance of every triangle (standard and Conker lists) in the
+  //vertex dump — the RDP-triangle ordinal it starts at links the shadow
+  //stream's triangles back to the DL command that produced them
+  if(FILE* dump = lumiverseGfxVtxDumpFile()) {
+    auto sx = [&](const LumiverseGfxVertex& v) { return v.w != 0.0f ? m.vpTransX + m.vpScaleX * (v.x / v.w) : 0.0f; };
+    auto sy = [&](const LumiverseGfxVertex& v) { return v.w != 0.0f ? m.vpTransY - m.vpScaleY * (v.y / v.w) : 0.0f; };
+    fprintf(dump, "dt task=%llu pc=%06x %08x %08x | %u %u %u | (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) clip=%02x%02x%02x w=%.1f,%.1f,%.1f geom=%08x n=%llu\n", (unsigned long long)lumiverseRdpTaskTag,
+      m.pc - 8, m.cmd0, m.cmd1, index0, index1, index2, sx(a), sy(a), sx(b), sy(b), sx(c), sy(c), a.clip, b.clip, c.clip, a.w, b.w, c.w, m.geometryMode, (unsigned long long)m.trisEmitted);
+  }
 
   //trivial rejection: all vertices outside the same frustum plane (near
   //excluded: F3DEX.NoN draws through the near plane, RDP scissors)
@@ -2452,7 +2567,7 @@ auto lumiverseGfxConkerTriangles(LumiverseGfxMachine& m, u32 cmd0, u32 cmd1) -> 
     //whole — no z clipping — while x/y excursions inside the guard band are
     //drawn (scissored) as usual; backface culling applies with the winding
     //above (accepted set: 0 of 178 fully-inside triangles back-facing)
-    if(variant == 4 && a < 32 && b < 32 && c < 32 && ((m.verts[a].clip | m.verts[b].clip | m.verts[c].clip) & (LumiverseClipFar | LumiverseClipNear))) { m.trisRejected++; continue; }
+    if(variant == 4 && a < 32 && b < 32 && c < 32 && ((m.verts[a].clip | m.verts[b].clip | m.verts[c].clip) & lumiverseGfxConkerNearFarMask())) { m.trisRejected++; continue; }
     if(FILE* dump = lumiverseGfxVtxDumpFile()) {
       const auto& va = m.verts[a]; const auto& vb = m.verts[b]; const auto& vc = m.verts[c];
       auto sx = [&](const LumiverseGfxVertex& v) { return v.w != 0.0f ? m.vpTransX + m.vpScaleX * (v.x / v.w) : 0.0f; };
@@ -2655,6 +2770,10 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       const u32 address = lumiverseGfxSegmentAddress(m, cmd1);
       f32 matrix[16];
       lumiverseGfxLoadMatrix(address, matrix);
+      if(FILE* dump = lumiverseGfxVtxDumpFile()) {
+        fprintf(dump, "mtx task=%llu pc=%06x %08x %08x at=%06x push=%d load=%d proj=%d:", (unsigned long long)lumiverseRdpTaskTag, m.pc - 8, cmd0, cmd1, address, push, load, projection);
+        for(u32 e = 0; e < 16; e++) fprintf(dump, " %.4f", matrix[e]); fprintf(dump, "\n");
+      }
 
       f32* stackBase = projection ? &m.projStack[0][0] : &m.mvStack[0][0];
       u32& depth = projection ? m.projDepth : m.mvDepth;
@@ -2664,6 +2783,7 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       f32 result[16];
       if(!load) {
         lumiverseGfxMatrixMultiply(matrix, top, result);
+        if(lumiverseGfxConker && projection) for(u32 index = 0; index < 16; index++) m.conkerView[index] = matrix[index];
       } else {
         for(u32 index = 0; index < 16; index++) result[index] = matrix[index];
       }
@@ -2678,6 +2798,7 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
     case 0xdb: {  //G_MOVEWORD: type in bits 16-23, offset in low 16
       const u32 type = (cmd0 >> 16) & 0xff;
       const u32 offset = cmd0 & 0xffff;
+      if(FILE* dump = lumiverseGfxVtxDumpFile()) fprintf(dump, "mw task=%llu pc=%06x %08x %08x\n", (unsigned long long)lumiverseRdpTaskTag, m.pc - 8, cmd0, cmd1);
       switch(type) {
       case 0x00: {  //G_MW_MATRIX: patch one 32-bit word of the combined MVP
         //(Super Smash Bros., fifo 2.04H). Empirical (own DL dumps): the game
@@ -2704,6 +2825,7 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       }
       case 0x02:  //G_MW_NUMLIGHT: value = numLights * 24
         m.numLights = (cmd1 / 24) & 7;
+        if(lumiverseGfxConker) m.conkerNumLights = (cmd1 / 48) < 15 ? cmd1 / 48 : 15;  //48-byte entries
         break;
       case 0x04:  //G_MW_CLIP: guard-band ratio
         lumiverseGfxSetClipRatio(m, cmd1);
@@ -2738,6 +2860,35 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       const u32 type = cmd0 & 0xfe;
       const u32 offset = ((cmd0 >> 8) & 0xff) << 3;
       const u32 address = lumiverseGfxSegmentAddress(m, cmd1);
+      if(lumiverseGfxConker && lumiverseGfxShadowDiscard && type == 10 && offset >= 0x60 && lumiverseGfxLightPatch().on) {
+        //the game's own light structs are CPU state (patching them in place
+        //stalled the game at 428 tasks per 2400 steps): build the patched
+        //copy in a scratch block at the top of RDRAM and redirect THIS
+        //command's pointer (the DL is rebuilt by the CPU every frame)
+        const auto& p = lumiverseGfxLightPatch();
+        const u32 size = (((cmd0 >> 19) & 0x1f) + 1) * 8;
+        const u32 scratch = 0x7fe000 + (offset - 0x60);
+        for(u32 e = 0; e < size / 4; e++) lumiverseGfxWriteWord(scratch + e * 4, lumiverseGfxWord(address + e * 4));
+        lumiverseGfxWriteWord(m.pc - 4, 0x80000000 | scratch);
+        for(u32 entry = 0; entry * 48 < size; entry++) {
+          const u32 at = scratch + entry * 48;
+          const bool ambient = lumiverseGfxWord(at + 8) == 0 && lumiverseGfxWord(at + 12) == 0 && lumiverseGfxWord(at + 32) == 0;  //dir 0, no param, no position
+          const bool probe = offset == 0x60 && entry == 0;
+          const u32 col = ambient ? p.amb << 8 : probe ? p.col << 8 : 0;
+          lumiverseGfxWriteWord(at + 0, col); lumiverseGfxWriteWord(at + 4, col);
+          if(!ambient) {
+            lumiverseGfxWriteWord(at + 8, probe ? ((u32)(u8)p.dir[0] << 24 | (u32)(u8)p.dir[1] << 16 | (u32)(u8)p.dir[2] << 8) : 0x00007f00);
+            lumiverseGfxWriteWord(at + 12, probe ? p.param << 24 : 0);
+            const u32 w0 = probe ? ((u32)(u16)p.pos[0] << 16 | (u16)p.pos[1]) : 0, w1 = probe ? (u32)(u16)p.pos[2] << 16 : 0;
+            lumiverseGfxWriteWord(at + 32, w0); lumiverseGfxWriteWord(at + 36, w1); lumiverseGfxWriteWord(at + 40, w0); lumiverseGfxWriteWord(at + 44, w1);
+          }
+        }
+      }
+      if(FILE* dump = lumiverseGfxVtxDumpFile()) {
+        const u32 size = (((cmd0 >> 19) & 0x1f) + 1) * 8;
+        fprintf(dump, "mm task=%llu pc=%06x %08x %08x type=%u offset=%03x at=%06x raw:", (unsigned long long)lumiverseRdpTaskTag, m.pc - 8, cmd0, lumiverseGfxWord(m.pc - 4), type, offset, lumiverseGfxSegmentAddress(m, lumiverseGfxWord(m.pc - 4)));
+        for(u32 e = 0; e < size / 4 && e < 32; e++) fprintf(dump, " %08x", lumiverseGfxWord(address + e * 4)); fprintf(dump, "\n");
+      }
       switch(type) {
       case 8:  //G_GBI2_MV_VIEWPORT
         m.vpScaleX = (f32)lumiverseGfxShort(address + 0) / 4.0f;
@@ -2748,6 +2899,24 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
         m.vpTransZ = (f32)lumiverseGfxShort(address + 12);
         break;
       case 10: {  //G_GBI2_MV_LIGHT: offset 0/24 = lookat (ignored), 48+ = lights
+        if(lumiverseGfxConker) {
+          //Conker: 16-byte lookat rows at 0x00/0x30, then 48-byte entries
+          //from 0x60 — colour (3), colour copy, direction (s8 x3), an
+          //attenuation parameter byte, 16 zero bytes, the view-space
+          //position (s16 x3) twice; entry numLights is the ambient
+          if(offset >= 0x60) {
+            const u32 size = (((cmd0 >> 19) & 0x1f) + 1) * 8;
+            for(u32 e = 0; e * 48 < size; e++) {
+              const u32 index = (offset - 0x60) / 48 + e; if(index >= 16) break;
+              const u32 at = address + e * 48; auto& l = m.conkerLights[index];
+              l.r = lumiverseGfxByte(at + 0); l.g = lumiverseGfxByte(at + 1); l.b = lumiverseGfxByte(at + 2);
+              l.dx = lumiverseGfxSByte(at + 8); l.dy = lumiverseGfxSByte(at + 9); l.dz = lumiverseGfxSByte(at + 10);
+              l.param = lumiverseGfxByte(at + 12);
+              l.px = lumiverseGfxShort(at + 32); l.py = lumiverseGfxShort(at + 34); l.pz = lumiverseGfxShort(at + 36);
+            }
+          }
+          break;
+        }
         if(offset >= 48) {
           const u32 lightIndex = (offset - 48) / 24;
           if(lightIndex < 8) {
@@ -2769,6 +2938,19 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
         break;
       }
       case 14: {  //G_GBI2_MV_MATRIX: gSPForceMatrix — replaces combined MVP
+        if(FILE* dump = lumiverseGfxVtxDumpFile()) {
+          fprintf(dump, "force task=%llu pc=%06x %08x %08x at=%06x raw:", (unsigned long long)lumiverseRdpTaskTag, m.pc - 8, cmd0, cmd1, address);
+          for(u32 e = 0; e < 16; e++) fprintf(dump, " %08x", lumiverseGfxWord(address + e * 4)); fprintf(dump, "\n");
+        }
+        //round 20: Conker's build issues this 64-byte block (index 0x0e) once
+        //per bone group of its skinned characters, between the bone's G_MTX
+        //and its G_VTX; the block is not a matrix (raw words such as
+        //3728fa7f / 8202xxxx, no s16.16 int/frac halves) — treating it as
+        //gSPForceMatrix replaced the MVP with garbage and every vertex of
+        //the group landed far behind the camera (w = -77602 on the N-logo
+        //frame; the class behind 73% of the stray on-screen area). The
+        //bone's MV x P is what the LLE stream shows for those vertices.
+        if(lumiverseGfxConker && !lumiverseGfxConkerMv14()) break;
         lumiverseGfxLoadMatrix(address, m.combined);
         m.combinedDirty = false;
         combinedForced = true;
@@ -3807,7 +3989,18 @@ static const LumiverseGfxCostTable lumiverseGfxCostCUSA = { 0, 0, 885, {
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 4222, 0, 0, 0, 3511, 0, 0, 0, 853, 0, 1615, 0, 0, 273 } };
 static const LumiverseGfxCostTable lumiverseGfxCostNone = { 0, 0, 0, {} };
+//round 20: Conker's Bad Fur Day (F3DEXBG) — 5,252 LLE tasks of the intro
+//+ first area (rms 7.8% of the 30.8 ms mean task, median 7.4%; the GBI2
+//table put 279 of 918 logo-scene tasks off by more than 2x). The sixteen
+//0x1x opcodes are one packed-triangle command and share a coefficient.
+static const LumiverseGfxCostTable lumiverseGfxCostConker = [] {
+  LumiverseGfxCostTable t = { 0, 0, 0, {} };
+  t.ops[0x06] = 3087; for(u32 op = 0x10; op <= 0x1f; op++) t.ops[op] = 1954;
+  t.ops[0xf0] = 3093; t.ops[0xfa] = 2978; t.ops[0xfc] = 14276; t.ops[0xfd] = 620;
+  return t;
+}();
 auto lumiverseGfxCostTableFor(u64 ucodeHash, u32 dialect) -> const LumiverseGfxCostTable& {
+  if(ucodeHash == 0x63a15d2f6bdae1f5ull) return lumiverseGfxCostConker;
   if(dialect == LumiverseDialectGBI2 || dialect == LumiverseDialectS2DEX2) return lumiverseGfxCostGBI2;
   if(dialect != LumiverseDialectGBI0) return lumiverseGfxCostGBI1;
   switch(ucodeHash) {
