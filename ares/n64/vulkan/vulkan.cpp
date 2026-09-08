@@ -11,6 +11,8 @@
 
 namespace ares::Nintendo64 {
 
+auto lumiverseVerboseLog() -> bool;  //rsp/lumiverse-hle.cpp (round 18): LUMIVERSE_ARES_N64_VERBOSE
+
 Vulkan vulkan;
 
 struct LoggingInterface : Util::LoggingInterface {
@@ -68,14 +70,18 @@ struct LumiverseStallStats {
 
     const u64 now = nowNs();
     if(windowStartNs == 0) windowStartNs = now;
-    if(now - windowStartNs >= 1000000000ull) {
+    //round 18: one status line per ~10 s in the release log; every second
+    //with LUMIVERSE_ARES_N64_VERBOSE=1 (the harness); the fields stay per-second rates
+    static const u64 windowNs = lumiverseVerboseLog() ? 1000000000ull : 10000000000ull;
+    if(now - windowStartNs >= windowNs) {
+      const double seconds = (now - windowStartNs) / 1e9;
       fprintf(stderr,
         "[ares-perf] sync %u/s wait %.1f ms/s (max %.2f) | rdp-enqueue %.1f ms/s | scanout %.1f ms/s | ring-spin-capped %llu\n",
-        syncCount,
-        syncWaitNs / 1e6,
+        (u32)(syncCount / seconds + 0.5),
+        syncWaitNs / 1e6 / seconds,
         syncWaitMaxNs / 1e6,
-        renderNs / 1e6,
-        scanoutNs / 1e6,
+        renderNs / 1e6 / seconds,
+        scanoutNs / 1e6 / seconds,
         (unsigned long long)::RDP::lumiverse_ring_spin_capped());
       syncWaitNs = 0;
       syncWaitMaxNs = 0;

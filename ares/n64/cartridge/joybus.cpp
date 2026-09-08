@@ -36,6 +36,7 @@ auto Cartridge::joybusComm(n8 send, n8 recv, n8 input[], n8 output[]) -> n2 {
     valid = 1;
     if(!eepromBusy) {
       u32 address = input[1] * 8;
+      lumiverseCartSaveNote(0, address);
       for(u32 index : range(send - 2)) {
         cartridge.eeprom.write<Byte>(address++, input[2 + index]);
       }

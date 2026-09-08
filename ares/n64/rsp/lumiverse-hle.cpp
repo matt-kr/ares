@@ -13,6 +13,17 @@
 //This file is included from rsp.cpp inside namespace ares::Nintendo64, so it
 //may not #include anything; it sticks to fixed-size tables instead of STL.
 
+//round 18: release log hygiene. LUMIVERSE_ARES_N64_VERBOSE=1 restores the
+//per-second / per-1024-task telemetry lines ([ares-perf] every second, the
+//[rsp-hle] dispatch census every 1024 tasks, ...); the app leaves it unset
+//(launch summary + errors + one status line per ~10 s), the harness scripts
+//set it so the gates keep reading them. Namespace scope (not the anonymous
+//namespace below): vulkan.cpp is a separate translation unit.
+auto lumiverseVerboseLog() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_VERBOSE"); return v && v[0] == '1'; }();
+  return value;
+}
+
 namespace {
 
 struct LumiverseTaskSignature {
@@ -85,6 +96,21 @@ auto lumiverseHLECompletionCycles(u32 taskType) -> s32 {
   return taskType == 1 ? gfx : audio;
 }
 s32 lumiverseHLERequestedCompletionCycles = 0;
+
+//task census (was function-local in lumiverseTaskDispatchHook): file scope
+//so a power cycle / ROM switch starts a fresh per-ROM census — every ucode
+//hash logs its "new task" line once per ROM again
+static LumiverseTaskSignature lumiverseHLESignatures[LumiverseMaxTaskSignatures];
+static u32 lumiverseHLESignatureCount = 0;
+static u64 lumiverseHLETotalDispatches = 0;
+
+//round 18: called from RSP::power() (every ROM load, every reset)
+auto lumiverseHLEPowerReset() -> void {
+  lumiverseHLERequestedCompletionCycles = 0;
+  lumiverseHLESignatureCount = 0;
+  lumiverseHLETotalDispatches = 0;
+  lumiverseAudioPowerReset();
+}
 
 auto lumiverseHLEDebug() -> int {
   static int debug = [] {
@@ -189,7 +215,7 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
   static u32 guardedTypes[4];
   if(taskType != 1 && taskType != 2) {
     guardedDispatches++;
-    if(guardedDispatches <= 3 || (guardedDispatches & 1023) == 0) {
+    if(guardedDispatches <= 3 || ((guardedDispatches & 1023) == 0 && lumiverseVerboseLog())) {
       fprintf(stderr, "[rsp-hle] non-OSTask dispatch #%llu: type=%08x ucode=%06x/%u data=%06x/%u dl=%06x/%u\n",
         (unsigned long long)guardedDispatches, taskType, ucode, ucodeSize, ucodeData, ucodeDataSize,
         dataPtr, dataSize);
@@ -205,7 +231,7 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
     //round 8 census)
     static u64 oddDispatches = 0;
     oddDispatches++;
-    if(oddDispatches <= 3 || (oddDispatches & 1023) == 0) {
+    if(oddDispatches <= 3 || ((oddDispatches & 1023) == 0 && lumiverseVerboseLog())) {
       fprintf(stderr, "[rsp-hle] OSTask with odd sizes #%llu: type=%u ucode=%06x/%u data=%06x/%u dl=%06x/%u\n",
         (unsigned long long)oddDispatches, taskType, ucode, ucodeSize, ucodeData, ucodeDataSize, dataPtr, dataSize);
     }
@@ -227,9 +253,9 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
       taskType, (unsigned long long)(u64)cpu.scc.count);
   }
 
-  static LumiverseTaskSignature signatures[LumiverseMaxTaskSignatures];
-  static u32 signatureCount = 0;
-  static u64 totalDispatches = 0;
+  auto& signatures = lumiverseHLESignatures;
+  auto& signatureCount = lumiverseHLESignatureCount;
+  auto& totalDispatches = lumiverseHLETotalDispatches;
   totalDispatches++;
   if(taskType == 1) lumiverseRdpTaskTag++;
 
@@ -296,7 +322,7 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
       word(outBuffSize), word(outBuff), word(outBuff + 4), word(outBuff + 8), word(outBuff + 12));
   }
 
-  if((totalDispatches & 1023) == 0) {
+  if((totalDispatches & 1023) == 0 && lumiverseVerboseLog()) {
     fprintf(stderr, "[rsp-hle] dispatches=%llu:", (unsigned long long)totalDispatches);
     for(u32 index = 0; index < signatureCount; index++) {
       fprintf(stderr, " type%u/%04llx=%llu",

@@ -78,6 +78,7 @@ auto Cartridge::Flash::writeWord(u32 address, u64 data) -> void {
     return;
 
   case 0xd2:  //execute
+    if(mode == Mode::Erase || mode == Mode::Write) lumiverseCartSaveNote(2, offset);
     if(mode == Mode::Erase) {
       for(u32 index = 0; index < 128; index += 2) {
         Memory::Writable::write<Half>(offset + index, 0xffff);

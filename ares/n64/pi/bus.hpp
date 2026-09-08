@@ -92,7 +92,7 @@ inline auto PI::busWrite(u32 address, u32 data) -> void {
   }
   if(address <= 0x07ff'ffff) return;
   if(address <= 0x0fff'ffff) {
-    if(cartridge.ram  ) return cartridge.ram.write<Size>(address, data);
+    if(cartridge.ram  ) { lumiverseCartSaveNote(1, address); return cartridge.ram.write<Size>(address, data); }
     if(cartridge.flash) return cartridge.flash.write<Size>(address, data);
     return;
   }

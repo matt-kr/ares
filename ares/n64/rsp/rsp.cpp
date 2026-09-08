@@ -28,6 +28,11 @@ namespace {
   auto lumiverseAudioFlushDeferredWrites() -> void;
   auto lumiverseAudioNoteTaskEnd(u64 cycles) -> void;
   auto lumiverseAudioProgressDeferredWrites(s64 elapsed, s64 total) -> void;
+  //round 18: drop every piece of HLE state that belongs to the previous
+  //ROM/power cycle (deferred RDRAM output, voice tables, the hybrid
+  //hand-off flag, the ucode census) — the app switches ROMs in-process
+  auto lumiverseAudioPowerReset() -> void;
+  auto lumiverseHLEPowerReset() -> void;
 }
 //Lumiverse diagnostic hooks defined in rdp/io.cpp (LUMIVERSE_ARES_N64_IO_POLL_LOG)
 auto lumiverseIOPollLog() -> bool;
@@ -228,6 +233,13 @@ auto RSP::power(bool reset) -> void {
   //Lumiverse addition: never reset the core out from under an in-flight
   //async audio task
   lumiverseAsyncDrain();
+  //round 18: an HLE task in flight at stop()/ROM switch must not complete
+  //into the next ROM — its pending completion, its deferred RDRAM writes
+  //and the per-ROM executor state are dropped here, before the new ROM's
+  //first dispatch (RSP::main would otherwise count the stale cycles down,
+  //land the old output in the new RDRAM and raise a spurious SP interrupt)
+  lumiverseHLEPendingCycles = 0;
+  lumiverseHLEPowerReset();
   Thread::reset();
   dmem.fill();
   imem.fill();

@@ -5,6 +5,23 @@ namespace ares::Nintendo64 {
 Cartridge& cartridge = cartridgeSlot.cartridge;
 #include "slot.cpp"
 #include "flash.cpp"
+
+auto lumiverseCartSaveNote(u32 kind, u32 address) -> void {
+  static const bool verbose = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_VERBOSE"); return v && v[0] == '1'; }();
+  if(!verbose || kind > 2) return;
+  static u64 writes[3] = {}, bursts[3] = {};
+  static u64 lastCycles[3] = {};
+  static const char* names[3] = {"eeprom", "sram", "flash"};
+  writes[kind]++;
+  //a burst = writes closer together than ~2 frames of RSP cycles (62.5 MHz)
+  const u64 now = rsp.profile.cycles;
+  if(bursts[kind] == 0 || now - lastCycles[kind] > 2'100'000) {
+    bursts[kind]++;
+    fprintf(stderr, "[cart-save] %s write burst #%llu at rsp-cycles=%llu addr=%06x (writes so far %llu)\n",
+      names[kind], (unsigned long long)bursts[kind], (unsigned long long)now, address, (unsigned long long)writes[kind]);
+  }
+  lastCycles[kind] = now;
+}
 #include "rtc.cpp"
 #include "joybus.cpp"
 #include "isviewer.cpp"

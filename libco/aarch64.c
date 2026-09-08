@@ -12,6 +12,27 @@ extern "C" {
 
 static thread_local alignas(16) uintptr_t co_active_buffer[64];
 static thread_local cothread_t co_active_handle = 0;
+
+/* LUMIVERSE (round 18): ThreadSanitizer fiber annotations. TSAN tracks a
+   shadow stack and happens-before per OS thread; a libco stack switch without
+   these calls confuses it (bogus reports / aborts). Only compiled into a
+   -fsanitize=thread build; the fiber handle lives in register slot 30 of the
+   cothread's save area (slots 0-23 are the callee-saved registers). */
+#if defined(__has_feature)
+  #if __has_feature(thread_sanitizer)
+    #define LIBCO_TSAN 1
+  #endif
+#endif
+#ifdef LIBCO_TSAN
+extern void* __tsan_get_current_fiber(void);
+extern void* __tsan_create_fiber(unsigned flags);
+extern void __tsan_destroy_fiber(void* fiber);
+extern void __tsan_switch_to_fiber(void* fiber, unsigned flags);
+#define LIBCO_TSAN_SLOT 30
+static void co_tsan_init_active(void) {
+  if(!co_active_buffer[LIBCO_TSAN_SLOT]) co_active_buffer[LIBCO_TSAN_SLOT] = (uintptr_t)__tsan_get_current_fiber();
+}
+#endif
 static void (*co_swap)(cothread_t, cothread_t) = 0;
 
 #ifdef LIBCO_MPROTECT
@@ -87,6 +108,9 @@ static void co_entrypoint(cothread_t handle) {
 
 cothread_t co_active() {
   if(!co_active_handle) co_active_handle = &co_active_buffer;
+#ifdef LIBCO_TSAN
+  co_tsan_init_active();
+#endif
   return co_active_handle;
 }
 
@@ -97,6 +121,9 @@ cothread_t co_derive(void* memory, unsigned int size, void (*entrypoint)(void)) 
     co_swap = (void (*)(cothread_t, cothread_t))co_swap_function;
   }
   if(!co_active_handle) co_active_handle = &co_active_buffer;
+#ifdef LIBCO_TSAN
+  co_tsan_init_active();
+#endif
 
   if(handle = (uintptr_t*)memory) {
     unsigned int offset = (size & ~15);
@@ -105,6 +132,9 @@ cothread_t co_derive(void* memory, unsigned int size, void (*entrypoint)(void)) 
     handle[1]  = (uintptr_t)co_entrypoint;  /* x30 (link register) */
     handle[2]  = (uintptr_t)entrypoint;     /* x19 (entry point) */
     handle[12] = (uintptr_t)p;              /* x29 (frame pointer) */
+#ifdef LIBCO_TSAN
+    handle[LIBCO_TSAN_SLOT] = (uintptr_t)__tsan_create_fiber(0);
+#endif
 #if defined(_WIN32) && !defined(LIBCO_NO_TIB)
     handle[22] = (uintptr_t)handle + size;  /* stack base */
     handle[23] = (uintptr_t)handle;         /* stack limit */
@@ -121,11 +151,17 @@ cothread_t co_create(unsigned int size, void (*entrypoint)(void)) {
 }
 
 void co_delete(cothread_t handle) {
+#ifdef LIBCO_TSAN
+  if(handle && ((uintptr_t*)handle)[LIBCO_TSAN_SLOT]) __tsan_destroy_fiber((void*)((uintptr_t*)handle)[LIBCO_TSAN_SLOT]);
+#endif
   free(handle);
 }
 
 void co_switch(cothread_t handle) {
   cothread_t co_previous_handle = co_active_handle;
+#ifdef LIBCO_TSAN
+  __tsan_switch_to_fiber((void*)((uintptr_t*)handle)[LIBCO_TSAN_SLOT], 0);
+#endif
   co_swap(co_active_handle = handle, co_previous_handle);
 }
 

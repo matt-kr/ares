@@ -463,6 +463,22 @@ static const u16 lumiverseAudioRareCost[32] = {
   0, 1630, 265, 2999, 97, 3055, 186, 0,  0, 171, 910, 220, 1111, 0, 0, 855,
   0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0 };
 constexpr u32 lumiverseAudioRareCostConstant = 2460;
+//round 18: the same model for the naudio image Super Smash Bros. and Kirby 64
+//share (LumiverseAudioUcodeSmashU) — per-opcode RSP cycles fitted by least
+//squares on 2448 Kirby 64 LLE tasks (shadow run, DEBUG=2 cost lines): rms
+//error 0.5% of the task duration (a flat per-command cost was 7.5%); ops
+//01 and 0e fitted slightly negative and are pinned at 0. Kirby's H-vs-M0
+//gate had been 0.977 with every frame identical since round 16: instant
+//naudio completion vs the LLE task's ~12k cycles (169 commands, 70/command).
+//LUMIVERSE_ARES_N64_AUDIO_HLE_NA_COST=0 restores instant completion.
+static const u16 lumiverseAudioNaCost[32] = {
+  0, 0, 44, 156, 5, 156, 18, 0,  0, 5, 41, 128, 133, 223, 0, 70,
+  0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0 };
+constexpr u32 lumiverseAudioNaCostConstant = 417;
+auto lumiverseAudioNaCostModel() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NA_COST"); return !v || v[0] != '0'; }();
+  return value;
+}
 //round 14 diagnostic: LLE audio task duration (RSP cycles from dispatch to
 //BREAK) in shadow modes, printed with the executed= summary
 u64 lumiverseAudioTaskStartCycles = 0; u64 lumiverseAudioTaskCycleSum = 0; u64 lumiverseAudioTaskCycleCount = 0; u64 lumiverseAudioTaskCycleMax = 0;
@@ -3224,12 +3240,15 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
     lumiverseAudioCmdCostCount = 0;
     const bool rareEngine = ucodeHash == LumiverseAudioUcodeBanjoK || ucodeHash == LumiverseAudioUcodeBanjoT
       || ucodeHash == LumiverseAudioUcodeDK64 || ucodeHash == LumiverseAudioUcodeConker;
-    const bool costModel = lumiverseAudioCostModel() && rareEngine && lumiverseAudioCyclesPerCommand() <= 0;
-    u32 cost = lumiverseAudioRareCostConstant;
+    //round 18: the Smash/Kirby naudio image gets its own fitted table
+    const bool naCost = lumiverseAudioNaCostModel() && ucodeHash == LumiverseAudioUcodeSmashU && lumiverseAudioCyclesPerCommand() <= 0;
+    const bool costModel = (lumiverseAudioCostModel() && rareEngine && lumiverseAudioCyclesPerCommand() <= 0) || naCost;
+    const u16* costTable = naCost ? lumiverseAudioNaCost : lumiverseAudioRareCost;
+    u32 cost = naCost ? lumiverseAudioNaCostConstant : lumiverseAudioRareCostConstant;
     for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
       const u32 op = lumiverseAudioRDRAMReadByte(dataPtr + offset) & 0x1f;
       lumiverseAudioTaskOps[op]++;
-      if(costModel && lumiverseAudioCmdCostCount < 8192) { cost += lumiverseAudioRareCost[op]; lumiverseAudioCmdCostPrefix[lumiverseAudioCmdCostCount++] = cost; }
+      if(costModel && lumiverseAudioCmdCostCount < 8192) { cost += costTable[op]; lumiverseAudioCmdCostPrefix[lumiverseAudioCmdCostCount++] = cost; }
     }
     lumiverseAudioSetDeferredCommands(commands);
     //round 15 diagnostic (DEBUG>=2): the task's dispatch time on the RSP
@@ -3251,6 +3270,45 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
     return false;  //LLE still executes the task; we only compare
   }
   return true;
+}
+
+
+//round 18: power cycle / ROM switch (RSP::power via lumiverseHLEPowerReset).
+//Everything that describes the previous ROM's audio engine is dropped: the
+//deferred RDRAM output that had not landed (it must NOT land in the next
+//ROM's RDRAM), the modelled schedule, the voice history table, the executor's
+//workspace/scalar state, the hybrid hand-off flag and the shadow/oracle
+//bookkeeping. The cumulative diagnostic counters (executed/fallback/hybrid,
+//printed at exit) survive so the process summary stays a process summary.
+auto lumiverseAudioPowerReset() -> void {
+  lumiverseAudioDeferredCount = 0;
+  lumiverseAudioDeferredBytes = 0;
+  lumiverseAudioDeferredCommands = 1;
+  lumiverseAudioCmdCostCount = 0;
+  lumiverseAudioStateReset();
+  {
+    auto& m = lumiverseAudioMachine;
+    LumiverseAudioMachine fresh;
+    fresh.tasksExecuted = m.tasksExecuted;
+    fresh.tasksFallback = m.tasksFallback;
+    fresh.unknownEnvmixFlags = m.unknownEnvmixFlags;
+    fresh.naTasksHybridFallback = m.naTasksHybridFallback;
+    fresh.naTransitions = m.naTransitions;
+    for(u32 op = 0; op < 32; op++) fresh.naUnmodelledOps[op] = m.naUnmodelledOps[op];
+    m = fresh;
+  }
+  auto& shadow = lumiverseAudioShadowState;
+  shadow.active = false;
+  shadow.pending = false;
+  shadow.writeCount = 0;
+  shadow.byteCount = 0;
+  shadow.overflow = false;
+  lumiverseAudioTruncateArmed = false;
+  lumiverseAudioLLEWriteCount = 0;
+  lumiverseAudioLLEWriteOverflow = false;
+  for(auto& lane : lumiverseAudioNaLastBlockLanes) lane = 0;
+  lumiverseAudioTaskStartCycles = 0;
+  for(auto& op : lumiverseAudioTaskOps) op = 0;
 }
 
 }  //namespace

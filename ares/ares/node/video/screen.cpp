@@ -215,7 +215,10 @@ auto Screen::frame() -> void {
     const u64 now = nowNs();
     spinNs += now - spinStart;
     if(!windowStartNs) windowStartNs = now;
-    if(now - windowStartNs >= 1000000000ull) {
+    //LUMIVERSE round 18: verbose-only (LUMIVERSE_ARES_N64_VERBOSE=1); the
+    //release log keeps one status line per ~10 s (n64/vulkan.cpp)
+    static const bool verbose = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_VERBOSE"); return v && v[0] == '1'; }();
+    if(now - windowStartNs >= 1000000000ull && verbose) {
       fprintf(stderr, "[ares-perf] present spin %.1f ms/s\n", spinNs / 1e6);
       spinNs = 0;
       windowStartNs = now;

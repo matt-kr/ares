@@ -529,6 +529,7 @@ auto CPU::power(bool reset) -> void {
   fenv.setRound(float_env::toNearest);
   context.setMode();
   lumiverseLoadFastConfig();
+  lumiversePoll = {};  //round 18: the SP poll-loop detector does not carry across a ROM switch
 
   if constexpr(Accuracy::CPU::Recompiler) {
     auto buffer = ares::Memory::FixedAllocator::get().tryAcquire(63_MiB);

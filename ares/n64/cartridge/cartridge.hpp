@@ -119,3 +119,9 @@ private:
 
 #include "slot.hpp"
 extern Cartridge& cartridge;
+
+//Lumiverse (round 18): battery-save write tracer, LUMIVERSE_ARES_N64_VERBOSE=1
+//only — one "[cart-save]" line per write burst per kind (0 = EEPROM joybus
+//block, 1 = SRAM via the PI bus, 2 = Flash program/erase execute), so a
+//harness log shows WHEN a game formats/saves its cartridge memory
+auto lumiverseCartSaveNote(u32 kind, u32 address) -> void;
