@@ -464,7 +464,10 @@ auto lumiverseGfxLoadUcodeDialect(u32 textAddress) -> s32 {
     dialect = LumiverseDialectS2DEX; break;
   //S2DEX2 images loaded mid-task by Majora's Mask (text 1abab0) and Kirby 64
   //(text 03be30; Kirby also dispatches it as a standalone OSTask)
-  case 0x2dbd2c59e8565ef7ull: case 0x9e66b240ccd2d588ull:
+  //round 18: Ocarina of Time (U) loads its own S2DEX2 image (text 0e5300)
+  //for the pause subscreens and the file select — the 100k-step soak spent
+  //most of its time paused and 76% of its gfx tasks fell back on this load
+  case 0x2dbd2c59e8565ef7ull: case 0x9e66b240ccd2d588ull: case 0x1176972d8a97a042ull:
     dialect = LumiverseDialectS2DEX2; break;
   case LumiverseUcodeF3DZEXNoN208J: case LumiverseUcodeF3DZEXNoN206H: case LumiverseUcodeF3DZEXNoN208I:
   case LumiverseUcodeF3DEX2NoN208: case LumiverseUcodeF3DEX2204H: case LumiverseUcodeF3DEX2206:

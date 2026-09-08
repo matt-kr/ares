@@ -61,7 +61,9 @@ auto lumiverseSpTrace(const char* who, const char* op, const char* reg, u32 valu
   static const u64 from = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_SP_TRACE_FROM"); return v ? ::strtoull(v, nullptr, 10) : 0ull; }();
   static const u64 cap = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_SP_TRACE_LINES"); return v ? ::strtoull(v, nullptr, 10) : 400000ull; }();
   static u64 lines = 0;
-  if((u64)cpu.scc.count < from || lines >= cap) return;
+  //round 18: arm by the RSP's monotonic cycle counter (the CPU Count wraps every ~3 minutes)
+  static const u64 fromRspc = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_SP_TRACE_FROM_RSPC"); return v ? ::strtoull(v, nullptr, 10) : 0ull; }();
+  if((u64)cpu.scc.count < from || rsp.profile.cycles < fromRspc || lines >= cap) return;
   //consecutive identical events (a poll loop) collapse into one line plus a REPEAT count
   static const char* lastWho = nullptr; static const char* lastOp = nullptr; static const char* lastReg = nullptr; static u32 lastValue = 0; static u64 repeats = 0;
   static u64 lastCc = 0; static s64 lastCclk = 0, lastRclk = 0;
