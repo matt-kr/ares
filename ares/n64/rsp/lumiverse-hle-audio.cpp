@@ -253,7 +253,12 @@ auto lumiverseAudioDialectForHash(u64 hash) -> s32 {
   //15/16). LUMIVERSE_ARES_N64_AUDIO_HLE_RARE=0 keeps it on LLE.
   if(hash == LumiverseAudioUcodeBanjoK && !lumiverseAudioRareOptOut()) return LumiverseAudioDialectNaudio;
   if(hash == LumiverseAudioUcodeBanjoT && lumiverseAudioRareOptIn()) return LumiverseAudioDialectNaudio;
-  if(hash == LumiverseAudioUcodeConker && lumiverseAudioRareOptIn()) return LumiverseAudioDialectNaudio;
+  //round 17: Conker under the global gate as a HYBRID — tasks whose alist
+  //carries its op 0x07 speech decoder (the dialogue) run on the LLE RSP,
+  //everything else natively (validator + voice re-seeding, see
+  //lumiverseAudioValidate / lumiverseAudioStateReset); LUMIVERSE_ARES_N64_
+  //AUDIO_HLE_RARE=0 keeps it on LLE
+  if(hash == LumiverseAudioUcodeConker && !lumiverseAudioRareOptOut()) return LumiverseAudioDialectNaudio;
   //round 13: Perfect Dark passes the WAV gate under the global gate
   //(Carrington Institute, 7000 steps, HLE vs LLE audio: envCorr 0.993,
   //level 1.004, clicks 0/0 vs 1/1) — whitelisted; LUMIVERSE_ARES_N64_AUDIO_HLE_RARE=0
@@ -545,18 +550,24 @@ struct LumiverseAudioVoiceState {
   u32 addr = 0;      //0 = free slot
   s16 samples[16] = {};
   u32 frac = 0;      //resampler fractional position (Q16 fraction bits)
+  //round 17: a slot allocated for a voice this executor has not seen since
+  //the last LLE-run task (hybrid dispatch): the microcode's RDRAM state
+  //blob, not this table, holds the voice's history — see the naudio ADPCM
+  //and RESAMPLE handlers
+  bool seeded = false;
 };
 
 constexpr u32 LumiverseAudioStateSlots = 1024;  //power of two
+static LumiverseAudioVoiceState lumiverseAudioStateSlots[LumiverseAudioStateSlots];
 
 auto lumiverseAudioState(u32 addr) -> LumiverseAudioVoiceState& {
-  static LumiverseAudioVoiceState slots[LumiverseAudioStateSlots];
+  auto* slots = lumiverseAudioStateSlots;
   addr &= 0x00ffffff;
   u32 index = (addr * 2654435761u) >> 22 & (LumiverseAudioStateSlots - 1);
   for(u32 probe = 0; probe < 8; probe++) {
     auto& slot = slots[index];
     if(slot.addr == addr) return slot;
-    if(slot.addr == 0) { slot.addr = addr; return slot; }
+    if(slot.addr == 0) { slot.addr = addr; slot.seeded = false; return slot; }
     index = index + 1 & (LumiverseAudioStateSlots - 1);
   }
   //table pressure: recycle the probed slot (worst case a one-chunk glitch on
@@ -565,7 +576,15 @@ auto lumiverseAudioState(u32 addr) -> LumiverseAudioVoiceState& {
   slot.addr = addr;
   for(auto& sample : slot.samples) sample = 0;
   slot.frac = 0;
+  slot.seeded = false;
   return slot;
+}
+
+//round 17 (hybrid dispatch): after a task the LLE microcode ran, every
+//voice's history lives in ITS RDRAM state blobs and this table is stale —
+//drop it, so the next HLE task re-seeds each voice from RDRAM
+auto lumiverseAudioStateReset() -> void {
+  for(auto& slot : lumiverseAudioStateSlots) { slot.addr = 0; slot.seeded = false; slot.frac = 0; for(auto& sample : slot.samples) sample = 0; }
 }
 
 //----------------------------------------------------------------------------
@@ -612,6 +631,15 @@ struct LumiverseAudioMachine {
   u64 tasksExecuted = 0;
   u64 tasksFallback = 0;
   u64 unknownEnvmixFlags = 0;
+  //round 17 (hybrid dispatch): naudio tasks handed to the LLE microcode
+  //because their alist carries an opcode this executor does not model
+  //(Conker's op 0x07 speech decoder), the HLE<->LLE transitions, and the
+  //per-opcode count of commands that reached the naudio executor's default
+  //case (the census behind the validator's accept list)
+  u64 naTasksHybridFallback = 0;
+  u64 naTransitions = 0;
+  u64 naUnmodelledOps[32] = {};
+  bool naLastTaskWasLLE = false;   //the previous task of this engine ran on the LLE RSP
 };
 
 //ABI1 RDRAM addresses go through a segment table (aSegment); ABI2 uses
@@ -656,6 +684,8 @@ struct LumiverseAudioValidator {
 //index of the task being validated (for fallback diagnostics; set by the
 //entry point before validation so oracle experiments can target the task)
 u64 lumiverseAudioValidateTaskIndex = 0;
+//round 17: opcodes (0x00-0x3f) that made the naudio validator reject a task
+static u64 lumiverseAudioNaRejectedOps[64] = {};
 
 auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u32 dataSize, u32 dialect) -> bool {
   LumiverseAudioValidator v;
@@ -670,7 +700,6 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
   v.aux2 = machine.aux2;
   v.aux3 = machine.aux3;
   const bool abi1 = dialect == LumiverseAudioDialectABI1;
-  if(dialect == LumiverseAudioDialectNaudio) return true;  //EXPERIMENT: permissive while decoding
 
   static u64 rejectLogs = 0;
   auto reject = [&](u32 offset, u32 w0, u32 w1, const char* reason) -> bool {
@@ -681,6 +710,43 @@ auto lumiverseAudioValidate(const LumiverseAudioMachine& machine, u32 dataPtr, u
     }
     return false;
   };
+
+  //round 17: naudio tasks are validated for their OPCODE SET only (the
+  //fields are fixed-layout and were never range-checked — rounds 12-16 ran
+  //this dialect permissively). A task whose alist carries an opcode the
+  //executor does not model is handed to the LLE microcode as a whole
+  //(hybrid dispatch, LUMIVERSE_ARES_N64_AUDIO_HLE_NA_HYBRID, default 1):
+  //Conker's Bad Fur Day's op 0x07 (with its 0x08 state-block base) is a
+  //streamed-speech decoder of the MPEG Layer-III class (round 16) that is
+  //not implemented, and it appears once per task while dialogue plays.
+  //Accepted: the executor's cases (01-06, 09-0f), 00 (no-op), and 08 alone
+  //(a base for 07; without a 07 it has no effect on the output). Whatever
+  //else appears is counted (naUnmodelledOps) and rejected. 0 = the round-16
+  //behaviour (every naudio task runs here, unmodelled commands ignored).
+  //LUMIVERSE_ARES_N64_AUDIO_HLE_NA_FORCE_FALLBACK_EVERY=<n> (diagnostic):
+  //also reject every n-th naudio task, to exercise the HLE<->LLE state
+  //handoff on content the executor renders exactly.
+  if(dialect == LumiverseAudioDialectNaudio) {
+    static const bool hybrid = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NA_HYBRID"); return !v || v[0] != '0'; }();
+    static const u32 forceEvery = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_AUDIO_HLE_NA_FORCE_FALLBACK_EVERY"); return v ? (u32)::atoi(v) : 0u; }();
+    static u64 naSeen = 0;
+    naSeen++;
+    if(!hybrid) return true;
+    for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
+      u32 w0 = 0, w1 = 0;
+      for(u32 b = 0; b < 4; b++) w0 = w0 << 8 | lumiverseAudioRDRAMReadByte(dataPtr + offset + b);
+      for(u32 b = 0; b < 4; b++) w1 = w1 << 8 | lumiverseAudioRDRAMReadByte(dataPtr + offset + 4 + b);
+      const u8 op = w0 >> 24;
+      const bool modelled = op <= 0x06 || (op >= 0x08 && op <= 0x0f);
+      if(!modelled) {
+        lumiverseAudioNaRejectedOps[op & 0x3f]++;
+        if(op == 0x07) return reject(offset, w0, w1, "naudio op 07 (streamed-speech decoder, not modelled): task runs on the LLE RSP");
+        return reject(offset, w0, w1, "naudio unmodelled opcode: task runs on the LLE RSP");
+      }
+    }
+    if(forceEvery && naSeen % forceEvery == 0) return reject(0, 0, 0, "forced fallback (NA_FORCE_FALLBACK_EVERY)");
+    return true;
+  }
 
   for(u32 offset = 0; offset + 8 <= dataSize; offset += 8) {
     u32 w0 = 0, w1 = 0;
@@ -1017,7 +1083,17 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
       lumiverseAudioReadRDRAM(shadow, m.loopAddr, raw, 32);
       for(u32 index = 0; index < 16; index++) last[index] = (s16)((u16)raw[index * 2] << 8 | raw[index * 2 + 1]);
     }
+    else if(!state.seeded) {
+      //round 17 (hybrid dispatch): a voice this executor has no history for
+      //(the previous task ran on the LLE RSP, or HLE was enabled mid-voice)
+      //continues from the microcode's own 32-byte state blob — the last 16
+      //decoded samples, the layout this executor writes too (round 14)
+      u8 raw[32];
+      lumiverseAudioReadRDRAM(shadow, w0 & 0x00ffffff, raw, 32);
+      for(u32 index = 0; index < 16; index++) last[index] = (s16)((u16)raw[index * 2] << 8 | raw[index * 2 + 1]);
+    }
     else for(u32 index = 0; index < 16; index++) last[index] = state.samples[index];
+    state.seeded = true;
     //state prefix at the output base
     for(u32 index = 0; index < 16; index++) lumiverseAudioDmemWriteS16(dmem, outBase + index * 2, last[index]);
     s32 prev2 = last[14], prev1 = last[15];
@@ -1214,8 +1290,18 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     } else {
       anchor = state.samples[1];
       position = (s64)(s32)state.frac;   //continuous Q16 stream position
-      //voice first seen mid-stream (HLE enabled late): adopt the pointer
-      if(anchor == 0 && state.samples[2] == 0) { anchor = ptrWhole; position = 0; state.samples[1] = (s16)anchor; }
+      //voice first seen mid-stream (HLE enabled late, or — round 17, hybrid
+      //dispatch — its last chunk ran on the LLE RSP): adopt the pointer and
+      //the sub-sample fraction from the microcode's 16-byte state blob
+      //([4 history][fraction u16][3 words], the layout this executor writes)
+      if(anchor == 0 && state.samples[2] == 0) {
+        anchor = ptrWhole; position = 0; state.samples[1] = (s16)anchor;
+        if(!state.seeded) {
+          u8 blob[16];
+          lumiverseAudioReadRDRAM(shadow, w0 & 0x00ffffff, blob, 16);
+          position = (u16)((u16)blob[8] << 8 | blob[9]);
+        }
+      }
       //drift servo: the command's 1/8-sample pointer carries the engine's
       //own whole-sample start; resync only past a 2-sample tolerance so
       //ordinary chunks stay sample-continuous (per-chunk snapping produced
@@ -1225,6 +1311,7 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
       if(err > 2 || err < -2) position = ((s64)wholeStart << 16) | (position & 0xffff);
     }
     state.samples[2] = 1;       //anchor-valid marker
+    state.seeded = true;
     const u32 dataStart = NaDecode + 32;
     const u32 step = pitch << 3;           //Q13 -> Q16 per output sample
     //band-limit when consuming faster than 1:1 — the microcode's short FIR
@@ -1603,6 +1690,7 @@ auto lumiverseAudioExecuteNaudio(LumiverseAudioMachine& m, LumiverseAudioShadow&
     break;
   }
   default:
+    m.naUnmodelledOps[op & 0x1f]++;
     break;
   }
 }
@@ -2878,6 +2966,20 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   auto& machine = lumiverseAudioMachine;
   auto& shadow = lumiverseAudioShadowState;
   static u64 taskIndex = 0;
+  //round 17: final counters at process exit (the periodic line only fires
+  //every 1024 executed tasks)
+  static const bool exitSummary = [] {
+    ::atexit([] {
+      auto& m = lumiverseAudioMachine;
+      fprintf(stderr, "[rsp-hle-audio] final: executed=%llu fallback=%llu na-hybrid-fallback=%llu na-transitions=%llu",
+        (unsigned long long)m.tasksExecuted, (unsigned long long)m.tasksFallback, (unsigned long long)m.naTasksHybridFallback, (unsigned long long)m.naTransitions);
+      for(u32 op = 0; op < 64; op++) if(lumiverseAudioNaRejectedOps[op]) fprintf(stderr, " na-rejected-op-%02x=%llu", op, (unsigned long long)lumiverseAudioNaRejectedOps[op]);
+      for(u32 op = 0; op < 32; op++) if(m.naUnmodelledOps[op]) fprintf(stderr, " na-ignored-op-%02x=%llu", op, (unsigned long long)m.naUnmodelledOps[op]);
+      fprintf(stderr, "\n");
+    });
+    return true;
+  }();
+  (void)exitSummary;
 
   auto*& capture = lumiverseAudioCapture;
   if(!capture && lumiverseAudioHLEDebug() >= 4) capture = new LumiverseAudioDebugCapture;
@@ -3038,6 +3140,17 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   lumiverseAudioValidateTaskIndex = taskIndex;
   if(!lumiverseAudioValidate(machine, dataPtr, dataSize, (u32)dialect)) {
     machine.tasksFallback++;
+    //round 17 (hybrid dispatch): the LLE microcode runs this task and
+    //rewrites every voice's RDRAM state; the next task this executor runs
+    //re-seeds its voice table from RDRAM (lumiverseAudioStateReset below).
+    //The previous HLE task's deferred output landed at its completion (or
+    //in lumiverseAudioFlushDeferredWrites above at the latest), so the
+    //microcode starts from coherent RDRAM.
+    if(dialect == (s32)LumiverseAudioDialectNaudio) {
+      machine.naTasksHybridFallback++;
+      if(!machine.naLastTaskWasLLE) machine.naTransitions++;
+      machine.naLastTaskWasLLE = true;
+    }
     //oracle on a task the validator rejects: nothing of ours to compare, but
     //LLE's DMEM after the truncated prefix is exactly the evidence wanted —
     //stash the alist and arm a write-less settle so the dump still happens
@@ -3066,6 +3179,13 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
   shadow.overflow = false;
   shadow.task = taskIndex;
 
+  //round 17 (hybrid dispatch): first HLE task after an LLE-run one — every
+  //voice continues from the microcode's RDRAM state blobs, not this table
+  if(machine.naLastTaskWasLLE) {
+    lumiverseAudioStateReset();
+    machine.naTransitions++;
+    machine.naLastTaskWasLLE = false;
+  }
   lumiverseAudioExecute(machine, shadow, dataPtr, dataSize, (u32)dialect);
 
   if(capture && level >= 2) {
@@ -3086,9 +3206,12 @@ auto lumiverseExecuteAudioTask(const u32 task[16], u64 ucodeHash) -> bool {
     if(lumiverseAudioTaskCycleCount) fprintf(stderr, "[rsp-hle-audio] LLE task duration: mean %.0f cycles (%.0f us) max %llu over %llu tasks; mean %.0f commands/task (%.0f cycles/command)\n",
       (double)lumiverseAudioTaskCycleSum / lumiverseAudioTaskCycleCount, (double)lumiverseAudioTaskCycleSum / lumiverseAudioTaskCycleCount / 62.5, (unsigned long long)lumiverseAudioTaskCycleMax, (unsigned long long)lumiverseAudioTaskCycleCount,
       (double)lumiverseAudioCommandSum / machine.tasksExecuted, (double)lumiverseAudioTaskCycleSum / (lumiverseAudioCommandSum ? lumiverseAudioCommandSum : 1));
-    fprintf(stderr, "[rsp-hle-audio] executed=%llu fallback=%llu envmix-unknown-flags=%llu\n",
+    fprintf(stderr, "[rsp-hle-audio] executed=%llu fallback=%llu envmix-unknown-flags=%llu na-hybrid-fallback=%llu na-transitions=%llu",
       (unsigned long long)machine.tasksExecuted, (unsigned long long)machine.tasksFallback,
-      (unsigned long long)machine.unknownEnvmixFlags);
+      (unsigned long long)machine.unknownEnvmixFlags, (unsigned long long)machine.naTasksHybridFallback, (unsigned long long)machine.naTransitions);
+    for(u32 op = 0; op < 64; op++) if(lumiverseAudioNaRejectedOps[op]) fprintf(stderr, " na-rejected-op-%02x=%llu", op, (unsigned long long)lumiverseAudioNaRejectedOps[op]);
+    for(u32 op = 0; op < 32; op++) if(machine.naUnmodelledOps[op]) fprintf(stderr, " na-ignored-op-%02x=%llu", op, (unsigned long long)machine.naUnmodelledOps[op]);
+    fprintf(stderr, "\n");
   }
 
   //round 14: modelled task duration (see lumiverseAudioCyclesPerCommand)
