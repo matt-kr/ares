@@ -51,6 +51,17 @@ namespace {
   auto lumiverseGfxNoteTaskEnd(u64 cycles, bool yielded) -> void;
   //lumiverse-hle.cpp: type (1 gfx / 2 audio) of the HLE task whose completion is pending
   extern u32 lumiverseHLEPendingType;
+  //lumiverse-hle.cpp (round 19): remaining modelled cycles of a yielded HLE graphics task
+  extern s32 lumiverseHLEYieldedRemaining;
+  //lumiverse-hle-gfx.cpp (round 22): LUMIVERSE_ARES_N64_RSP_HLE_GFX_LATE_CHECK diagnostic —
+  //re-hash the matrix / vertex blocks the executor read at dispatch when the task completes
+  auto lumiverseGfxLateCheck() -> void;
+  //lumiverse-hle-gfx.cpp (round 22): fifo-stall model
+  auto lumiverseGfxFifoDrainImpl() -> void;
+  auto lumiverseGfxFifoStalled() -> bool;
+  auto lumiverseGfxFifoStallTick(s32 cycles) -> void;
+  auto lumiverseGfxFifoReset() -> void;
+  auto lumiverseGfxDPDelayCycles() -> s32;
 }
 #include "lumiverse-async-audio.cpp"
 #include "lumiverse-hle.cpp"
@@ -85,6 +96,16 @@ auto RSP::main() -> void {
   while(Thread::clock < 0) {
     auto clock = Thread::clock;
 
+    //round 22: a held SyncFull interrupt lands a little after the task-done
+    //interrupt it belongs to (see lumiverseHLEDeliverCompletion)
+    if(lumiverseDPInterruptDelay > 0) {
+      lumiverseDPInterruptDelay -= 128;
+      if(lumiverseDPInterruptDelay <= 0 && lumiverseDPInterruptPending) {
+        lumiverseDPInterruptPending = false;
+        mi.raise(MI::IRQ::DP);
+      }
+    }
+
     if(lumiverseHLEPendingCycles > 0) {
       //Lumiverse addition: a natively-executed task "runs" for its
       //requested duration, then completes exactly like BREAK would
@@ -93,7 +114,17 @@ auto RSP::main() -> void {
       lumiverseHLEPendingCycles -= 128;
       //round 14: the audio HLE's deferred RDRAM output lands progressively over the modelled duration
       lumiverseAudioProgressDeferredWrites(lumiverseHLERequestedCompletionCycles - lumiverseHLEPendingCycles, lumiverseHLERequestedCompletionCycles);
-      if(lumiverseHLEPendingCycles <= 0) lumiverseHLEDeliverCompletion();
+      //round 22: a fifo task whose stream did not fit the game's frozen
+      //fifo is stalled exactly like the microcode — its remaining output
+      //reaches the fifo at the microcode's rate once the game unfreezes,
+      //it cannot complete before that output is out, and a stall past its
+      //budget falls back to the round-9 forced wrap
+      const bool stalled = lumiverseHLEPendingType == 1 && lumiverseGfxFifoStalled();
+      if(stalled) lumiverseGfxFifoStallTick(128);
+      if(lumiverseHLEPendingCycles <= 0) {
+        if(stalled && lumiverseGfxFifoStalled()) lumiverseHLEPendingCycles = 128;
+        else lumiverseHLEDeliverCompletion();
+      }
     } else if(status.halted) {
       //Lumiverse addition: settle a truncated-task audio-HLE shadow compare
       //(debug tool; the game typically crashes after the experiment, so the
@@ -113,21 +144,33 @@ auto RSP::main() -> void {
   }
 }
 
+auto RSP::lumiverseHLEGfxTaskPending() const -> bool {
+  return (lumiverseHLEPendingCycles > 0 && lumiverseHLEPendingType == 1) || lumiverseHLEYieldedRemaining > 0;
+}
+
 auto RSP::lumiverseHLEDeliverCompletion() -> void {
+  if(lumiverseHLEPendingType == 1) lumiverseGfxLateCheck();  //round 22 diagnostic (no-op unless LATE_CHECK=1)
   lumiverseHLEPendingCycles = 0;
   lumiverseAudioFlushDeferredWrites();  //round 14: the task's RDRAM output lands at completion
-  //round 19: the SyncFull of the RDP stream this task queued at dispatch
-  //lands with the task (LLE order: the microcode's last DPC_END, then BREAK)
-  if(lumiverseDPInterruptPending) {
-    lumiverseDPInterruptPending = false;
-    mi.raise(MI::IRQ::DP);
-  }
   //mirror BREAK semantics + the microcode's task-done signal (SIG2)
   status.halted = 1;
   status.broken = 1;
   status.signal[2] = 1;
   if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
+  //round 19: the SyncFull of the RDP stream this task queued lands with the
+  //task; round 22: AFTER the task-done interrupt, a short RDP drain later
+  //(the LLE order — the microcode's BREAK precedes the RDP finishing the
+  //fifo's tail; round 19 raised it just before the SP interrupt)
+  if(lumiverseDPInterruptPending) {
+    const s32 delay = lumiverseGfxDPDelayCycles();
+    if(delay > 0) lumiverseDPInterruptDelay = delay;
+    else { lumiverseDPInterruptPending = false; mi.raise(MI::IRQ::DP); }
+  }
   if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("hle-done", lumiverseHLEPendingType, 0, 0);
+}
+
+auto RSP::lumiverseGfxFifoDrain() -> void {
+  lumiverseGfxFifoDrainImpl();
 }
 
 auto RSP::instruction() -> void {
@@ -262,6 +305,8 @@ auto RSP::power(bool reset) -> void {
   lumiverseHLEPendingCycles = 0;
   lumiverseDPInterruptDefer = false;
   lumiverseDPInterruptPending = false;
+  lumiverseDPInterruptDelay = 0;
+  lumiverseGfxFifoReset();
   lumiverseHLEPowerReset();
   Thread::reset();
   dmem.fill();

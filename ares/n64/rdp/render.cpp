@@ -616,7 +616,11 @@ auto RDP::syncTile() -> void {
 //0x29
 auto RDP::syncFull() -> void {
   if(!command.crashed) {
-    if(lumiverseDPInterruptDefer) lumiverseDPInterruptPending = true;  //round 19: delivered at the HLE task's modelled completion
+    //round 19: delivered at the HLE task's modelled completion; round 22:
+    //also while the task is still running / yielded (the stream may be
+    //consumed by the game's own DPC_END or unfreeze after the executor
+    //returned — Donkey Kong 64)
+    if(lumiverseDPInterruptDefer || (lumiverseGfxSyncHoldEnabled() && rsp.lumiverseHLEGfxTaskPending())) lumiverseDPInterruptPending = true;
     else mi.raise(MI::IRQ::DP);
     command.bufferBusy = 0;
     command.pipeBusy = 0;

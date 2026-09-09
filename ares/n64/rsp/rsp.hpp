@@ -316,6 +316,18 @@ struct RSP : Thread, Memory::RCP<RSP> {
   //(instant completion, the timed completion in main(), and a yield request
   //answered as "done" all go through it)
   auto lumiverseHLEDeliverCompletion() -> void;
+  //round 22: a natively-executed graphics task is still "running" (modelled
+  //duration) or halted as yielded awaiting its resume — the RDP's SyncFull
+  //interrupt is held until it completes (rdp/render.cpp syncFull)
+  auto lumiverseHLEGfxTaskPending() const -> bool;
+  //round 22: the fifo-stall model — output a natively-executed fifo task
+  //could not place in the game's frozen fifo is written when the RDP has
+  //consumed the fifo (rdp/io.cpp flushCommands calls this after a run)
+  auto lumiverseGfxFifoDrain() -> void;
+  //round 22: the RDP's SyncFull interrupt of a completed task lands this many
+  //RSP cycles after the task-done interrupt (LLE order: BREAK, then the RDP
+  //drains the tail of the fifo)
+  s32 lumiverseDPInterruptDelay = 0;
 
   //lumiverse-async-audio.cpp
   //Lumiverse addition: opt-in worker-thread execution of audio (type-2)

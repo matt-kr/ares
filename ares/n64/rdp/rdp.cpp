@@ -5,6 +5,7 @@ namespace ares::Nintendo64 {
 RDP rdp;
 extern bool lumiverseDPInterruptDefer;    //io.cpp (round 19): hold SyncFull's interrupt during an HLE graphics task's modelled duration
 extern bool lumiverseDPInterruptPending;
+auto lumiverseGfxSyncHoldEnabled() -> bool;  //io.cpp (round 22)
 #include "render.cpp"
 #include "io.cpp"
 #include "debugger.cpp"

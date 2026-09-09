@@ -34,6 +34,20 @@ u64 lumiverseRdpTaskTag = 0;
 //consumed by RSP::lumiverseHLEDeliverCompletion.
 bool lumiverseDPInterruptDefer = false;
 bool lumiverseDPInterruptPending = false;
+//round 22: LUMIVERSE_ARES_N64_RSP_HLE_GFX_SYNC_HOLD (default 1, 0 = round-19
+//behaviour). Donkey Kong 64's engine holds DPC FREEZE across a task and
+//unfreezes from the CPU while the task runs, so the RDP consumed the HLE
+//stream (queued whole at dispatch) and raised its SyncFull interrupt BEFORE
+//the task's own completion interrupt — the reverse of the LLE order, where
+//the fifo microcode's last DPC_END precedes its BREAK. The game's scheduler
+//never dispatched graphics again (the intro cutscene's picture froze while
+//audio ran). With the hold, any SyncFull reached while a natively-executed
+//graphics task is still running (or halted as yielded) is delivered with
+//the task's completion, whichever DPC write ran the stream.
+auto lumiverseGfxSyncHoldEnabled() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_SYNC_HOLD"); return !v || v[0] != '0'; }();
+  return value;
+}
 
 auto lumiverseIOPollLog() -> bool {
   static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_IO_POLL_LOG"); return v && v[0] == '1'; }();
@@ -345,4 +359,7 @@ auto RDP::flushCommands() -> void {
   }
   if(command.end > command.current) render();
   command.ready = 1;
+  //round 22: the RDP consumed the fifo — a natively-executed fifo task
+  //stalled on a full frozen fifo writes its next chunk now (rsp)
+  rsp.lumiverseGfxFifoDrain();
 }

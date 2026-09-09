@@ -278,9 +278,11 @@ auto RSP::lumiverseTaskDispatchHook() -> bool {
       if(unlikely(lumiverseAiTraceOn())) lumiverseAiTrace("gfx-resume", dataPtr, remaining, task[1]);
       return true;
     }
-    //a fresh task instead: the yielded one was abandoned by the OS; its
-    //held SyncFull interrupt goes with it
-    lumiverseDPInterruptPending = false;
+    //a fresh task instead: the yielded one was abandoned by the OS; a
+    //SyncFull held for it is delivered now rather than lost, its stalled
+    //fifo output dropped (round 22)
+    lumiverseGfxFifoReset();
+    if(lumiverseDPInterruptPending) { lumiverseDPInterruptPending = false; mi.raise(MI::IRQ::DP); }
   }
   //ucode_size 0 = "microcode already resident" (Conker's Bad Fur Day passes
   //0 for every task; its engine loads the ucode itself): hash the full

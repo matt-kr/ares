@@ -175,6 +175,7 @@ struct LumiverseGfxOut {
   static constexpr u32 FlushAt  = 0xc000;
   u32 words[Capacity];
   u32 count = 0;
+  u32 emitted = 0;  //round 22: words emitted by the current task (drain pacing)
   bool failed = false;
   //last SETSCISSOR that went through (10.2, xl/yl exclusive): RDP state that
   //persists across tasks; S2DEX clips its backgrounds against it (round 11,
@@ -234,6 +235,237 @@ auto lumiverseGfxShadowDumpFile() -> FILE* {
   }();
   return file;
 }
+//round 22: LUMIVERSE_ARES_N64_RSP_HLE_GFX_WRAP_STATUS (default 1, 0 = round 9
+//behaviour). The frozen-fifo wrap releases DPC FREEZE so the RDP consumes
+//the pending range, then restores it; that release also raised the RDP's
+//busy bits (flushCommands sets buffer/pipe busy + start-gclk, only a
+//SyncFull clears them) and left them set for the rest of the frame — the
+//LLE microcode, stalled on the full frozen fifo, never kicks the RDP, so
+//the game's per-frame DPC_STATUS read sees 0x82 (frozen, idle) where the
+//HLE showed 0xea (frozen, busy). Donkey Kong 64 reads that status once per
+//frame and its DK Rap choreography lost the actors (root matrices held
+//while the camera cut on) — half the rap's frames drew 1 of the 3 fifos.
+//Since ares's render() consumes the range synchronously, the RDP is idle
+//again after the release: restore the busy bits the game would see.
+auto lumiverseGfxWrapStatusRestore() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_WRAP_STATUS"); return !v || v[0] != '0'; }();
+  return value;
+}
+auto lumiverseGfxFifoFrozenWrap() -> void {
+  lumiverseGfxFifoWrapsFrozen++;
+  const auto bufferBusy = rdp.command.bufferBusy;
+  const auto pipeBusy = rdp.command.pipeBusy;
+  const auto startGclk = rdp.command.startGclk;
+  rdp.writeWord(0x0c, 0x0004, rsp);  //DPC_STATUS: clear freeze -> the RDP runs current..end
+  rdp.writeWord(0x0c, 0x0008, rsp);  //set freeze
+  if(lumiverseGfxWrapStatusRestore()) {
+    rdp.command.bufferBusy = bufferBusy;
+    rdp.command.pipeBusy = pipeBusy;
+    rdp.command.startGclk = startGclk;
+  }
+}
+
+//round 22: the fifo-stall model. LUMIVERSE_ARES_N64_RSP_HLE_GFX_FIFO_STALL
+//(default 1, 0 = the round-9 forced wrap). Rare's engine (Donkey Kong 64)
+//dispatches the graphics task with DPC FREEZE held and unfreezes from the
+//CPU ~16 ms later, once it has finished loading what the RDP will read
+//(textures, animated vertex data): the RSP fills the 160 KB fifo, stalls on
+//it, and continues when the RDP drains it after the unfreeze. The round-9
+//path ran the RDP on the whole stream at dispatch (releasing the freeze
+//per wrap), so it drew from RDRAM the CPU had not written yet — in the DK
+//Rap the actors and the subtitles came out of a stale texture and vanished
+//(alpha-tested away), popping back whenever the data happened to be there.
+//Now: what fits the frozen fifo is written at dispatch; the rest waits in
+//a spill buffer and is written when the RDP has consumed the fifo
+//(rdp/io.cpp flushCommands -> RSP::lumiverseGfxFifoDrain), the task cannot
+//complete before its spill is drained (RSP::main), and a stall past
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_FIFO_STALL_CYCLES (default 6,250,000 = 100 ms)
+//falls back to the forced wrap so a game that never unfreezes cannot hang.
+auto lumiverseGfxFifoStallEnabled() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_FIFO_STALL"); return !v || v[0] != '0'; }();
+  return value;
+}
+auto lumiverseGfxFifoStallBudget() -> s32 {
+  static const s32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_FIFO_STALL_CYCLES"); return v ? (s32)::atoi(v) : 6250000; }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_DP_DELAY (default 2048 RSP cycles, 0 = with
+//the task-done interrupt): a held SyncFull interrupt follows the task's
+//completion by this much — under the microcode the RDP finishes the tail of
+//the fifo after the RSP's BREAK
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_DRAIN_RATE (percent, default 100): scales the
+//drain's output rate relative to the cost model's (a diagnostic lever)
+auto lumiverseGfxDrainRatePercent() -> u32 {
+  static const u32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_DRAIN_RATE"); return v ? (u32)::atoi(v) : 100u; }();
+  return value;
+}
+auto lumiverseGfxDPDelayCycles() -> s32 {
+  static const s32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_DP_DELAY"); return v ? (s32)::atoi(v) : 2048; }();
+  return value;
+}
+//LUMIVERSE_ARES_N64_RSP_HLE_GFX_PACED (default 0 = off): EXPERIMENTAL — the
+//whole RDP stream of a fifo task reaches the game's fifo over the task's
+//modelled duration at the microcode's rate (DPC_END every ..._PACED_KICK
+//ticks of 128 RSP cycles, default 64) instead of at dispatch, so the RDP
+//reads RDRAM when the microcode would have made it. 2 (or "auto") = Donkey
+//Kong 64's microcode only, 1 = every fifo task. Round 22a: tried for DK64's
+//DK Rap chest close-up (a noise picture) — it did not change that frame
+//and the intro cutscene stopped drawing at frame 7,250 with it (the game's
+//per-frame DPC_STATUS check met a busy RDP), so the default is off: only
+//the output that does not fit the frozen fifo waits (FIFO_STALL).
+auto lumiverseGfxPacedMode() -> int {
+  static const int value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_PACED"); return !v ? 0 : v[0] == 'a' ? 2 : ::atoi(v); }();
+  return value;
+}
+auto lumiverseGfxPacedKickTicks() -> u32 {
+  static const u32 value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_PACED_KICK"); u32 t = v ? (u32)::atoi(v) : 64u; return t ? t : 1u; }();
+  return value;
+}
+constexpr u64 LumiverseUcodeDK64Fifo207 = 0xfcf475ff1d56eb94ull;
+static bool lumiverseGfxPacedActive = false;  //the executing task feeds its fifo from the spill
+static u32 lumiverseGfxDrainAccum = 0;        //words accrued since the last paced kick
+static u32 lumiverseGfxDrainTicks = 0;
+constexpr u32 LumiverseGfxSpillCapacity = 0x100000;  //words (4 MiB): ~12 of DK64's fifos
+static u32 lumiverseGfxSpillWords[LumiverseGfxSpillCapacity];
+static u32 lumiverseGfxSpillCount = 0;
+static u32 lumiverseGfxSpillOffset = 0;
+static LumiverseGfxOut* lumiverseGfxSpillOut = nullptr;
+static s32 lumiverseGfxStallCycles = 0;
+static bool lumiverseGfxDraining = false;
+static u32 lumiverseGfxDrainWordsPerTick = 0;  //the microcode's output rate, from the task's cost model
+static bool lumiverseGfxDrainAll = false;      //stall budget exhausted: drain without pacing
+u64 lumiverseGfxFifoStallCount = 0;    //diagnostic: tasks that stalled
+u64 lumiverseGfxFifoStallExpired = 0;  //diagnostic: stalls that hit the budget
+auto lumiverseGfxFifoStalled() -> bool { return lumiverseGfxSpillOffset < lumiverseGfxSpillCount; }
+auto lumiverseGfxFifoReset() -> void {
+  lumiverseGfxSpillCount = 0; lumiverseGfxSpillOffset = 0; lumiverseGfxStallCycles = 0; lumiverseGfxDraining = false; lumiverseGfxDrainAll = false;
+  lumiverseGfxDrainAccum = 0; lumiverseGfxDrainTicks = 0;
+}
+auto lumiverseGfxSpillAppend(LumiverseGfxOut& out, u32 offset) -> void {
+  const u32 words = out.count - offset;
+  if(lumiverseGfxSpillCount + words > LumiverseGfxSpillCapacity) { out.failed = true; return; }
+  for(u32 index = 0; index < words; index++) lumiverseGfxSpillWords[lumiverseGfxSpillCount++] = out.words[offset + index];
+  lumiverseGfxSpillOut = &out;
+}
+//largest command-aligned prefix of words[offset .. offset+limit)
+auto lumiverseGfxAlignedChunkWords(const u32* words, u32 offset, u32 limit) -> u32 {
+  u32 pos = 0, boundary = 0;
+  while(pos < limit) {
+    const u32 code = words[offset + pos] >> 24 & 0x3f;
+    const u32 length = lumiverseGfxRDPCommandQwords[code] * 2;
+    if(pos + length > limit) break;
+    pos += length;
+    boundary = pos;
+  }
+  return boundary;
+}
+//writes words[offset .. total) into the game's fifo like the microcode:
+//sequentially, DPC_START once per pass, DPC_END per chunk, wrapping at the
+//end of the fifo. Returns false (offset at the unwritten remainder) when a
+//wrap is needed while the game holds FREEZE and the stall model is on;
+//otherwise a frozen wrap releases the freeze for the pending range
+//(round 9) and the write completes.
+auto lumiverseGfxFifoWrite(LumiverseGfxOut& out, const u32* words, u32 total, u32& offset) -> bool {
+  const u32 capacityWords = ((out.fifoEnd - out.fifoStart) / 4) & ~1u;
+  while(offset < total) {
+    u32 space = ((out.fifoEnd - out.fifoPos) / 4) & ~1u;
+    const u32 remaining = total - offset;
+    u32 chunk = remaining;
+    if(chunk > space) chunk = space >= 2 ? lumiverseGfxAlignedChunkWords(words, offset, space) : 0;
+    if(chunk == 0) {
+      //no whole command fits before the end of the fifo: wrap. paraLLEl
+      //consumed everything up to DPC_END synchronously at the last kick
+      //unless the game holds DPC FREEZE (the RDP then never consumes and
+      //the buffer cannot be reused)
+      if(out.fifoPos == out.fifoStart) { out.failed = true; return true; }  //fifo too small for one command
+      if(rdp.command.freeze || rdp.command.current != rdp.command.end) {
+        if(lumiverseGfxFifoStallEnabled() && !lumiverseGfxDrainAll) return false;
+        lumiverseGfxFifoFrozenWrap();
+      }
+      out.fifoPos = out.fifoStart;
+      out.fifoStarted = false;
+      continue;
+    }
+    for(u32 index = 0; index < chunk; index++) {
+      rdram.ram.Memory::Writable::write<Word>(out.fifoPos + index * 4, words[offset + index]);
+    }
+    //DPC_START once per fifo pass, then DPC_END per chunk: the RDP runs
+    //current..end at every END write (or at the game's unfreeze)
+    if(!out.fifoStarted) {
+      rdp.writeWord(0x00, out.fifoPos, rsp);
+      out.fifoStarted = true;
+    }
+    out.fifoPos += chunk * 4;
+    rdp.writeWord(0x04, out.fifoPos, rsp);
+    offset += chunk;
+  }
+  return true;
+}
+//writes up to `budget` words of the spill (whole commands) into the fifo
+auto lumiverseGfxFifoDrainSlice(u32 budget) -> bool {
+  if(lumiverseGfxDraining || !lumiverseGfxFifoStalled() || rdp.command.crashed) return false;
+  lumiverseGfxDraining = true;
+  const u32 before = lumiverseGfxSpillOffset;
+  auto& out = *lumiverseGfxSpillOut;
+  const u32 remaining = lumiverseGfxSpillCount - lumiverseGfxSpillOffset;
+  u32 words = remaining;
+  if(budget < remaining) {
+    words = lumiverseGfxAlignedChunkWords(lumiverseGfxSpillWords, lumiverseGfxSpillOffset, budget);
+    if(words == 0) words = lumiverseGfxRDPCommandQwords[lumiverseGfxSpillWords[lumiverseGfxSpillOffset] >> 24 & 0x3f] * 2;  //one command
+    if(words > remaining) words = remaining;
+  }
+  lumiverseGfxFifoWrite(out, lumiverseGfxSpillWords, lumiverseGfxSpillOffset + words, lumiverseGfxSpillOffset);
+  const bool progressed = lumiverseGfxSpillOffset != before;
+  if(!lumiverseGfxFifoStalled()) lumiverseGfxFifoReset();
+  lumiverseGfxDraining = false;
+  return progressed;
+}
+//rdp/io.cpp flushCommands, after the RDP consumed a run (never under FREEZE):
+//the paced drain runs from RSP::main; only an expired stall drains here
+auto lumiverseGfxFifoDrainImpl() -> void {
+  if(lumiverseGfxDrainAll) lumiverseGfxFifoDrainSlice(~0u);
+}
+//RSP::main, every 128 cycles while a stalled graphics task is pending:
+//unfrozen -> the microcode's share of output for this tick reaches the
+//fifo (its production rate: the task's words over its modelled cycles);
+//frozen -> the stall budget counts down, and past it the round-9 forced
+//wrap drains everything (release the freeze for the pending range, restore)
+auto lumiverseGfxFifoStallTick(s32 cycles) -> void {
+  if(!lumiverseGfxDrainAll) {
+    //the microcode's share of output for this tick; written every
+    //PACED_KICK ticks (one DPC_END per kick) or when the stream ends
+    lumiverseGfxDrainAccum += lumiverseGfxDrainWordsPerTick;
+    if(++lumiverseGfxDrainTicks < lumiverseGfxPacedKickTicks()
+    && lumiverseGfxDrainAccum < lumiverseGfxSpillCount - lumiverseGfxSpillOffset) return;
+    lumiverseGfxDrainTicks = 0;
+    const u32 budget = lumiverseGfxDrainAccum;
+    if(lumiverseGfxFifoDrainSlice(budget)) { lumiverseGfxDrainAccum = 0; lumiverseGfxStallCycles = 0; return; }
+    //no progress: the fifo is full and frozen (or unconsumed) — the stall
+    //(the accrued share stays; it is written when the fifo frees up)
+    if(lumiverseGfxDrainAccum > LumiverseGfxSpillCapacity) lumiverseGfxDrainAccum = LumiverseGfxSpillCapacity;
+  } else if(lumiverseGfxFifoDrainSlice(~0u)) {
+    lumiverseGfxStallCycles = 0;
+    return;
+  }
+  lumiverseGfxStallCycles += cycles;
+  if(lumiverseGfxStallCycles < lumiverseGfxFifoStallBudget()) return;
+  lumiverseGfxFifoStallExpired++;
+  lumiverseGfxDrainAll = true;
+  const auto bufferBusy = rdp.command.bufferBusy;
+  const auto pipeBusy = rdp.command.pipeBusy;
+  const auto startGclk = rdp.command.startGclk;
+  const bool frozen = rdp.command.freeze;
+  if(frozen) rdp.writeWord(0x0c, 0x0004, rsp);  //flushCommands -> render -> drain (all)
+  lumiverseGfxFifoDrainSlice(~0u);
+  if(frozen) rdp.writeWord(0x0c, 0x0008, rsp);
+  if(lumiverseGfxWrapStatusRestore()) {
+    rdp.command.bufferBusy = bufferBusy;
+    rdp.command.pipeBusy = pipeBusy;
+    rdp.command.startGclk = startGclk;
+  }
+  if(lumiverseGfxFifoStalled()) lumiverseGfxFifoReset();  //cannot drain (crashed RDP): drop it
+}
+
 auto lumiverseGfxFlush(LumiverseGfxOut& out) -> void {
   if(lumiverseGfxShadowDiscard) {
     if(FILE* dump = lumiverseGfxShadowDumpFile()) {
@@ -247,57 +479,11 @@ auto lumiverseGfxFlush(LumiverseGfxOut& out) -> void {
   if(out.fifo) {
     const u32 capacityWords = ((out.fifoEnd - out.fifoStart) / 4) & ~1u;
     if(capacityWords >= 2) {
+      //round 22: output already stalled behind the frozen fifo keeps its
+      //order — everything new queues behind it
+      if(lumiverseGfxPacedActive || lumiverseGfxFifoStalled()) { lumiverseGfxSpillAppend(out, 0); out.count = 0; return; }
       u32 offset = 0;
-      while(offset < out.count) {
-        u32 space = ((out.fifoEnd - out.fifoPos) / 4) & ~1u;
-        const u32 remaining = out.count - offset;
-        if(space < 2 || (remaining > space && out.fifoPos != out.fifoStart)) {
-          //wrap to the start of the fifo. paraLLEl consumed everything up to
-          //DPC_END synchronously at the last kick, unless the game holds
-          //DPC FREEZE (the RDP then never consumes and the buffer cannot be
-          //reused): release the freeze for the pending range and restore it,
-          //exactly the state the game will see after its own unfreeze
-          if(rdp.command.freeze) {
-            lumiverseGfxFifoWrapsFrozen++;
-            rdp.writeWord(0x0c, 0x0004, rsp);
-            rdp.writeWord(0x0c, 0x0008, rsp);
-          }
-          out.fifoPos = out.fifoStart;
-          out.fifoStarted = false;
-          space = capacityWords;
-        }
-        u32 chunk = remaining;
-        if(chunk > space) {
-          //cut on an RDP command boundary: a command split across the fifo
-          //end leaves a partial command in paraLLEl's queue, and the fork's
-          //render() used to drop the next kick outright when that backlog
-          //plus a full-fifo range exceeded its queue (DK64 hang, round 9)
-          chunk = lumiverseGfxAlignedChunk(out, offset, space);
-          if(chunk == 0) {  //fifo too small for one command: wrap and retry
-            if(out.fifoPos == out.fifoStart) { out.failed = true; out.count = 0; return; }
-            if(rdp.command.freeze) {
-              lumiverseGfxFifoWrapsFrozen++;
-              rdp.writeWord(0x0c, 0x0004, rsp);
-              rdp.writeWord(0x0c, 0x0008, rsp);
-            }
-            out.fifoPos = out.fifoStart;
-            out.fifoStarted = false;
-            continue;
-          }
-        }
-        for(u32 index = 0; index < chunk; index++) {
-          rdram.ram.Memory::Writable::write<Word>(out.fifoPos + index * 4, out.words[offset + index]);
-        }
-        //DPC_START once per fifo pass, then DPC_END per flush: the RDP runs
-        //current..end at every END write (or at the game's unfreeze)
-        if(!out.fifoStarted) {
-          rdp.writeWord(0x00, out.fifoPos, rsp);
-          out.fifoStarted = true;
-        }
-        out.fifoPos += chunk * 4;
-        rdp.writeWord(0x04, out.fifoPos, rsp);
-        offset += chunk;
-      }
+      if(!lumiverseGfxFifoWrite(out, out.words, out.count, offset)) lumiverseGfxSpillAppend(out, offset);
       out.count = 0;
       return;
     }
@@ -314,6 +500,7 @@ auto lumiverseGfxFlush(LumiverseGfxOut& out) -> void {
 auto lumiverseGfxEmit(LumiverseGfxOut& out, u32 word) -> void {
   if(out.count >= LumiverseGfxOut::Capacity) { out.failed = true; return; }
   out.words[out.count++] = word;
+  out.emitted++;
 }
 
 auto lumiverseGfxEmit2(LumiverseGfxOut& out, u32 hi, u32 lo) -> void {
@@ -723,7 +910,29 @@ auto lumiverseGfxEndDisplayList(LumiverseGfxMachine& m) -> void {
 //clip = v * modelview * projection with matrices as stored in RDRAM)
 //----------------------------------------------------------------------------
 
+//round 22 diagnostic: LUMIVERSE_ARES_N64_RSP_HLE_GFX_LATE_CHECK=1 — every
+//matrix / vertex block the executor reads at dispatch is hashed; at the
+//task's modelled completion the blocks are hashed again and a task whose
+//inputs the CPU rewrote meanwhile prints one [gfx-late] line (the LLE
+//microcode reads them over the task, the executor at dispatch)
+auto lumiverseGfxLateCheckOn() -> bool {
+  static const bool value = [] { const char* v = ::getenv("LUMIVERSE_ARES_N64_RSP_HLE_GFX_LATE_CHECK"); return v && v[0] == '1'; }();
+  return value;
+}
+struct LumiverseGfxLateBlock { u32 address; u32 length; u64 hash; u8 kind; };
+constexpr u32 LumiverseGfxLateCapacity = 16384;
+static LumiverseGfxLateBlock lumiverseGfxLateBlocks[LumiverseGfxLateCapacity];
+static u32 lumiverseGfxLateCount = 0;
+static bool lumiverseGfxLateArmed = false;
+auto lumiverseGfxLateCheckNamed(const char* when, bool disarm) -> void;
+auto lumiverseGfxLateNote(u8 kind, u32 address, u32 length) -> void {
+  if(!lumiverseGfxLateArmed || lumiverseGfxShadowDiscard) return;
+  if(lumiverseGfxLateCount >= LumiverseGfxLateCapacity) return;
+  lumiverseGfxLateBlocks[lumiverseGfxLateCount++] = { address & 0x00ffffff, length, lumiverseHashRDRAM(address & 0x00ffffff, length), kind };
+}
+
 auto lumiverseGfxLoadMatrix(u32 address, f32* matrix) -> void {
+  lumiverseGfxLateNote(0, address, 64);
   constexpr f32 recip = 1.0f / 65536.0f;
   for(u32 row = 0; row < 4; row++) {
     for(u32 col = 0; col < 4; col++) {
@@ -1061,6 +1270,7 @@ auto lumiverseGfxCalculateLighting(LumiverseGfxMachine& m, f32 nx, f32 ny, f32 n
 
 auto lumiverseGfxLoadVertices(LumiverseGfxMachine& m, u32 v0, u32 n, u32 address) -> void {
   if(v0 + n > 32) return;
+  lumiverseGfxLateNote(1, address, n * 16);
   lumiverseGfxUpdateCombined(m);
 
   if(lumiverseGfxLogLevel() >= 3 && (m.geometryMode & LumiverseGeomLighting)) {
@@ -3132,6 +3342,9 @@ auto lumiverseGfxExecuteTaskGBI2(LumiverseGfxMachine& m, u32 pc) -> bool {
       break;
 
     case 0xfd:  //G_SETTIMG
+      lumiverseGfxLateNote(2, lumiverseGfxSegmentAddress(m, cmd1), 2048);  //round 22 diagnostic: texture source (2 KiB window)
+      lumiverseGfxEmit2(m.out, cmd0, lumiverseGfxSegmentAddress(m, cmd1));
+      break;
     case 0xfe:  //G_SETZIMG
     case 0xff:  //G_SETCIMG
       lumiverseGfxEmit2(m.out, cmd0, lumiverseGfxSegmentAddress(m, cmd1));
@@ -4262,29 +4475,55 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   const u32 modelledCycles = lumiverseGfxCostModel() && lumiverseHLERequestedCompletionCycles <= 0
     ? lumiverseGfxModelledCycles(ucodeHash, dialect, lumiverseGfxTaskFeatures) : 0;
   lumiverseDPInterruptPending = false;
-  lumiverseDPInterruptDefer = modelledCycles > 0;
+  //round 22: held for the instant path too — a game that runs the RDP
+  //unfrozen while the task executes (Donkey Kong 64's scene loads) would
+  //otherwise take the SyncFull interrupt before the task-done interrupt of
+  //the same task, the reverse of the LLE order; RSP::lumiverseHLEDeliverCompletion
+  //raises both together for an instant completion
+  lumiverseDPInterruptDefer = true;
+  lumiverseGfxLateCheckNamed("next-dispatch", true);  //the previous task's inputs, re-hashed as this one starts
+  machine.out.emitted = 0;
+  lumiverseGfxFifoReset();
+  lumiverseGfxPacedActive = machine.out.fifo && lumiverseGfxFifoStallEnabled()
+    && (lumiverseGfxPacedMode() == 1 || (lumiverseGfxPacedMode() == 2 && ucodeHash == LumiverseUcodeDK64Fifo207));
+  lumiverseGfxLateCount = 0;
+  lumiverseGfxLateArmed = lumiverseGfxLateCheckOn();
   const bool ok = dialect == LumiverseDialectGBI2
     ? lumiverseGfxExecuteTaskGBI2(machine, dataPtr)
     : lumiverseGfxExecuteTask(machine, dataPtr, dialect, gbi0Vertex, geBaked);
   lumiverseDPInterruptDefer = false;
+  lumiverseGfxPacedActive = false;
   if(ok) {
     tasksExecuted++;
     if(modelledCycles > 0) lumiverseHLERequestedCompletionCycles = (s32)modelledCycles;
+    //round 22: a task stalled on the frozen fifo completes only once the
+    //game's unfreeze drained it (RSP::main); never instantly
+    if(lumiverseGfxFifoStalled()) {
+      lumiverseGfxFifoStallCount++;
+      if(lumiverseHLERequestedCompletionCycles <= 0) lumiverseHLERequestedCompletionCycles = 128;
+      //the drain runs at the microcode's production rate: the task's words
+      //over its modelled cycles (instant completion: everything per tick)
+      const u64 cycles = modelledCycles > 0 ? modelledCycles : 128;
+      u64 rate = (u64)machine.out.emitted * 128 * lumiverseGfxDrainRatePercent() / 100 / cycles;
+      if(rate < 4) rate = 4;
+      lumiverseGfxDrainWordsPerTick = rate > 0xffffffffull ? 0xffffffffu : (u32)rate;
+    }
   } else {
     tasksFallback++;
+    lumiverseGfxFifoReset();  //the LLE microcode regenerates the stream
     if(lumiverseDPInterruptPending) { lumiverseDPInterruptPending = false; mi.raise(MI::IRQ::DP); }
   }
 
   if(lumiverseGfxLogLevel() >= 1 && ((tasksExecuted + tasksFallback) & 63) == 1) {
     fprintf(stderr,
-      "[rsp-hle-gfx] tasks=%llu fallback=%llu tris=%llu clipped=%llu rejected=%llu rejects(stack/b0/mw/mvtx/baked/bakedcut)=%llu/%llu/%llu/%llu/%llu/%llu fifoWrapsFrozen=%llu\n",
+      "[rsp-hle-gfx] tasks=%llu fallback=%llu tris=%llu clipped=%llu rejected=%llu rejects(stack/b0/mw/mvtx/baked/bakedcut)=%llu/%llu/%llu/%llu/%llu/%llu fifoWrapsFrozen=%llu fifoStalls=%llu/%llu\n",
       (unsigned long long)tasksExecuted, (unsigned long long)tasksFallback,
       (unsigned long long)machine.trisEmitted, (unsigned long long)machine.trisClipped,
       (unsigned long long)machine.trisRejected,
       (unsigned long long)lumiverseGfxRejectCounts[0], (unsigned long long)lumiverseGfxRejectCounts[1],
       (unsigned long long)lumiverseGfxRejectCounts[2], (unsigned long long)lumiverseGfxRejectCounts[3],
       (unsigned long long)lumiverseGfxRejectCounts[4], (unsigned long long)lumiverseGfxRejectCounts[5],
-      (unsigned long long)lumiverseGfxFifoWrapsFrozen);
+      (unsigned long long)lumiverseGfxFifoWrapsFrozen, (unsigned long long)lumiverseGfxFifoStallCount, (unsigned long long)lumiverseGfxFifoStallExpired);
   }
 
   return ok;
@@ -4292,6 +4531,37 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   (void)task;
   (void)ucodeHash;
   return false;
+#endif
+}
+
+//round 22: called by RSP::lumiverseHLEDeliverCompletion for graphics tasks
+auto lumiverseGfxLateCheck() -> void { lumiverseGfxLateCheckNamed("done", false); }
+#if !defined(VULKAN)
+auto lumiverseGfxFifoDrainImpl() -> void {}
+auto lumiverseGfxFifoStalled() -> bool { return false; }
+auto lumiverseGfxFifoStallTick(s32) -> void {}
+auto lumiverseGfxFifoReset() -> void {}
+auto lumiverseGfxDPDelayCycles() -> s32 { return 0; }
+#endif
+auto lumiverseGfxLateCheckNamed(const char* when, bool disarm) -> void {
+#if defined(VULKAN)
+  if(!lumiverseGfxLateArmed) return;
+  if(disarm) lumiverseGfxLateArmed = false;
+  u32 changedOf[3] = {0, 0, 0}, totalOf[3] = {0, 0, 0};
+  u32 firstAddress = 0; u8 firstKind = 0;
+  for(u32 index = 0; index < lumiverseGfxLateCount; index++) {
+    const auto& b = lumiverseGfxLateBlocks[index];
+    const bool changed = lumiverseHashRDRAM(b.address, b.length) != b.hash;
+    const u32 kind = b.kind < 3 ? b.kind : 2;
+    totalOf[kind]++; if(changed) changedOf[kind]++;
+    if(changed && !firstAddress) { firstAddress = b.address; firstKind = b.kind; }
+  }
+  static u32 lines = 0;
+  if((changedOf[0] || changedOf[1] || changedOf[2]) && lines++ < 4000) {
+    static const char* names[3] = {"mtx", "vtx", "timg"};
+    fprintf(stderr, "[gfx-late] %s task=%llu mtx changed %u/%u vtx changed %u/%u timg changed %u/%u first=%s@%06x\n",
+      when, (unsigned long long)lumiverseRdpTaskTag, changedOf[0], totalOf[0], changedOf[1], totalOf[1], changedOf[2], totalOf[2], names[firstKind < 3 ? firstKind : 2], firstAddress);
+  }
 #endif
 }
 
