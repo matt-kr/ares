@@ -5,6 +5,8 @@ namespace ares::Nintendo64 {
 struct Vulkan {
   auto load(Node::Object) -> bool;
   auto unload() -> void;
+  auto synchronizeState() -> void;
+  auto serialize(serializer&) -> void;
 
   auto render() -> bool;
   auto frame() -> void;

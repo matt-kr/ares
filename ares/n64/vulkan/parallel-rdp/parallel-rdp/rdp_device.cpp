@@ -1063,6 +1063,46 @@ void *CommandProcessor::get_tmem()
 	return device.map_host_buffer(*tmem, MEMORY_ACCESS_READ_BIT);
 }
 
+bool CommandProcessor::copy_save_state_memory(std::vector<uint8_t> &data, bool restore)
+{
+	const auto hidden_size = hidden_rdram->get_create_info().size;
+	const auto tmem_size = tmem->get_create_info().size;
+	if (data.size() != hidden_size + tmem_size) return false;
+	BufferCreateInfo info = {};
+	info.size = data.size();
+	info.domain = BufferDomain::CachedCoherentHostPreferCoherent;
+	info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	auto staging = device.create_buffer(info, restore ? data.data() : nullptr);
+	if (!staging) return false;
+	auto cmd = device.request_command_buffer();
+	cmd->barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+	             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+	if (restore)
+	{
+		cmd->copy_buffer(*hidden_rdram, 0, *staging, 0, hidden_size);
+		cmd->copy_buffer(*tmem, 0, *staging, hidden_size, tmem_size);
+	}
+	else
+	{
+		cmd->copy_buffer(*staging, 0, *hidden_rdram, 0, hidden_size);
+		cmd->copy_buffer(*staging, hidden_size, *tmem, 0, tmem_size);
+	}
+	cmd->barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+	             restore ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_HOST_BIT,
+	             restore ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT) : VK_ACCESS_HOST_READ_BIT);
+	Fence fence;
+	device.submit(cmd, &fence);
+	fence->wait();
+	if (!restore)
+	{
+		auto mapped = device.map_host_buffer(*staging, MEMORY_ACCESS_READ_BIT);
+		if (!mapped) return false;
+		memcpy(data.data(), mapped, data.size());
+		device.unmap_host_buffer(*staging, MEMORY_ACCESS_READ_BIT);
+	}
+	return true;
+}
+
 void CommandProcessor::idle()
 {
 	flush();

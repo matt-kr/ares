@@ -148,6 +148,8 @@ public:
 	size_t get_rdram_size() const;
 	size_t get_hidden_rdram_size() const;
 	void *get_tmem();
+	// Used only while saving/loading; gameplay keeps its original GPU allocations.
+	bool copy_save_state_memory(std::vector<uint8_t> &data, bool restore);
 
 	// Sets VI register
 	void set_vi_register(VIRegister reg, uint32_t value);

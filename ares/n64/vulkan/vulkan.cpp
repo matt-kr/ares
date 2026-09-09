@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <stdexcept>
 
 #if defined(LUMIVERSE_ARES_STATIC_MOLTENVK)
 #include <dlfcn.h>
@@ -138,6 +139,8 @@ struct Vulkan::Implementation {
   //commands are u64 words, but the backend uses u32 swapped words.
   //size and offset are in u64 words.
   u32 buffer[0x10000] = {};
+  u32 stateCommands[64][8][2] = {};
+  bool stateCommandSet[64][8] = {};
   u32 queueSize = 0;
   u32 queueOffset = 0;
 
@@ -190,6 +193,40 @@ auto Vulkan::load(Node::Object) -> bool {
   return true;
 }
 
+auto Vulkan::synchronizeState() -> void {
+  if(!enable || !implementation || !implementation->processor) return;
+  std::unique_lock<std::mutex> lock(implementation->lock);
+  implementation->condition.wait(lock, [&] { return implementation->scanoutCount == implementation->endCount; });
+  implementation->processor->idle();
+}
+
+auto Vulkan::serialize(serializer& s) -> void {
+  if(!enable || !implementation || !implementation->processor) return;
+  auto& i = *implementation;
+  auto& p = *i.processor;
+  s(i.buffer); s(i.queueSize); s(i.queueOffset);
+  s(i.stateCommands); s(i.stateCommandSet);
+  s(i.viShadow); s(i.viShadowSet);
+  // RDRAM itself is serialized by the core after synchronizeState(). The
+  // renderer additionally owns coverage/depth bits and texture memory.
+  std::vector<u8> memory(p.get_hidden_rdram_size() + 4096);
+  if(s.writing() && !p.copy_save_state_memory(memory, false))
+    throw std::runtime_error("Could not read graphics memory for the save state.");
+  s(std::span<u8>(memory.data(), memory.size()));
+  if(s.reading()) {
+    if(!p.copy_save_state_memory(memory, true))
+      throw std::runtime_error("Could not restore graphics memory.");
+    // SetTile must precede SetTileSize (it replaces the tile descriptor).
+    for(u32 tile = 0; tile < 8; tile++) if(i.stateCommandSet[0x35][tile])
+      p.enqueue_command(2, i.stateCommands[0x35][tile]);
+    for(u32 code = 0; code < 64; code++) for(u32 tile = 0; tile < 8; tile++)
+      if(code != 0x35 && i.stateCommandSet[code][tile]) p.enqueue_command(2, i.stateCommands[code][tile]);
+    for(u32 reg = 0; reg < unsigned(::RDP::VIRegister::Count); reg++)
+      if(i.viShadowSet[reg]) p.set_vi_register(::RDP::VIRegister(reg), i.viShadow[reg]);
+    p.idle();
+  }
+}
+
 auto Vulkan::unload() -> void {
   //LUMIVERSE: keep the instance/device alive for the process lifetime; only
   //the processor (which references the current RDRAM allocation) goes away.
@@ -237,6 +274,12 @@ auto Vulkan::processQueuedCommands() -> bool {
       return false;
     }
 
+    if((code >= 0x2a && code <= 0x2f) || code == 0x32 || code == 0x35 || code >= 0x37) {
+      const u32 tile = (code == 0x32 || code == 0x35) ? (buffer[queueOffset * 2 + 1] >> 24 & 7) : 0;
+      implementation->stateCommands[code][tile][0] = buffer[queueOffset * 2];
+      implementation->stateCommands[code][tile][1] = buffer[queueOffset * 2 + 1];
+      implementation->stateCommandSet[code][tile] = true;
+    }
     if(code >= 8) {
       if(batch) {
         pending[pendingCount++] = { length * 2, buffer + queueOffset * 2 };
@@ -683,6 +726,8 @@ void Vulkan::Implementation::destroyProcessor() {
   pendingSyncFullIndex = 0;
   scanoutCount = 0;
   endCount = 0;
+  memset(stateCommands, 0, sizeof(stateCommands));
+  memset(stateCommandSet, 0, sizeof(stateCommandSet));
   queueSize = 0;
   queueOffset = 0;
 }

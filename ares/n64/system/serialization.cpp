@@ -1,6 +1,11 @@
-static const string SerializerVersion = "v152";
+static const string SerializerVersion = "lumi-state-1";
 
 auto System::serialize(bool synchronize) -> serializer {
+  rsp.lumiverseAsyncDrain();
+  #if defined(VULKAN)
+  if(_vulkanNeedsLoad) { vulkan.load(node); _vulkanNeedsLoad = false; }
+  vulkan.synchronizeState();
+  #endif
   serializer s;
 
   u32  signature = SerializerSignature;
@@ -12,6 +17,13 @@ auto System::serialize(bool synchronize) -> serializer {
   s(synchronize);
   s(version);
   s(description);
+  bool gpu = false;
+  #if defined(VULKAN)
+  gpu = vulkan.enable;
+  #endif
+  s(gpu);
+  auto banks = controllerPakBankCount;
+  s(banks);
 
   serialize(s, synchronize);
   return s;
@@ -30,8 +42,24 @@ auto System::unserialize(serializer& s) -> bool {
 
   if(signature != SerializerSignature) return false;
   if(string{version} != SerializerVersion) return false;
+  bool savedGPU = false;
+  s(savedGPU);
+  bool currentGPU = false;
+  #if defined(VULKAN)
+  currentGPU = vulkan.enable;
+  #endif
+  auto banks = controllerPakBankCount;
+  s(banks);
+  if(savedGPU != currentGPU || banks != controllerPakBankCount) return false;
 
+  rsp.lumiverseAsyncDrain();
+  #if defined(VULKAN)
+  vulkan.synchronizeState();
+  #endif
   if(synchronize) power(/* reset = */ false);
+  #if defined(VULKAN)
+  if(_vulkanNeedsLoad) { vulkan.load(node); _vulkanNeedsLoad = false; }
+  #endif
   serialize(s, synchronize);
   return true;
 }
@@ -57,4 +85,7 @@ auto System::serialize(serializer& s, bool synchronize) -> void {
   s(rsp);
   s(dd);
   s(aleck64);
+  #if defined(VULKAN)
+  vulkan.serialize(s);
+  #endif
 }

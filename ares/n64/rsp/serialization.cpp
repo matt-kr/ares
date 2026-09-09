@@ -3,6 +3,33 @@ auto RSP::serialize(serializer& s) -> void {
   //any in-flight async audio task before touching core state
   lumiverseAsyncDrain();
   Thread::serialize(s);
+  auto pod = [&](auto& value) {
+    static_assert(std::is_trivially_copyable_v<std::remove_reference_t<decltype(value)>>);
+    s(std::span<u8>((u8*)&value, sizeof(value)));
+  };
+  s(lumiverseHLEPendingCycles); s(lumiverseDPInterruptDelay);
+  s(lumiverseHLERequestedCompletionCycles); s(lumiverseHLEPendingType);
+  s(lumiverseHLELastDispatchType); s(lumiverseHLELastDispatchDataPtr);
+  s(lumiverseHLEYieldedTaskDataPtr); s(lumiverseHLEYieldedRemaining); s(lumiverseHLEYieldedDataPtr);
+  s(lumiverseDPInterruptDefer); s(lumiverseDPInterruptPending);
+  pod(lumiverseAudioMachine); pod(lumiverseAudioStateSlots);
+  pod(lumiverseAudioDeferred); s(lumiverseAudioDeferredCount);
+  s(lumiverseAudioDeferredData); s(lumiverseAudioDeferredBytes); s(lumiverseAudioDeferredCommands);
+  s(lumiverseAudioCmdCostPrefix); s(lumiverseAudioCmdCostCount);
+  s(lumiverseAudioNaLastBlockLanes);
+  #if defined(VULKAN)
+  pod(lumiverseSavedGfxMachine);
+  s(lumiverseGfxPacedActive); s(lumiverseGfxDrainAccum); s(lumiverseGfxDrainTicks);
+  s(lumiverseGfxSpillWords); s(lumiverseGfxSpillCount); s(lumiverseGfxSpillOffset);
+  s(lumiverseGfxStallCycles); s(lumiverseGfxDrainWordsPerTick); s(lumiverseGfxDrainAll);
+  bool hasSpill = lumiverseGfxSpillOut != nullptr;
+  s(hasSpill);
+  if(s.reading()) {
+    lumiverseGfxSpillOut = hasSpill ? &lumiverseSavedGfxMachine.out : nullptr;
+    lumiverseGfxDraining = false;
+    lumiverseGfxLateArmed = false;
+  }
+  #endif
   s(dmem);
   s(imem);
 

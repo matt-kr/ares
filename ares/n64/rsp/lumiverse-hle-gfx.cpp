@@ -4429,6 +4429,10 @@ auto lumiverseGfxNoteTaskDispatch(const u32 task[16], u64 ucodeHash) -> void { (
 auto lumiverseGfxNoteTaskEnd(u64 cycles, bool yielded) -> void { (void)cycles; (void)yielded; }
 #endif
 
+#if defined(VULKAN)
+static LumiverseGfxMachine lumiverseSavedGfxMachine;
+#endif
+
 auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
 #if defined(VULKAN)
   u32 dialect;
@@ -4437,7 +4441,7 @@ auto lumiverseExecuteGraphicsTask(const u32 task[16], u64 ucodeHash) -> bool {
   if(!lumiverseGfxResolveDialect(ucodeHash, dialect, gbi0Vertex, geBaked)) return false;
   if(!vulkan.enable) return false;
 
-  static LumiverseGfxMachine machine;
+  auto& machine = lumiverseSavedGfxMachine;
   static LumiverseGfxCensus census;
   static u64 tasksExecuted = 0;
   static u64 tasksFallback = 0;
