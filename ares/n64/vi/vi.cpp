@@ -184,8 +184,8 @@ auto VI::main() -> void {
         }
       }
 
-      u32 lineDuration = io.quarterLineDuration+1;
-      if(io.vcounter == 1)
+      u32 lineDuration = lumiverseLineDuration();
+      if(io.vcounter == 1 && !lumiversePalField())
         lineDuration = io.hsyncLeap[io.leapPattern.bit(io.leapCounter)];      
       step(lineDuration);
     } else {
@@ -200,6 +200,37 @@ auto VI::main() -> void {
       step(0x800);
     }
   }
+}
+
+//Lumiverse round 22b: LUMIVERSE_ARES_N64_VI_PAL_FIELD=1 (default 0) — on a
+//PAL console, a VI programmed with an NTSC-style field (fewer than 600
+//half-lines) is timed as a PAL field (313 lines x 3178 video clocks = 20.03
+//ms, what the 625 x 3177 PAL program gives) instead of the 16.4 ms / 61 Hz
+//field the PAL clock makes of 525 x 3094. Experiment knob for the
+//GameCube-disc PAL builds (Ocarina of Time Master Quest (E)) which keep a PAL
+//osTvType (PAL DAC rate, 50 Hz audio buffer sizing) but program NTSC VI
+//timing; the GameCube emulator they ran under output 50 Hz regardless.
+auto VI::lumiversePalField() const -> bool {
+  static const bool value = [] {
+    const char* v = ::getenv("LUMIVERSE_ARES_N64_VI_PAL_FIELD");
+    return v && *v == '1';
+  }();
+  return value && Region::PAL() && io.halfLinesPerField < 600 && io.halfLinesPerField >= 400;
+}
+
+auto VI::lumiverseLineDuration() const -> u32 {
+  if(lumiversePalField()) {
+    //lines per field as VI::main counts them = (halfLines+1)/2 (263 for the
+    //progressive 525 program; an even program alternates 263/262)
+    const u32 twiceLines = (u32)io.halfLinesPerField + 1;
+    return (2u * 313u * 3178u + twiceLines / 2) / twiceLines;
+  }
+  return (u32)io.quarterLineDuration + 1;
+}
+
+auto VI::lumiverseFieldSeconds() const -> double {
+  const double lines = ((double)io.halfLinesPerField + 1.0) / 2.0;
+  return lines * (double)lumiverseLineDuration() / (double)system.videoFrequency();
 }
 
 auto VI::refresh() -> void {

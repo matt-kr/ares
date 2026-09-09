@@ -96,6 +96,25 @@ auto VI::readWord(u32 address, Thread& thread) -> u32 {
   return data;
 }
 
+//Lumiverse round 22b diagnostic (LUMIVERSE_ARES_N64_TIMING_DIAG=1): every
+//change of the VI field/line timing registers, with the CPU Count and the
+//osTvType word the IPL3 left at RDRAM 0x300 (0 = PAL, 1 = NTSC, 2 = MPAL),
+//so a ROM that programs one region's VI timing under the other's tvType is
+//visible (Ocarina of Time Master Quest (E): PAL tvType, NTSC VI timing).
+auto VI::lumiverseTimingLog(const char* reg, u32 value) -> void {
+  static const bool timingDiag = [] {
+    const char* v = ::getenv("LUMIVERSE_ARES_N64_TIMING_DIAG");
+    return v && *v == '1';
+  }();
+  if(!timingDiag) return;
+  static u32 logged = 0;
+  if(logged++ >= 64) return;
+  const u32 tvType = rdram.ram.read<Word>(0x300, RBusDevice::VI_DMA);
+  fprintf(stderr, "[vi] %s <- 0x%08x count=%llu region=%s videoClock=%u osTvType=%u (V_SYNC=%u H_SYNC=%u)\n",
+    reg, value, (unsigned long long)(u64)cpu.scc.count, Region::PAL() ? "PAL" : "NTSC",
+    system.videoFrequency(), tvType, (u32)io.halfLinesPerField, (u32)io.quarterLineDuration);
+}
+
 auto VI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
   address = (address & 0x3f) >> 2;
   n32 data = data_;
@@ -147,11 +166,13 @@ auto VI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
 
   if(address == 6) {
     //VI_V_TOTAL
+    if(io.halfLinesPerField != data.bit(0,9)) lumiverseTimingLog("V_SYNC", data);
     io.halfLinesPerField = data.bit(0,9);
   }
 
   if(address == 7) {
     //VI_H_TOTAL
+    if(io.quarterLineDuration != data.bit(0,11)) lumiverseTimingLog("H_SYNC", data);
     io.quarterLineDuration = data.bit( 0,11);
     io.leapPattern         = data.bit(16,20);
   }

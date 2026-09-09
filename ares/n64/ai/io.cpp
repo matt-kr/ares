@@ -17,6 +17,10 @@ auto AI::readWord(u32 address, Thread& thread) -> u32 {
     data.bit(30) = io.dmaCount > 0;
     data.bit(31) = io.dmaCount > 1;
     cpu.forceSynchronize();
+    //Lumiverse round 22b: the audio driver polls AI_STATUS before queuing a
+    //buffer and drops the buffer when the FIFO is full — trace those reads
+    //so a dropped buffer is visible on the AI timebase (see ai.cpp).
+    if(unlikely(lumiverseAiTraceOn()) && io.dmaCount > 1) lumiverseAiTrace("full", io.dmaAddress[0], io.dmaLength[0], io.dmaCount);
   }
 
   debugger.io(Read, address, data);

@@ -23,6 +23,12 @@ struct VI : Thread, Memory::RCP<VI> {
   auto refresh() -> void;
   auto power(bool reset) -> void;
   auto active() -> bool { return io.colorDepth != 0; }
+  //Lumiverse round 22b (vi.cpp): the emulated line duration in video clocks
+  //and the field it makes, honouring LUMIVERSE_ARES_N64_VI_PAL_FIELD
+  auto lumiversePalField() const -> bool;
+  auto lumiverseLineDuration() const -> u32;
+  auto lumiverseFieldSeconds() const -> double;
+  auto lumiverseTimingLog(const char* reg, u32 value) -> void;
 
   //io.cpp
   auto readWord(u32 address, Thread& thread) -> u32;
