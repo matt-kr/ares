@@ -150,6 +150,14 @@ struct Vulkan::Implementation {
   u32 viShadow[unsigned(::RDP::VIRegister::Count)] = {};
   bool viShadowSet[unsigned(::RDP::VIRegister::Count)] = {};
   bool viWarmupDone = false;
+  //LUMIVERSE (picture knobs): the option set the last VI sweep compiled for.
+  //The Implementation outlives ROM loads, and a later launch in the same
+  //process may pick another render scale / VI filter set / deinterlacer —
+  //each keys different pipeline variants, so the sweep must run again for it
+  //(createProcessor compares and clears viWarmupDone).
+  u32 viWarmupUpscale = 0;
+  bool viWarmupDisableVI = false;
+  bool viWarmupWeave = false;
   std::mutex lock;
   std::condition_variable condition;
   u64 pendingSyncFullTimelines[4] = {};
@@ -431,6 +439,9 @@ auto Vulkan::warmupVIPipelines() -> void {
   if(!implementation || !implementation->processor) return;
   if(implementation->viWarmupDone) return;
   implementation->viWarmupDone = true;
+  implementation->viWarmupUpscale = internalUpscale;
+  implementation->viWarmupDisableVI = disableVideoInterfaceProcessing;
+  implementation->viWarmupWeave = weaveDeinterlacing;
   if(!lumiverseVIWarmupEnabled()) return;
 
   using Reg = ::RDP::VIRegister;
@@ -535,8 +546,9 @@ auto Vulkan::warmupVIPipelines() -> void {
     }
   }
 
-  fprintf(stderr, "[ares] VI pipeline warm-up: %u scanouts in %.0f ms\n",
-    submitted, (LumiverseStallStats::nowNs() - startNs) / 1e6);
+  fprintf(stderr, "[ares] VI pipeline warm-up: %u scanouts in %.0f ms (render scale %ux, VI filters %s, %s deinterlacing)\n",
+    submitted, (LumiverseStallStats::nowNs() - startNs) / 1e6,
+    internalUpscale, disableVideoInterfaceProcessing ? "off" : "on", weaveDeinterlacing ? "weave" : "bob");
 }
 
 auto Vulkan::scanoutAsync(bool field) -> bool {
@@ -671,6 +683,16 @@ Vulkan::Implementation::Implementation(u8* data, u32 size) {
 
 void Vulkan::Implementation::createProcessor(u8* data, u32 size) {
   destroyProcessor();
+
+  //LUMIVERSE (picture knobs): a different render scale / VI option set than
+  //the last sweep compiled for keys new VI pipeline variants — sweep again on
+  //this load's first scanout (already-compiled variants are cache hits).
+  if(viWarmupDone
+  && (viWarmupUpscale != vulkan.internalUpscale
+   || viWarmupDisableVI != vulkan.disableVideoInterfaceProcessing
+   || viWarmupWeave != vulkan.weaveDeinterlacing)) {
+    viWarmupDone = false;
+  }
 
   ::RDP::CommandProcessorFlags flags = 0;
   switch(vulkan.internalUpscale) {
